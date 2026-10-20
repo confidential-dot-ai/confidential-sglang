@@ -714,6 +714,7 @@ class TpModelWorker(BaseTpWorker):
                     output=out.routed_experts_output, relayed=relayed_routed_experts
                 ),
                 indexer_topk_output=out.indexer_topk_output,
+                ced_boundary=forward_batch.ced_boundary,
                 iteration_ids=(
                     None
                     if not return_iteration_ids
