@@ -391,6 +391,28 @@ def _first_rows(act, n: int):
     return act[:n]
 
 
+def _low_ratio_index_topk_live(backend, layer, x, q_lora, req, pos, q, w):
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    real = forward_batch.global_num_token_non_padded_cpu
+    if real is None:
+        real = x.shape[0]
+    if real == 0:
+        return
+    backend._low_ratio_index_topk(
+        layer,
+        x[:real],
+        q_lora[:real],
+        req[:real],
+        pos[:real],
+        forward_batch,
+        q=q[:real],
+        weights=w[:real],
+    )
+
+
+_bcg_low_ratio_index_topk = eager_on_graph(True)(_low_ratio_index_topk_live)
+
+
 def _as_int_list(values) -> Optional[List[int]]:
     if values is None:
         return None
@@ -1193,6 +1215,8 @@ class DSV4Metadata:
                 self.c128_compress_metadata,
                 src=static_metadata.c128_compress_metadata,
             )
+        # The eager index layers republish it every replay.
+        self.candidate_metadata = None
         self.sparse_prefill_cache = None
 
 
@@ -1343,6 +1367,11 @@ class DeepseekV4AttnBackend(
         )
         self.has_c4: bool = 4 in self.present_ratios
         self.has_c128: bool = 128 in self.present_ratios
+        # The prefill graph's ratio-1/2 index layers run as eager breaks on the live
+        # rows instead of scoring a static context width.
+        self.prefill_graph_eager_indexer: bool = (
+            envs.SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER.get()
+        )
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
         self.prefill_candidates, self.decode_candidates = make_candidate_indexer(
@@ -1507,7 +1536,15 @@ class DeepseekV4AttnBackend(
         """The draft block's extend lengths on the device; glued, a cached constant
         (a captured host copy would replay from a freed pinned buffer)."""
         if not self.draft_metadata_glued:
-            return self._move_to_device(lens)
+            # Every request extends by the block size, so fill on device: a per-step
+            # upload from pinned memory blocks the host behind the stream under CC,
+            # where pinned memory is managed.
+            return torch.full(
+                (len(lens),),
+                lens[0] if lens else 0,
+                dtype=torch.int32,
+                device=self.device,
+            )
         key = tuple(lens)
         cached = self._draft_extend_lens.get(key)
         if cached is None:
@@ -1811,8 +1848,11 @@ class DeepseekV4AttnBackend(
         the full top-k layers score at eager breaks, and the consumers score the
         published candidate blocks in the graph. Otherwise the sources are one eager
         break."""
-        return bool(self.low_ratios) and isinstance(
-            self.prefill_candidates, SparseTableBackend
+        return (
+            # The CED encoder graph runs ratio-1/2 sources at eager breaks.
+            not getattr(self, "ced_encoder_graph", False)
+            and bool(self.low_ratios)
+            and isinstance(self.prefill_candidates, SparseTableBackend)
         )
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
@@ -3587,16 +3627,25 @@ class DeepseekV4AttnBackend(
             req, pos = hoisted_req[:n], hoisted_pos[:n]
         if (
             forward_batch.forward_mode.is_extend()
+            # TARGET_VERIFY also satisfies is_extend(), but runs in the decode
+            # graph runner without the prefill context the projection break needs.
+            and not forward_batch.forward_mode.is_target_verify()
             and self._low_ratio_in_prefill_graph()
         ):
             bufs = self._source_projection_buffers(x.shape[0], layer.compress_ratio)
+            eager_index = self.prefill_graph_eager_indexer
             captured_index = (
                 run_indexer
                 and layer.indexer is not None
+                and not eager_index
                 and layer.indexer.uses_candidates
             )
+            # The eager index break below scores the projected q and weights.
+            project_index = captured_index or (
+                run_indexer and layer.indexer is not None and eager_index
+            )
             _bcg_low_ratio_source_projections(
-                layer, x, q_lora, pos, bufs, run_compressor, captured_index
+                layer, x, q_lora, pos, bufs, run_compressor, project_index
             )
             if run_compressor and layer.compressor is not None:
                 if layer.compressor.use_fused_gate:
@@ -3613,7 +3662,13 @@ class DeepseekV4AttnBackend(
                         layer, x, req, pos, projected=(bufs["kv"], bufs.get("score"))
                     )
             if run_indexer and layer.indexer is not None:
-                if captured_index:
+                if eager_index:
+                    # Every ratio-1/2 index layer scores the live rows at an eager
+                    # break (SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER).
+                    _bcg_low_ratio_index_topk(
+                        self, layer, x, q_lora, req, pos, bufs["q"], bufs["w"]
+                    )
+                elif captured_index:
                     # Captured: sparse scores of the published blocks only, so
                     # nothing here depends on the context length.
                     self._low_ratio_index_topk_captured(layer, bufs["q"], bufs["w"])
@@ -4044,6 +4099,8 @@ class DeepseekV4AttnBackend(
         forward_batch,
         *,
         rows_per_request=None,  # NOTE: only used in CP
+        q=None,  # NOTE: prefill only, with weights
+        weights=None,
     ) -> None:
         is_source = layer.indexer.is_candidate_source
         is_consumer = layer.indexer.uses_candidates
@@ -4080,7 +4137,11 @@ class DeepseekV4AttnBackend(
                 pos,
                 forward_batch,
                 rows_per_request,
-                allow_row_shard=rows_per_request is None,
+                # Only the eager caller shards: q/weights come from the prefill
+                # graph's projection break, which must not add collectives.
+                allow_row_shard=rows_per_request is None and q is None,
+                q=q,
+                weights=weights,
             )
             if is_source:
                 published = self.prefill_candidates.publish_prefill(inputs)
@@ -4143,6 +4204,8 @@ class DeepseekV4AttnBackend(
         rows_per_request,
         *,
         allow_row_shard: bool = False,
+        q=None,
+        weights=None,
     ) -> PrefillInputs:
         core = self.forward_metadata.core_metadata
         tail = self.forward_metadata.late_layer_tail
@@ -4191,6 +4254,8 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu=seq_lens_cpu,
             rows_per_request=rows_per_request,
             rows_per_request_device=rows_per_request_device,
+            q=q,
+            weights=weights,
             out_raw_indices=core.sparse_raw_indices(layer.compress_ratio),
             out_page_indices=(
                 core.sparse_page_indices(layer.compress_ratio)

@@ -43,6 +43,7 @@ from sglang.srt.utils.msgpack_utils import enc_hook, ext_hook
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+    from sglang.srt.disaggregation.ced_boundary import CedBoundaryLayout
     from sglang.srt.disaggregation.common.conn import (
         CommonKVBootstrapServer,
         CommonKVManager,
@@ -634,6 +635,7 @@ class MetadataBuffers:
         output_dsa_topk_indices_dim: int = 0,
         *,
         kv_checksum_enabled: bool = False,
+        ced_boundary_layout: Optional["CedBoundaryLayout"] = None,
     ):
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
@@ -750,6 +752,23 @@ class MetadataBuffers:
                     device=self.bootstrap_room.device,
                 )
 
+        # CED boundary handoff: one window state per slot. Registered last, so a
+        # pipeline stage that does not run the boundary layer (and registers no
+        # such buffer) never addresses it.
+        self.ced_boundary_layout = ced_boundary_layout
+        self.ced_boundary: torch.Tensor | None = None
+        if ced_boundary_layout is not None:
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.ced_boundary = torch.zeros(
+                    (self.output_ids.shape[0], ced_boundary_layout.nbytes),
+                    dtype=torch.uint8,
+                    device=self.bootstrap_room.device,
+                )
+
     def set_kv_checksum(self, req: Req, digest: int, signature: int) -> None:
         # Slot 0 the digest, slot 1 the layout signature it was taken under;
         # the row is 8 wide for the 64 B RDMA minimum anyway.
@@ -791,6 +810,8 @@ class MetadataBuffers:
         bufs.append(self.bootstrap_room)
         if self.kv_checksum is not None:
             bufs.append(self.kv_checksum)
+        if self.ced_boundary is not None:
+            bufs.append(self.ced_boundary)
         bufs = [buf for buf in bufs if buf is not None]
         if self.output_customized_info is not None:
             assert bufs[self.CUSTOMIZED_INFO_SLOTS] == [
@@ -892,6 +913,15 @@ class MetadataBuffers:
         self.output_customized_info_len[idx, 0] = len(payload)
 
     def set_buf(self, req: Req):
+        from sglang.srt.disaggregation.ced_boundary import (
+            ced_boundary_enabled,
+            finalize_ced_boundary_slot,
+        )
+
+        if ced_boundary_enabled() and self.ced_boundary is not None:
+            finalize_ced_boundary_slot(
+                req=req, slots=self.ced_boundary, layout=self.ced_boundary_layout
+            )
         self._set_customized_info(req)
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
@@ -1465,7 +1495,11 @@ def remap_draft_layer_ids(layer_ids: List[int], num_hidden_layers: int) -> List[
 
 
 def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
-    if pool.layer_router.wrapped_view() is not None:
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    if pool.layer_router.wrapped_view() is not None or isinstance(
+        pool, DeepSeekV4TokenToKVPool
+    ):
         ids = pool.get_kv_layer_ids()
     else:
         # Pools register k0..k(L-1) then v0..v(L-1), so ids repeat once per
@@ -1894,9 +1928,58 @@ def _token_kv_view(token_to_kv_pool):
     return token_to_kv_pool.layer_router.wrapped_view() or token_to_kv_pool
 
 
+def ced_split_enabled() -> bool:
+    return envs.SGLANG_OPT_DSV41_CED_SPLIT.get()
+
+
+def disagg_swa_transfer_window(sliding_window_size: int, page_size: int) -> int:
+    # Under the CED split decode replays the prompt from its tail start, and the
+    # replayed rows' encoder layers read one more window before it.
+    if ced_split_enabled():
+        return 2 * sliding_window_size + page_size
+    return sliding_window_size
+
+
+def ced_tail_start(seq_len: int, sliding_window_size: int, page_size: int) -> int:
+    # Page aligned so compressor groups and transferred pages split cleanly.
+    return max(0, seq_len - sliding_window_size) // page_size * page_size
+
+
 def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
     """Describe the positional transfer layout without pool capacities or pointers."""
     ratios = getattr(kv_args, "mla_compression_ratios", None) or []
+    if 2 in ratios and envs.SGLANG_OPT_DSV41_PREFILL_TAIL.get():
+        # MLA latent KV and draft SWA are replicated across TP ranks. Stage
+        # components are mapped by layer id; only the last PP stage owns draft.
+        if str(get_spec().speculative_algorithm).upper() != "DSPARK":
+            raise RuntimeError("Prefill-tail PD requires DSpark on both workers")
+        return {
+            "prefill_tail": True,
+            "num_draft_tokens": get_spec().speculative_num_draft_tokens,
+            "compression_ratios": list(ratios),
+            "page_size": kv_args.page_size,
+            # Full-page byte counts differ at the ratio-1 source (layer 20),
+            # which exists only on PP1. Compare bytes per compressed token.
+            "kv_token_item_sizes": sorted(
+                {
+                    size * ratios[layer] // kv_args.page_size
+                    for size, layer in zip(kv_args.kv_item_lens, kv_args.kv_layer_ids)
+                }
+            ),
+            "target_state_types": [state.value for state in kv_args.state_types[:2]],
+            "target_swa_item_size": kv_args.state_item_lens[0][0],
+        }
+    if 2 in ratios and ced_split_enabled():
+        from sglang.srt.disaggregation.base.conn import StateType
+
+        # The encoder-only prefill runs without DSpark; decode seeds its own
+        # draft ring, so only the target state (the first component) crosses.
+        # Per-layer lists are left out: a pipeline-parallel prefill stage
+        # registers only its own layers, which the transfer pairs by layer id.
+        return {
+            "ced_split": True,
+            "target_state_type": kv_args.state_types[0].value,
+        }
     if 2 not in ratios or str(get_spec().speculative_algorithm).upper() != "DSPARK":
         return None
 

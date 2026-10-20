@@ -9,15 +9,7 @@ from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from enum import Enum
 from http import HTTPStatus
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    AsyncGenerator,
-    Callable,
-    Dict,
-    List,
-    Optional,
-)
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from sglang.srt.runtime_context import get_model, get_serving
 
@@ -55,6 +47,9 @@ from sglang.srt.entrypoints.openai import (
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
     encode_prompt_segments,
     parallel_prompt_encode,
+)
+from sglang.srt.entrypoints.openai.prefix_prompt_encode import (
+    maybe_create_prefix_prompt_encoder,
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
@@ -174,6 +169,25 @@ class _ClosingStreamingResponse(StreamingResponse):
 def _incomplete_tool_call_indices(parser) -> set[int]:
     detector = getattr(parser, "detector", parser)
     return getattr(detector, "incomplete_tool_call_indices", set())
+
+
+class _ChatStreamingResponse(_ClosingStreamingResponse):
+    """Own the prefetched generator even if sending headers/body fails."""
+
+    def __init__(self, content, *, generator: AsyncGenerator[str, None], **kwargs):
+        super().__init__(content, **kwargs)
+        self._generator = generator
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            try:
+                await self.body_iterator.aclose()
+            finally:
+                # The body iterator may never have started (header send failure),
+                # but _handle_streaming_request already advanced this generator.
+                await self._generator.aclose()
 
 
 def normalize_tool_content(role: str, content):
@@ -482,6 +496,20 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         self._doc_splitter = ChatDocSplitter.for_model(
             self, handle_window=super().handle_request
+        )
+        self._prefix_prompt_encoder = maybe_create_prefix_prompt_encoder(
+            self.tokenizer_manager.tokenizer
+        )
+
+    def _encode_rendered_prompt(
+        self, text: str, encode_kwargs: Optional[dict] = None
+    ) -> List[int]:
+        if self._prefix_prompt_encoder is not None:
+            return self._prefix_prompt_encoder.encode(text, encode_kwargs)
+        if encode_kwargs is None:
+            return self.tokenizer_manager.tokenizer.encode(text)
+        return parallel_prompt_encode(
+            self.tokenizer_manager.tokenizer, text, encode_kwargs
         )
 
     def _probe_prompt_text_round_trip(self) -> bool:
@@ -996,13 +1024,30 @@ class OpenAIServingChat(OpenAIServingBase):
 
         The reasoning parser is told the same thing, so channel-framed formats
         keep their framing intact exactly when a tool-call parser consumes it.
+
+        Gating this on the request's tools -- declared, or implied by tool
+        calls in the history -- passed the model's tool-call markup through
+        verbatim as visible content with finish_reason "stop", delivering raw
+        special tokens to the user instead of a tool_calls array. The provider
+        API contract requires the opposite: "calls should be allowed even
+        when no tools are defined; when tools are defined, calls to undefined
+        tools should still be allowed". Tool schemas are only needed to
+        type-convert arguments, not to recognise a call, so the parser does
+        the right thing with an empty tool list.
+
+        `tool_choice == "none"` only counts as an opt-out alongside declared
+        tools. With no tools the field is not the caller's choice at all --
+        `set_tool_choice_default` injects "none" (protocol.py) -- and reading
+        it as one would disable the parser on exactly the no-tools request the
+        contract requires it for.
         """
         if not self.tool_call_parser or request._response_parser_json_response_format:
             return False
         if not self._effective_tools(request):
-            # With no tools declared, tool_choice only holds its default and limits nothing.
-            detector = FunctionCallParser.ToolCallParserEnum[self.tool_call_parser]
-            return detector.parses_without_tools()
+            # With no tools declared, tool_choice only holds its default and limits
+            # nothing. The contract above holds for every parser, so this does not
+            # ask the detector (upstream: parses_without_tools()).
+            return True
         return request.tool_choice != "none"
 
     @staticmethod
@@ -1013,6 +1058,59 @@ class OpenAIServingChat(OpenAIServingBase):
             isinstance(reasoning_parser.detector, ResponseTemplateReasoningDetector)
             and reasoning_parser.detector.answer_started
         )
+
+    @staticmethod
+    def _validate_tool_call_ids(request: ChatCompletionRequest) -> str | None:
+        """Check that tool replies line up with the tool calls that were made.
+
+        Two ways an agent history can be internally inconsistent, both of which
+        were previously served as if valid:
+
+          * a `tool` message whose tool_call_id matches no call the assistant
+            ever issued -- the reply is attributed to nothing;
+          * an assistant turn whose calls are only partly answered -- the model
+            is asked to continue from a state that never existed.
+
+        The second is deliberately scoped to turns that HAVE been answered. An
+        assistant message whose calls are still outstanding is the normal
+        mid-flight shape (the caller is about to run the tools), and must stay
+        valid.
+        """
+        issued: dict = {}  # call id -> index of the assistant message issuing it
+        for idx, message in enumerate(request.messages):
+            for call in getattr(message, "tool_calls", None) or []:
+                call_id = getattr(call, "id", None)
+                if call_id is not None:
+                    issued[call_id] = idx
+
+        answered = set()
+        for message in request.messages:
+            if getattr(message, "role", None) != "tool":
+                continue
+            call_id = getattr(message, "tool_call_id", None)
+            if call_id is None:
+                return "A `tool` message must carry a tool_call_id."
+            if call_id not in issued:
+                return (
+                    f"tool_call_id `{call_id}` does not match any tool call in "
+                    "this conversation."
+                )
+            answered.add(call_id)
+
+        if answered:
+            by_turn: dict = {}
+            for call_id, turn in issued.items():
+                by_turn.setdefault(turn, set()).add(call_id)
+            for turn, call_ids in sorted(by_turn.items()):
+                if call_ids & answered:
+                    missing = sorted(call_ids - answered)
+                    if missing:
+                        return (
+                            "Every tool call must be answered before the "
+                            "conversation continues; missing a `tool` message "
+                            f"for: {', '.join(missing)}."
+                        )
+        return None
 
     def _validate_request(
         self,
@@ -1033,6 +1131,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 "Request-supplied chat_template is not allowed. Start the server "
                 "with --trust-request-chat-template to permit it."
             )
+
+        model_error = self._validate_model_name(request.model)
+        if model_error:
+            return model_error
+
+        tool_call_id_error = self._validate_tool_call_ids(request)
+        if tool_call_id_error:
+            return tool_call_id_error
 
         if request.return_sampling_mask and not request.return_meta_info:
             return "return_sampling_mask requires return_meta_info=true."
@@ -2052,7 +2158,7 @@ class OpenAIServingChat(OpenAIServingBase):
             real_input = encoding_dsv32.encode_messages(
                 messages, thinking_mode=thinking_mode
             )
-            prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+            prompt_ids = self._encode_rendered_prompt(real_input)
 
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:
@@ -2266,8 +2372,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **template_kwargs,
                 )
-                prompt_ids = parallel_prompt_encode(
-                    self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
+                prompt_ids = self._encode_rendered_prompt(
+                    rendered_prompt, encode_kwargs
                 )
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
@@ -2379,10 +2485,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 async for chunk in generator:
                     yield chunk
             finally:
+                # Closing/cancelling an outer async generator does not close
+                # the generator it is iterating over.
                 await generator.aclose()
 
-        return _ClosingStreamingResponse(
+        return _ChatStreamingResponse(
             prepend_first_chunk(),
+            generator=generator,
             media_type="text/event-stream",
             # The first chunk is out, so the wire has seen the first engine event.
             headers=wire_response.headers() or None,
@@ -2789,9 +2898,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 yield f"data: {usage_chunk.model_dump_json(context=wire.serialization_context)}\n\n"
 
         except Exception as e:
-            if not stream_started or not (
-                wire.errors_end_choices or isinstance(e, ValueError)
-            ):
+            # Before headers, handle_request can still return an HTTP error.
+            # After headers, make failures explicit rather than truncating SSE.
+            # Do not catch BaseException: cancellation/GeneratorExit must unwind.
+            if not stream_started:
                 raise
             if wire.errors_end_choices:
                 logger.warning(
@@ -2801,12 +2911,21 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 for chunk in end_frames(close_open_choices=True):
                     yield chunk
-            else:
+            elif isinstance(e, ValueError):
                 error = self.create_streaming_error_response(str(e))
+                yield f"data: {error}\n\n"
+            else:
+                logger.exception("Error while streaming chat completion")
+                error = self.create_streaming_error_response(
+                    message=f"Internal server error: {e}",
+                    err_type="InternalServerError",
+                    status_code=500,
+                )
                 yield f"data: {error}\n\n"
         finally:
             # Closing generate_request runs its cleanup, which aborts the
-            # request only while this request still owns its rid.
+            # request only while this request still owns its rid (and releases
+            # the model-update lock on parser failures or a closed stream).
             await stream.aclose()
 
         yield "data: [DONE]\n\n"

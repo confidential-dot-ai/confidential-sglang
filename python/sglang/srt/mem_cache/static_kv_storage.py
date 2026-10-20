@@ -871,15 +871,19 @@ def _static_owner_region(token_to_kv_pool) -> Region:
         ptrs, lens, item_lens = token_to_kv_pool.get_sparse_kv_buf_infos()
     else:
         ptrs, lens, item_lens = token_to_kv_pool.get_contiguous_buf_infos()
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
 
     # A pool wrapping one token KV view (its other layers hold state), or one
-    # whose main page rows pair by layer id, reports per-entry layer ids for the
-    # peers to pair by.
+    # whose main page rows pair by layer id (MiniMax-M3, and DeepSeek-V4: ours,
+    # so a PP prefill stage pairs with decode by layer), reports per-entry layer
+    # ids for the peers to pair by.
     layer_ids = (
         token_to_kv_pool.get_kv_layer_ids()
         if token_to_kv_pool.layer_router.wrapped_view() is not None
-        or isinstance(token_to_kv_pool, MiniMaxM3Nvfp4KVPool)
+        or isinstance(
+            token_to_kv_pool, (MiniMaxM3Nvfp4KVPool, DeepSeekV4TokenToKVPool)
+        )
         else ()
     )
     return Region(
@@ -998,9 +1002,10 @@ def _static_state_entries(
 
         router = token_to_kv_pool.layer_router
         has_window_sub_pool = router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
+        is_dsv4_pool = isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         # A pool with a sliding-window sub-pool describes its window state here,
         # and so does DeepSeek-V4's, its heterogeneous state list per entry.
-        if has_window_sub_pool or isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
+        if has_window_sub_pool or is_dsv4_pool:
             swa_kv_layout = None
             if has_window_sub_pool and isinstance(
                 router.view(IdSpaceKind.SLIDING_WINDOW), MHATokenToKVPool
@@ -1011,6 +1016,10 @@ def _static_state_entries(
                 data_ptrs,
                 data_lens,
                 item_lens,
+                # DeepSeek-V4 pairs its state entries by layer id (ours).
+                layer_ids=(
+                    token_to_kv_pool.get_state_layer_ids() if is_dsv4_pool else None
+                ),
                 kv_layout=swa_kv_layout,
                 # Read when asked, as the window's view was: not every pool
                 # with window state keeps a window pool of its own.
@@ -1053,6 +1062,11 @@ def _static_state_entries(
                         c128_ptrs,
                         c128_lens,
                         c128_item_lens,
+                        layer_ids=(
+                            token_to_kv_pool.get_request_state_layer_ids()
+                            if is_dsv4_pool
+                            else None
+                        ),
                     )
         elif router.wrapped_view() is not None:
             dim = (

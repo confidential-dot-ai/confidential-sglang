@@ -51,6 +51,9 @@ from sglang.srt.layers.quantization.mxfp8_input import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import compile_in_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
     is_in_prefill_graph_scope,
 )
@@ -331,7 +334,10 @@ def make_boundary(
 
 
 def use_stats_stream(cfg: HcConfig, forward_batch: ForwardBatch, x: torch.Tensor):
-    if not cfg.pre_from_prev:
+    # Not inside a breakable graph: an eager break (e.g. a CPU Engram lookup)
+    # between fork and join lets the stats escape capture, and replay then
+    # reuses stale coefficients.
+    if not cfg.pre_from_prev or is_in_breakable_cuda_graph():
         return False
     decode_like = forward_batch.forward_mode.is_decode() or (
         forward_batch.forward_mode.is_target_verify() and x.shape[0] > 0

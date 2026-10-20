@@ -8,6 +8,7 @@ from .attn import (
 from .compress import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
+    compress_c4_norm_rope_store_fp4,
     compress_forward,
     compress_norm_rope_store,
 )
@@ -32,6 +33,7 @@ from .utils import make_name
 __all__ = [
     "CompressorDecodePlan",
     "CompressorPrefillPlan",
+    "compress_c4_norm_rope_store_fp4",
     "compress_forward",
     "compress_norm_rope_store",
     "fused_norm_rope_inplace",

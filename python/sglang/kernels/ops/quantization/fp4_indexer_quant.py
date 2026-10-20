@@ -66,6 +66,52 @@ def _fp4_e2m1_code_rne(x):
 
 
 @triton.jit
+def _fp32x2_to_e2m1x2(x_lo, x_hi):
+    # PTX places its first source in the high nibble and its second source in
+    # the low nibble, so the operands are intentionally high then low.
+    return tl.inline_asm_elementwise(
+        """
+        {
+        .reg .b8 packed;
+        cvt.rn.satfinite.e2m1x2.f32 packed, $1, $2;
+        cvt.u32.u8 $0, packed;
+        }
+        """,
+        constraints="=r,f,f",
+        args=[x_hi, x_lo],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    ).to(tl.uint8)
+
+
+def _has_native_e2m1x2(device: torch.device) -> bool:
+    if device.type != "cuda" or torch.version.hip is not None:
+        return False
+    if torch.version.cuda is None:
+        return False
+    cuda_version = tuple(int(part) for part in torch.version.cuda.split(".")[:2])
+    if cuda_version < (12, 8):
+        return False
+    major, minor = torch.cuda.get_device_capability(device)
+    # SM121 (GB10) is not instruction-compatible with the SM120 FP4 convert.
+    return major in (10, 11) or (major, minor) == (12, 0)
+
+
+@triton.jit
+def _pack_e2m1x2(x_lo, x_hi, RNE: tl.constexpr, USE_NATIVE_E2M1X2: tl.constexpr):
+    if RNE and USE_NATIVE_E2M1X2:
+        return _fp32x2_to_e2m1x2(x_lo, x_hi)
+    if RNE:
+        code_lo = _fp4_e2m1_code_rne(x_lo)
+        code_hi = _fp4_e2m1_code_rne(x_hi)
+    else:
+        code_lo = _fp4_e2m1_code(x_lo)
+        code_hi = _fp4_e2m1_code(x_hi)
+    return (code_lo & 0x0F) | ((code_hi & 0x0F) << 4)
+
+
+@triton.jit
 def quantize_fp4_indexer_row(
     values,
     v0,
@@ -73,6 +119,7 @@ def quantize_fp4_indexer_row(
     BLOCK_N: tl.constexpr,
     GROUP_N: tl.constexpr,
     RNE: tl.constexpr,
+    USE_NATIVE_E2M1X2: tl.constexpr = False,
 ):
     """One row of quantize_fp4_indexer_tensor: values is the fp32 [BLOCK_N] row,
     v0 / v1 its even / odd elements as fp32 [BLOCK_N // 2]. Returns
@@ -116,13 +163,7 @@ def quantize_fp4_indexer_row(
 
     v0 = v0 / scale0
     v1 = v1 / scale1
-    if RNE:
-        code0 = _fp4_e2m1_code_rne(v0)
-        code1 = _fp4_e2m1_code_rne(v1)
-    else:
-        code0 = _fp4_e2m1_code(v0)
-        code1 = _fp4_e2m1_code(v1)
-    packed = (code0 & 0x0F) | ((code1 & 0x0F) << 4)
+    packed = _pack_e2m1x2(v0, v1, RNE, USE_NATIVE_E2M1X2)
     return packed, packed_sf
 
 
@@ -134,6 +175,7 @@ def _quantize_fp4_indexer_kernel(
     BLOCK_N: tl.constexpr,
     GROUP_N: tl.constexpr,
     RNE: tl.constexpr,
+    USE_NATIVE_E2M1X2: tl.constexpr = False,
 ):
     token_id = tl.program_id(0)
     offs = tl.arange(0, BLOCK_N)
@@ -143,7 +185,13 @@ def _quantize_fp4_indexer_kernel(
     v0 = tl.load(row + pair_offsets * 2).to(tl.float32)
     v1 = tl.load(row + pair_offsets * 2 + 1).to(tl.float32)
     packed, packed_sf = quantize_fp4_indexer_row(
-        values, v0, v1, BLOCK_N=BLOCK_N, GROUP_N=GROUP_N, RNE=RNE
+        values,
+        v0,
+        v1,
+        BLOCK_N=BLOCK_N,
+        GROUP_N=GROUP_N,
+        RNE=RNE,
+        USE_NATIVE_E2M1X2=USE_NATIVE_E2M1X2,
     )
     tl.store(x_sf + token_id, packed_sf)
     tl.store(x_fp4 + token_id * (BLOCK_N // 2) + pair_offsets, packed)
@@ -200,10 +248,10 @@ def _quantize_fp4_indexer_rows(
 
 
 def quantize_fp4_indexer_tensor(
-    x: torch.Tensor, rne: bool = False
+    x: torch.Tensor, rne: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-32 ue8m0 fp4 quantize. rne=True uses round-to-nearest-even (the dsv41
-    reference rounding); the default keeps ``_fp4_e2m1_code``'s thresholds."""
+    reference rounding); rne=False keeps the legacy thresholds."""
     assert x.shape[-1] == 128
     x = x.contiguous().view(-1, x.shape[-1])
     x_fp4 = torch.empty((x.shape[0], 64), device=x.device, dtype=torch.int8)
@@ -229,5 +277,6 @@ def quantize_fp4_indexer_tensor(
             BLOCK_N=128,
             GROUP_N=32,
             RNE=rne,
+            USE_NATIVE_E2M1X2=_has_native_e2m1x2(x.device),
         )
     return x_fp4, x_sf
