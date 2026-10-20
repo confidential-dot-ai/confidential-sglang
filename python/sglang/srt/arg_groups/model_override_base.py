@@ -60,7 +60,13 @@ def register_model_override_predicate(predicate: Callable[[str], bool]):
 
 # --moe-a2a-backend values DSpark with DP attention is validated on, per
 # architecture that differs from the default.
-DSPARK_DP_A2A_BACKENDS_DEFAULT: Tuple[str, ...] = ("none", "megamoe", "mori")
+# "flashinfer" (ours): DSpark under dp attention also runs the FlashInfer a2a MoE.
+DSPARK_DP_A2A_BACKENDS_DEFAULT: Tuple[str, ...] = (
+    "none",
+    "megamoe",
+    "mori",
+    "flashinfer",
+)
 _DSPARK_DP_A2A_BACKENDS: Dict[str, Tuple[str, ...]] = {}
 
 

@@ -30,15 +30,16 @@ from sglang.kernels.ops.attention.dsv4.topk import (
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.device import async_h2d
 
+from .memory_budget import INDEX_LOGITS_BUDGET_CAP_BYTES, planned_index_logits_budget
 from .types import DecodeInputs, PrefillInputs, RowShard
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-# TODO: use a per-forward mqa_logits_budget_bytes() budget that also
-# leaves room for candidate block ids and block-selection scratch.
-_DEEP_GEMM_SCORE_BUDGET_BYTES = 2 << 30
+# Cap of one fp32 logits tile; startup planning (memory_budget) may lower it to
+# what CUDA-graph capture leaves free.
+_DEEP_GEMM_SCORE_BUDGET_BYTES = INDEX_LOGITS_BUDGET_CAP_BYTES
 
 
 class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
@@ -205,6 +206,38 @@ def get_deep_gemm_decode_data(
     return DeepGEMMDecodeData(q_fp4, q_sf, weights, k_cache)
 
 
+def get_prefill_queries(inputs: PrefillInputs) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Roped queries [rows, heads, 128] and bf16 head weights [rows, heads]."""
+    assert (inputs.q is None) == (inputs.weights is None), (
+        "a precomputed prefill query comes with its head weights"
+    )
+    if inputs.q is not None:
+        return inputs.q, inputs.weights
+    indexer = inputs.indexer
+    return (
+        indexer.queries(inputs.q_lora, inputs.freqs_cis[inputs.positions]),
+        indexer.head_weights(inputs.x),
+    )
+
+
+def _prefill_index_q_and_weights(
+    inputs: PrefillInputs,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``_index_q_and_weights`` for a prefill chunk, or the quantized queries and
+    fp32 weights the prefill graph's projection break already computed."""
+    if inputs.q is None:
+        return _index_q_and_weights(
+            indexer=inputs.indexer,
+            x=inputs.x,
+            q_lora=inputs.q_lora,
+            freqs_cis=inputs.freqs_cis,
+            positions=inputs.positions,
+        )
+    q, weights = get_prefill_queries(inputs)
+    q_fp4, q_sf = quantize_index_q(q)
+    return q_fp4, q_sf, weights.float()
+
+
 def prefill_k_slots(
     *,
     req_to_token: torch.Tensor,
@@ -278,13 +311,7 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil
             plans[ratio] = plan
     if plan is None:
         return None
-    q_fp4, q_sf, weights = _index_q_and_weights(
-        indexer=inputs.indexer,
-        x=inputs.x,
-        q_lora=inputs.q_lora,
-        freqs_cis=inputs.freqs_cis,
-        positions=inputs.positions,
-    )
+    q_fp4, q_sf, weights = _prefill_index_q_and_weights(inputs)
     return DeepGEMMPrefillData(
         k_slots=inputs.k_slots,
         request_starts=plan.request_starts,
@@ -309,7 +336,7 @@ def score_tiles(
         starts=data.request_starts,
         lengths=data.compress_lens,
         context_lengths=data.lens_per_request,
-        budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
+        budget_bytes=min(_DEEP_GEMM_SCORE_BUDGET_BYTES, planned_index_logits_budget()),
     )
 
 
@@ -437,8 +464,7 @@ def prefill_requests(
         )
     )
     inputs.reset_outputs()
-    q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
-    weights = indexer.head_weights(inputs.x)
+    q, weights = get_prefill_queries(inputs)
     # A compressed position is visible once the query has passed its last token.
     compress_lens = (pos + 1) // ratio
     topk = indexer.index_topk

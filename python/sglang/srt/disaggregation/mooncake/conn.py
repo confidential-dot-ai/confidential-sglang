@@ -2054,7 +2054,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if dst_aux_item_lens is None:
             dst_aux_item_lens = prefill_aux_item_lens
 
-        # Stop at the shorter list; see check_peer_aux_buffer_count.
+        # Stop at the shorter list; see check_peer_aux_buffer_count. A pipeline
+        # stage may register fewer trailing buffers than decode (the CED boundary
+        # state lives only on the stage that computes it).
         for i in range(min(len(prefill_aux_ptrs), len(dst_aux_ptrs))):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
@@ -2270,6 +2272,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             else:
                 dst_data_ptrs, dst_item_lens, dst_dim_per_tensor = [], [], []
                 dst_state_layer_ids = []
+            if envs.SGLANG_OPT_DSV41_PREFILL_TAIL.get():
+                pairs = build_transfer_entry_pairs(
+                    src_state_layer_ids,
+                    dst_state_layer_ids,
+                    len(src_data_ptrs),
+                    len(dst_data_ptrs),
+                )
+                for src_entry, dst_entry in pairs:
+                    if src_item_lens[src_entry] != dst_item_lens[dst_entry]:
+                        raise RuntimeError(
+                            f"Prefill-tail state item size mismatch: component={i}, "
+                            f"src={src_item_lens[src_entry]}, dst={dst_item_lens[dst_entry]}"
+                        )
             dst_indices = (
                 req.dst_state_indices[i] if i < len(req.dst_state_indices) else []
             )

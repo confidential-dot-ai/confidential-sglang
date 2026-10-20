@@ -12,7 +12,7 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
 from sglang.srt.model_executor.forward_batch_info import compute_position
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
-from sglang.srt.utils import is_pin_memory_available
+from sglang.srt.speculative.spec_utils import lens_to_device
 
 
 class PrefillPlacement(NamedTuple):
@@ -73,13 +73,8 @@ class TargetHiddenKvInjector:
             raise RuntimeError("DSpark prefill expected out_cache_loc, but got None.")
 
         device = self.model_runner.device
-        pin_memory = is_pin_memory_available(device)
-        ctx_lens = torch.tensor(
-            batch.extend_lens, dtype=torch.int32, pin_memory=pin_memory
-        ).to(device, non_blocking=True)
-        draft_seq_lens = torch.tensor(
-            batch.prefix_lens, dtype=torch.int32, pin_memory=pin_memory
-        ).to(device, non_blocking=True)
+        ctx_lens = lens_to_device(lens=batch.extend_lens, device=device)
+        draft_seq_lens = lens_to_device(lens=batch.prefix_lens, device=device)
         positions, _ = compute_position(
             self.model_runner.prefill_attention_backend_str,
             draft_seq_lens,

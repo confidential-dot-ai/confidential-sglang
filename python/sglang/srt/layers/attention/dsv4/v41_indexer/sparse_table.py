@@ -535,6 +535,8 @@ def select_prefill_rows(
             out_offsets=zero_offsets[: logits.shape[0]],
             out_indices=out_blocks[tile],
         )
+        # Free this tile's logits before the generator scores the next one.
+        del logits, keys
 
 
 # TODO(dark): support fusion of publish + topk of publish layer

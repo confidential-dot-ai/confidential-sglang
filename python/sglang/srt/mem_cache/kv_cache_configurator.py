@@ -1363,7 +1363,7 @@ class KVCacheConfigurator:
             model=None,
             model_dtype=aux.draft_model_config.dtype,
             is_draft_worker=True,
-            is_dflash=self.spec_algorithm.is_dflash_family(),
+            is_dflash_family=self.spec_algorithm.is_dflash_family(),
             speculative_draft_attention_backend=draft_backend,
             speculative_draft_kv_cache_dtype=draft_kv_cache_dtype,
         )

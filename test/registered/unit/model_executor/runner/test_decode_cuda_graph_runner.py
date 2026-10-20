@@ -26,7 +26,7 @@ server is constructed.
 import os
 import tempfile
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest import mock
 
 import torch
@@ -436,6 +436,59 @@ class TestAttentionVariantSizes(CustomTestCase):
                 for bs, label in replays.items():
                     replayed = runner._resolve_attention_variant(long_batch, bs)
                     self.assertEqual(replayed, label, bs)
+
+
+class TestCaptureOomDegradesToEager(CustomTestCase):
+    """An OOM'd capture shape must be recorded as eager-only, not crash the boot.
+
+    The 1M-context boot died outright instead of serving without those graphs.
+    Two black-box behaviors are pinned: an OOM is absorbed and the shape is
+    recorded in ``_skipped_bs`` (which is what keeps ``can_run_graph``
+    from admitting a bucket whose graph was never captured -- replay indexes
+    ``self._graphs[shape_key]`` bare, so admitting one is a KeyError at serving
+    time, not a slow path), while a non-OOM error still propagates so real bugs
+    are not swallowed.
+    """
+
+    def _stub(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        stub = SimpleNamespace(
+            _skipped_capture_shapes=[],
+            _skipped_bs=frozenset(),
+        )
+        stub._skip_capture_shape_or_raise = MethodType(
+            DecodeCudaGraphRunner._skip_capture_shape_or_raise, stub
+        )
+        return stub
+
+    def test_oom_is_absorbed_and_the_shape_is_recorded(self):
+        stub = self._stub()
+        stub._skip_capture_shape_or_raise(
+            torch.OutOfMemoryError("CUDA out of memory"), 128, 1024
+        )
+        self.assertEqual(stub._skipped_capture_shapes, [(128, 1024)])
+        self.assertIn(128, stub._skipped_bs)
+
+    def test_plain_runtime_error_naming_oom_is_also_absorbed(self):
+        # FlashInfer workspace and driver graph allocations surface as a bare
+        # RuntimeError, not torch.OutOfMemoryError.
+        stub = self._stub()
+        stub._skip_capture_shape_or_raise(
+            RuntimeError("CUDA error: out of memory"), 64, 512
+        )
+        self.assertIn(64, stub._skipped_bs)
+
+    def test_a_non_oom_failure_still_raises(self):
+        stub = self._stub()
+        with self.assertRaises(ValueError):
+            stub._skip_capture_shape_or_raise(
+                ValueError("a real bug"), 8, 64
+            )
+        self.assertEqual(stub._skipped_capture_shapes, [])
+        self.assertEqual(stub._skipped_bs, frozenset())
 
 
 class TestRaggedVerifyLayoutPerTier(CustomTestCase):

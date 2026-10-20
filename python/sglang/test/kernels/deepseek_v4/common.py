@@ -257,6 +257,34 @@ def fp4_e2m1_code_ref(x: torch.Tensor) -> torch.Tensor:
     return idx | sign
 
 
+def fp4_e2m1_code_rne_ref(x: torch.Tensor) -> torch.Tensor:
+    """E2M1 nibble of ``x`` under round-to-nearest-even, the dsv41 default:
+    midpoints round toward the even code, so every other threshold is inclusive."""
+    ax = torch.minimum(x.abs(), torch.tensor(6.0, device=x.device))
+    idx = torch.zeros_like(ax, dtype=torch.uint8)
+    for threshold, inclusive in (
+        (0.25, False),
+        (0.75, True),
+        (1.25, False),
+        (1.75, True),
+        (2.5, False),
+        (3.5, True),
+        (5.0, False),
+    ):
+        comparison = ax >= threshold if inclusive else ax > threshold
+        idx += comparison.to(torch.uint8)
+    sign = ((x < 0) & (idx != 0)).to(torch.uint8) * 8
+    return idx | sign
+
+
+def fold_fp4_negative_zero(packed: torch.Tensor) -> torch.Tensor:
+    """Packed e2m1 bytes with -0 (code 8) written as +0. Native PTX cvt keeps the
+    sign of a value that rounds to zero and the software path drops it; both are 0."""
+    packed = packed.view(torch.uint8)
+    lo, hi = packed & 0x0F, packed & 0xF0
+    return torch.where(lo == 0x08, 0, lo) | torch.where(hi == 0x80, 0, hi)
+
+
 # DSV4 FP4 index-K row: 128 values as 64 packed e2m1 bytes plus four ue8m0
 # exponents (one per 32 values), stored page-major as 64 payload bytes per slot
 # followed by 4 scale bytes per slot.
@@ -268,9 +296,12 @@ _INDEX_SCALE_BYTES = 4
 _INDEX_PAGE_SIZE = 64
 
 
-def quantize_fp4_indexer_ref(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Torch ``quantize_fp4_indexer_tensor`` (default rounding): packed e2m1 codes
-    uint8 ``[n, 64]`` and the four ue8m0 exponents packed into int32 ``[n]``."""
+def quantize_fp4_indexer_ref(
+    x: torch.Tensor, rne: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Torch ``quantize_fp4_indexer_tensor`` (default: round-to-nearest-even):
+    packed e2m1 codes uint8 ``[n, 64]`` and the four ue8m0 exponents packed into
+    int32 ``[n]``. Compare kernel payloads through ``fold_fp4_negative_zero``."""
     x = x.contiguous().view(-1, _INDEX_HEAD_DIM).float()
     groups = x.view(-1, _INDEX_SCALE_GROUPS, _INDEX_GROUP_SIZE)
     scale_raw = (groups.abs().amax(dim=-1) / 6.0).clamp_min(1.0e-4)
@@ -278,7 +309,7 @@ def quantize_fp4_indexer_ref(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tenso
     scale = (scale_exp << 23).contiguous().view(torch.float32)
 
     scaled = (groups / scale.unsqueeze(-1)).view(-1, _INDEX_HEAD_DIM)
-    code = fp4_e2m1_code_ref(scaled)
+    code = fp4_e2m1_code_rne_ref(scaled) if rne else fp4_e2m1_code_ref(scaled)
     packed = (code[:, 0::2].to(torch.int16) | (code[:, 1::2].to(torch.int16) << 4)).to(
         torch.uint8
     )
@@ -315,3 +346,11 @@ def store_fp4_index_cache_ref(
             (x_sf[token_id] >> sf_shifts) & 0xFF
         ).to(torch.uint8)
     return expected
+
+
+def fold_fp4_index_cache_negative_zero(cache: torch.Tensor) -> torch.Tensor:
+    """A 64-slot index-K cache with -0 folded in the fp4 payload; scale bytes kept."""
+    folded = cache.clone()
+    payload = folded[:, : _INDEX_PAGE_SIZE * _INDEX_FP4_DIM]
+    payload.copy_(fold_fp4_negative_zero(payload))
+    return folded

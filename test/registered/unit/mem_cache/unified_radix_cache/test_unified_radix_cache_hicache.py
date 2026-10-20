@@ -3,6 +3,7 @@ from array import array
 from dataclasses import replace
 from unittest import mock
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InitLoadBackParams,
@@ -28,6 +29,7 @@ from sglang.test.kits.unified_radix_cache.config import (
     requires_mamba,
     requires_swa,
     requires_swa_and_mamba,
+    requires_swa_only,
 )
 from sglang.test.kits.unified_radix_cache.fixtures import (
     build_fixture,
@@ -707,6 +709,23 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         )
         self._finish_pending_loads(cache)
         self._release_ongoing_load_back_locks(cache)
+        cache.sanity_check()
+
+    @requires_swa_only
+    def test_hicache_write_back_internal_swa_evict_drops_when_disabled(self):
+        """SGLANG_ENABLE_HICACHE_SWA_TOMBSTONE_BACKUP=0 keeps the legacy drop
+        under write_back too (no hicache strategy covers FULL+SWA+MAMBA)."""
+        cache, _, seq_a, seq_b = self._build_internal_swa_fixture("write_back")
+
+        with envs.SGLANG_ENABLE_HICACHE_SWA_TOMBSTONE_BACKUP.override(False):
+            cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_b)))
+
+        m = match_prefix(cache, seq_a)
+        if m.best_match_node != cache.root_node_handle():
+            self.assertIsNone(
+                node_host_value(cache, m.best_match_node, ComponentType.SWA),
+                "disabled: no host demote",
+            )
         cache.sanity_check()
 
     def test_match_prefix_best_and_device_node_without_hicache(self):

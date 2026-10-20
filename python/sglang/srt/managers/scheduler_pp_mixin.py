@@ -4,7 +4,7 @@ import logging
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed
@@ -104,6 +104,9 @@ class PPBatchMetadata:
     unified_forward_done: Optional[torch.cuda.Event] = None
     # Rank-local: recorded on the forward stream after this forward, any pool.
     forward_done: Optional[torch.cuda.Event] = None
+    # CED boundary capture of the stage that ran the boundary layer; the rebuilt
+    # result must carry it or prefill never writes the handoff slot.
+    ced_boundary: Optional[Any] = None
 
 
 class SchedulerPPMixin:
@@ -1223,6 +1226,7 @@ class SchedulerPPMixin:
                 fpm_timing=mb_metadata.fpm_timing,
                 forward_launch=mb_metadata.forward_launch,
                 unified_forward_done=mb_metadata.unified_forward_done,
+                ced_boundary=mb_metadata.ced_boundary,
             )
             return output_result
 
@@ -1300,6 +1304,7 @@ class SchedulerPPMixin:
                         else next_draft_input.hidden_states
                     ),
                 ),
+                future_indices_cpu=batch.req_pool_indices_cpu,
             )
         batch.input_ids = None
         output_result = GenerationBatchResult(
@@ -1313,6 +1318,7 @@ class SchedulerPPMixin:
             fpm_timing=mb_metadata.fpm_timing,
             forward_launch=mb_metadata.forward_launch,
             unified_forward_done=mb_metadata.unified_forward_done,
+            ced_boundary=mb_metadata.ced_boundary,
         )
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
@@ -1858,6 +1864,7 @@ class SchedulerPPMixin:
                     forward_launch=result.forward_launch,
                     unified_forward_done=result.unified_forward_done,
                     forward_done=event,
+                    ced_boundary=result.ced_boundary,
                 )
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth

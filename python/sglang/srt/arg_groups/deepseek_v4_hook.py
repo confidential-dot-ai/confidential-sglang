@@ -330,6 +330,31 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     )
 
 
+def _resolve_prefill_graph_max_seq_len(server_args: ServerArgs) -> None:
+    # An unset max_seq_len is capped by the attention backend
+    # (prefill_cuda_graph_default_max_seq_len), which leaves it uncapped under
+    # SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER.
+    cfg = resolving_view(server_args)
+    prefill_graph = cfg.cuda_graph_config.prefill
+    if prefill_graph.backend == Backend.DISABLED:
+        return
+    eager_indexer = envs.SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER.get()
+    if eager_indexer and (
+        cfg.attn_cp_size != 1 or cfg.dcp_size != 1 or cfg.enable_prefill_cp
+    ):
+        # Under CP the index layers are not an eager break of the prefill graph.
+        logger.warning(
+            "SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER does not apply under "
+            "context parallelism; keeping the captured indexer."
+        )
+        return
+    if eager_indexer and prefill_graph.max_seq_len is None:
+        logger.info(
+            "DeepSeek-V4.1 prefill graphs replay any context length; the "
+            "ratio-1/2 index layers run as eager breaks."
+        )
+
+
 def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     if not cfg.enable_encoder_swa_bounded_replay:
@@ -426,7 +451,17 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             cfg.dsv4_attn_backend == "trtllm" and cfg.enable_encoder_swa_bounded_replay,
         ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
-        ("pipeline parallelism", cfg.pp_size > 1),
+        (
+            "pipeline parallelism outside a CED-split prefill",
+            cfg.pp_size > 1
+            and not (
+                (
+                    envs.SGLANG_OPT_DSV41_CED_SPLIT.get()
+                    or envs.SGLANG_OPT_DSV41_PREFILL_TAIL.get()
+                )
+                and cfg.disaggregation_mode == "prefill"
+            ),
+        ),
     )
     for feature, enabled in unsupported:
         if enabled:
@@ -464,6 +499,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "both servers use the same block size and target/draft KV layout."
             )
 
+    _resolve_prefill_graph_max_seq_len(server_args)
+
     incompatible = (
         (
             "prefill CP with the prefill CUDA graph",
@@ -489,6 +526,11 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                     )
                 )
             ),
+        ),
+        (
+            "prefill graph with CP",
+            cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+            and (cfg.attn_cp_size != 1 or cfg.dcp_size != 1 or cfg.enable_prefill_cp),
         ),
     )
     if cfg.enable_decoder_swa_bounded_replay:

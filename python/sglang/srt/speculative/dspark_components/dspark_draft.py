@@ -16,6 +16,7 @@ from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecutio
 from sglang.srt.environ import envs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.overlap_utils import consume_deferred_seq_lens_cpu
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     enable_num_token_non_padded,
@@ -613,6 +614,10 @@ class DraftBlockProposer:
             noise_embedding = embed_module(draft_block_ids)
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
+        # First exact consumer of the tick: the draft's attention plan
+        # derives its K coverage from the mirror, so the deferred blocking
+        # resolve (if armed) must land here, not earlier.
+        consume_deferred_seq_lens_cpu(batch)
         if not self.draft_model_runner.attn_backend.needs_cpu_seq_lens:
             draft_seq_lens_cpu = None
             draft_seq_lens_sum = None
