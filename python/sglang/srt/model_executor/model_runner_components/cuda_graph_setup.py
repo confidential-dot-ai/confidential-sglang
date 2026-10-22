@@ -487,6 +487,14 @@ def capture_cuda_graphs(
             decode = capture_decode_graph(
                 model_runner=model_runner, prefill_runner=prefill.runner
             )
+            if not model_runner.is_draft_worker:
+                from sglang.srt.model_executor.runner.ced_tail_graph import (
+                    precapture_ced_late_graphs,
+                )
+
+                precapture_ced_late_graphs(
+                    model_runner=model_runner, eager_runner=eager_runner
+                )
     else:
         decode = GraphCapture(
             runner=eager_runner,
