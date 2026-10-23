@@ -1249,3 +1249,63 @@ class TestCandidateIndexerGating(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPrefillIndexPlanCache(CustomTestCase):
+    """The index-source layers of one forward share their index plan, but a plan
+    must never be reused for a different compress ratio: the compressed lengths
+    and request starts of one ratio are wrong for the other."""
+
+    def _inputs(self, ratio, plans):
+        from sglang.srt.layers.attention.dsv4.v41_indexer.types import PrefillInputs
+
+        seq_len, rows = 40, 8
+        return PrefillInputs(
+            indexer=None,
+            layer_id=0,
+            compress_ratio=ratio,
+            freqs_cis=None,
+            x=None,
+            q_lora=None,
+            positions=self.positions,
+            req_rows=None,
+            req_pool_indices=torch.tensor([1]),
+            k_slots=torch.zeros(0, dtype=torch.int64),
+            index_plans=plans,
+            kv_page_table=None,
+            seq_lens_cpu=[seq_len],
+            rows_per_request=[rows],
+            rows_per_request_device=torch.tensor([rows]),
+            out_raw_indices=torch.empty(0),
+            out_page_indices=None,
+        )
+
+    def test_plan_is_shared_within_a_ratio_and_never_across(self):
+        from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
+
+        self.positions = torch.arange(32, 40)
+        built = []
+        real = scoring.prefill_index_plan
+
+        def counting(inputs):
+            built.append(inputs.compress_ratio)
+            return real(inputs)
+
+        plans = {}
+        with patch.object(scoring, "prefill_index_plan", counting), patch.object(
+            scoring, "_prefill_index_q_and_weights", lambda inputs: (None, None, None)
+        ), patch.object(
+            scoring,
+            "async_h2d",
+            lambda v, dtype, device: torch.tensor(v, dtype=dtype),
+        ):
+            first = scoring.get_deep_gemm_prefill_data(self._inputs(1, plans))
+            again = scoring.get_deep_gemm_prefill_data(self._inputs(1, plans))
+            other = scoring.get_deep_gemm_prefill_data(self._inputs(2, plans))
+            uncached = scoring.get_deep_gemm_prefill_data(self._inputs(2, None))
+
+        self.assertEqual(built, [1, 2, 2])
+        self.assertIs(again.request_starts, first.request_starts)
+        self.assertFalse(torch.equal(other.compress_lens, first.compress_lens))
+        self.assertTrue(torch.equal(other.compress_lens, uncached.compress_lens))
+        self.assertEqual(other.lens_per_request, uncached.lens_per_request)
