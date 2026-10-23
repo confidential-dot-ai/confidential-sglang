@@ -52,13 +52,32 @@ if TYPE_CHECKING:
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
+    if batch is None or batch.forward_mode != ForwardMode.EXTEND:
+        return False
+    if batch.return_logprob:
+        return False
+    if _ced_prefill_needs_no_output(batch):
+        return True
     return (
         envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get()
-        and batch is not None
-        and batch.forward_mode == ForwardMode.EXTEND
         and len(batch.reqs) == 1
         and not batch.contains_last_prefill_chunk
-        and not batch.return_logprob
+    )
+
+
+def _ced_prefill_needs_no_output(batch: ScheduleBatch) -> bool:
+    # A CED-split prefill runs only the encoder and decode samples the first token
+    # itself, so the last stage's token is never read; every stage decides this
+    # from the batch alone, which keeps each skipped send matched to its recv.
+    from sglang.srt.disaggregation.utils import ced_split_enabled
+
+    return (
+        ced_split_enabled()
+        and get_disagg().disaggregation_mode == "prefill"
+        and not any(
+            req.return_sampling_mask or req.return_routed_experts
+            for req in batch.reqs
+        )
     )
 
 
@@ -1129,6 +1148,7 @@ class SchedulerPPMixin:
             can_run_cuda_graph=(
                 mb_metadata.can_run_cuda_graph if mb_metadata else False
             ),
+            ced_boundary=mb_metadata.ced_boundary if mb_metadata else None,
             skipped_output_comm=True,
             fpm_timing=mb_metadata.fpm_timing if mb_metadata else None,
             forward_launch=mb_metadata.forward_launch if mb_metadata else None,
