@@ -72,6 +72,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
             move_logprobs_to_cpu=Mock(),
             consume_auxiliary_output=Mock(),
             _maybe_collect_customized_info=Mock(),
+            _wait_result_copy=Mock(),
         )
         self.spec_algorithm = SimpleNamespace(is_eagle=lambda: False)
         self.tree_cache = Mock()
