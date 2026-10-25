@@ -789,6 +789,14 @@ class MetadataBuffers:
             self.kv_checksum[idx] = 0
 
     def get_buf_infos(self):
+        bufs = self.transfer_buffers()
+        ptrs = [buf.data_ptr() for buf in bufs]
+        data_lens = [buf.nbytes for buf in bufs]
+        item_lens = [buf[0].nbytes for buf in bufs]
+        return ptrs, data_lens, item_lens
+
+    def transfer_buffers(self) -> List[torch.Tensor]:
+        """The buffers PD transfers, in aux-pointer order; row i is slot i."""
         bufs = [
             self.output_ids,
             self.cached_tokens,
@@ -818,10 +826,7 @@ class MetadataBuffers:
                 self.output_customized_info,
                 self.output_customized_info_len,
             ]
-        ptrs = [buf.data_ptr() for buf in bufs]
-        data_lens = [buf.nbytes for buf in bufs]
-        item_lens = [buf[0].nbytes for buf in bufs]
-        return ptrs, data_lens, item_lens
+        return bufs
 
     def get_buf(self, idx: int):
         return (

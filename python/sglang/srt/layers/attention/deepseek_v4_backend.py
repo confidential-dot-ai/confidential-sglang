@@ -56,6 +56,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     ComputeDsparkWindowGather,
     swa_ring_rows,
 )
+from sglang.srt.disaggregation.divergence_debug import (
+    LAYER_PROBES_ENABLED,
+    layer_probe,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -4167,10 +4171,19 @@ class DeepseekV4AttnBackend(
             out_page_indices=core.sparse_page_indices(ratio),
             out_raw_indices=core.sparse_raw_indices(ratio),
         )
+        if LAYER_PROBES_ENABLED:
+            layer_probe(layer_id=layer.layer_id, point="index_q", tensor=projected_q)
+            layer_probe(layer_id=layer.layer_id, point="index_w", tensor=projected_w)
         # At any width: the consumer scores only the blocks the source published.
         self.prefill_candidates.consume_prefill_captured(
             inputs, self.forward_metadata.candidate_metadata
         )
+        if LAYER_PROBES_ENABLED:
+            layer_probe(
+                layer_id=layer.layer_id,
+                point="selected",
+                tensor=core.sparse_raw_indices(ratio),
+            )
 
     def _make_low_ratio_decode_indexer_inputs(self, layer, x, q_lora, req, pos, mode):
         ratio = layer.compress_ratio
