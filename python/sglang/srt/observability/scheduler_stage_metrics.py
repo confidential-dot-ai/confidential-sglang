@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import TypeVar, cast
 
+from sglang.srt.utils import pair_progress
+
 from sglang.srt.utils.nvtx_utils import (
     NVTX_SCHEDULER_ENABLED,
     profile_range,
@@ -173,6 +175,10 @@ def scheduler_stage_method(stage: str) -> Callable[[_F], _F]:
 
         @wraps(func)
         def wrapper(self, *args, **kwargs):
+            with pair_progress.stage(stage):
+                return measured(self, *args, **kwargs)
+
+        def measured(self, *args, **kwargs):
             recorder = self.scheduler_stage_metrics
             if recorder is None:
                 return profiled_func(self, *args, **kwargs)

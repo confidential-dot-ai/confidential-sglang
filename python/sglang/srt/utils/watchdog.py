@@ -16,6 +16,15 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import pyspy_dump_schedulers
 
 logger = logging.getLogger(__name__)
 
+
+def _arm_fatal_exit(grace: float = 30.0) -> threading.Timer:
+    """Arm before diagnostics or NCCL cleanup; either operation may block."""
+    timer = threading.Timer(grace, lambda: os._exit(1))
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
 # Grace between asking the parent to tear the group down and exiting anyway.
 # Long enough for an orderly shutdown to win, short enough that a wedged rank
 # does not sit in rotation.
@@ -182,10 +191,17 @@ class WatchdogRaw:
             # sub-timeout resolution during startup.
             time.sleep(self.watchdog_timeout / 2)
 
-        if self.dump_info is not None and (info_msg := self.dump_info()):
-            logger.error(f"{self.debug_name} debug info:\n{info_msg}")
+        if not self.soft:
+            _arm_fatal_exit()
+        from sglang.srt.utils.pair_progress import error_event
 
-        pyspy_dump_schedulers()
+        error_event("watchdog_timeout")
+        # The pair profile exports only reviewed structured records. Existing
+        # dumps can include request objects or arbitrary library messages.
+        if not os.environ.get("SGLANG_PAIR_RUN_DIR"):
+            if self.dump_info is not None and (info_msg := self.dump_info()):
+                logger.error(f"{self.debug_name} debug info:\n{info_msg}")
+            pyspy_dump_schedulers()
         logger.error(
             f"{self.debug_name} watchdog timeout "
             f"({self.watchdog_timeout=}, {self.soft=})"
@@ -274,6 +290,12 @@ class SubprocessWatchdog:
                 f"with exit code {proc.exitcode}. "
                 f"Triggering SIGQUIT for cleanup..."
             )
+            # Uvicorn's multi-process supervisor can ignore SIGQUIT. Always
+            # retain an exit deadline, independently of its signal handling.
+            _arm_fatal_exit()
+            from sglang.srt.utils.pair_progress import error_event
+
+            error_event("rank_failed")
             os.kill(os.getpid(), signal.SIGQUIT)
             return True
         return False
