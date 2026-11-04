@@ -7080,6 +7080,11 @@ def run_scheduler_process(
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
 ):
+    # Register before model loading so the supervisor can distinguish startup
+    # from a missing or dead rank. Each pair uses TP/PP with DP size one.
+    from sglang.srt.utils import pair_progress
+
+    pair_progress.initialize(pp_rank * server_args.tp_size + tp_rank)
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     dp_rank = resolve_spawn_dp_rank(dp_rank)
@@ -7121,6 +7126,7 @@ def run_scheduler_process(
     scheduler = None
     try:
         scheduler = Scheduler(server_args, port_args)
+        pair_progress.scheduler_ready(scheduler)
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
