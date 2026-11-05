@@ -5,6 +5,7 @@ module. A heartbeat comes from the scheduler thread, never an independent
 timer that could keep a stalled scheduler looking healthy.
 """
 
+from array import array
 from collections import deque
 from contextlib import contextmanager
 import json
@@ -43,7 +44,7 @@ def _scheduler_snapshot(directory, role, rank):
         record["batch_size"] = len(requests)
         for attribute, field in (("origin_input_ids", "input_tokens"), ("output_ids", "output_tokens")):
             values = [getattr(request, attribute, None) for request in requests]
-            if all(type(value) is list for value in values):
+            if all(type(value) in (list, array) for value in values):
                 record[field] = sum(len(value) for value in values)
     _send_diagnostic(directory, record)
 
