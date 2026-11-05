@@ -123,10 +123,12 @@ class Progress:
         self.clock = clock
         self.event_factory = event_factory
         self.pending = deque()
+        self.unobserved_since = None
         self.depth = 0
         self.stage_started = 0.0
         self.completed = 0.0
         self.last_write = 0.0
+        self.last_published_state = None
         self.last_poll = float("-inf")
         self.starting = True
         self.failed = False
@@ -139,7 +141,9 @@ class Progress:
         now = self.clock()
         if not force and now - self.last_write < 0.5:
             return
-        pending_since = min([stamp for stamp, _ in self.pending] + ([self.stage_started] if self.depth else []) or [0.0])
+        pending_since = min([stamp for stamp, _ in self.pending]
+                            + ([self.unobserved_since] if self.unobserved_since is not None else [])
+                            + ([self.stage_started] if self.depth else []) or [0.0])
         state = "failed" if self.failed else "starting" if self.starting else "busy" if pending_since else "idle"
         record = {"pid": os.getpid(), "state": state, "updated": now,
                   "completed": self.completed, "pending_since": pending_since}
@@ -148,6 +152,7 @@ class Progress:
             temporary.write_text(json.dumps(record))
             temporary.replace(self.path)
             self.last_write = now
+            self.last_published_state = state
         except OSError:
             # The external supervisor treats absent/stale progress as failure.
             error_event("diagnostic_failed", rank=self.rank)
@@ -158,6 +163,12 @@ class Progress:
             return
         self.last_poll = now
         try:
+            if self.unobserved_since is not None:
+                # One marker covers all work submitted since the last marker.
+                # Idle polling also records a marker, so the final batch cannot
+                # disappear from progress tracking when no later batch arrives.
+                self.pending.append((self.unobserved_since, self.event_factory()))
+                self.unobserved_since = None
             while self.pending and self.pending[0][1].query():
                 self.pending.popleft()
                 self.completed = self.clock()
@@ -174,14 +185,17 @@ class Progress:
             self.stage_started = self.clock()
         self.depth += 1
         self.stages.append(STAGES.get(name, 0))
-        self.publish(force=name == "run_batch")
+        # Publish entry into busy work before it can block. Once busy, the
+        # regular heartbeat preserves the oldest pending timestamp. Rewriting
+        # the file for every batch adds I/O and GIL handoffs to the hot path.
+        self.publish(force=name == "run_batch" and self.last_published_state != "busy")
         try:
             yield
             if name == "run_batch":
-                # Enqueue a completion event on the worker's forward stream.
-                # Merely incrementing forward_ct does not prove GPU progress.
-                event = self.event_factory()
-                self.pending.append((self.stage_started, event))
+                # Track every batch immediately. CUDA marker creation and
+                # queries run at most every 100ms, including during idle loops.
+                if self.unobserved_since is None:
+                    self.unobserved_since = self.stage_started
         except BaseException:
             self.failed = True
             error_event("rank_failed", rank=self.rank)
