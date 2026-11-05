@@ -1,5 +1,6 @@
 """Test progress rules without importing Torch or loading a model."""
 
+from array import array
 import importlib.util
 import json
 from pathlib import Path
@@ -24,6 +25,21 @@ class Event:
 
 
 class ProgressTests(unittest.TestCase):
+    def test_native_token_arrays_export_lengths_without_values_or_text(self):
+        request=SimpleNamespace(origin_input_ids=array('q',[987654321,987654322]),
+                                output_ids=array('q',[987654323]),
+                                origin_input_text='PRIVATE_PROMPT',output_text='PRIVATE_RESPONSE')
+        scheduler=SimpleNamespace(cur_batch=SimpleNamespace(reqs=[request]))
+        reporter=SimpleNamespace(scheduler=scheduler,stages=[4],last_step_ms=12,depth=0)
+        with patch.object(progress,'_reporter',reporter),patch.object(progress,'_send_diagnostic') as send:
+            progress._scheduler_snapshot('/unused','decode',0)
+        record=send.call_args.args[1]
+        self.assertEqual(2,record['input_tokens'])
+        self.assertEqual(1,record['output_tokens'])
+        raw=json.dumps(record)
+        for private in ('987654321','987654322','987654323','PRIVATE_PROMPT','PRIVATE_RESPONSE'):
+            self.assertNotIn(private,raw)
+
     def test_continuous_batches_bound_file_writes_and_preserve_busy_entry(self):
         with tempfile.TemporaryDirectory() as directory:
             now = [100.0]
