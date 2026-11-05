@@ -4,7 +4,9 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
 spec = importlib.util.spec_from_file_location("pair_progress", ROOT / "python/sglang/srt/utils/pair_progress.py")
@@ -14,12 +16,47 @@ spec.loader.exec_module(progress)
 
 class Event:
     done = False
+    queries = 0
 
     def query(self):
+        self.queries += 1
         return self.done
 
 
 class ProgressTests(unittest.TestCase):
+    def test_scheduler_snapshot_uses_lengths_without_request_content(self):
+        private = "PRIVATE_PROMPT_RESPONSE_CREDENTIAL_CLIENT_ID"
+        request = SimpleNamespace(origin_input_ids=[private] * 3,
+                                  output_ids=[private] * 2,
+                                  rid=private, text=private, api_key=private)
+        reporter = SimpleNamespace(
+            scheduler=SimpleNamespace(cur_batch=SimpleNamespace(reqs=[request])),
+            stages=[4], last_step_ms=12, depth=1, stage_started=100,
+            clock=lambda: 101)
+        with patch.object(progress, "_reporter", reporter), patch.object(progress, "_send_diagnostic") as send:
+            progress._scheduler_snapshot("unused", "decode", 1)
+        record = send.call_args.args[1]
+        self.assertEqual({"event": "scheduler_snapshot", "role": "decode", "rank": 1,
+                          "stage_code": 4, "last_step_ms": 12, "step_age_ms": 1000,
+                          "batch_size": 1, "input_tokens": 3, "output_tokens": 2}, record)
+        self.assertNotIn(private, json.dumps(record))
+
+    def test_gpu_query_failure_marks_failed_without_exception_text(self):
+        class FailedEvent:
+            def query(self):
+                raise RuntimeError("PRIVATE_NATIVE_ERROR")
+        with tempfile.TemporaryDirectory() as directory:
+            p = progress.Progress(directory, "decode", 0, clock=lambda: 100)
+            p.ready()
+            p.pending.append((99, FailedEvent()))
+            with patch.object(progress, "error_event") as emit:
+                with self.assertRaises(RuntimeError):
+                    p.poll()
+            emit.assert_called_once_with("gpu_event_query_failed", rank=0)
+            raw = p.path.read_text()
+            self.assertNotIn("PRIVATE_NATIVE_ERROR", raw)
+            self.assertEqual("failed", json.loads(raw)["state"])
+
     def test_busy_gpu_stays_busy_until_completion(self):
         with tempfile.TemporaryDirectory() as directory:
             now = [100.0]
@@ -40,11 +77,32 @@ class ProgressTests(unittest.TestCase):
             p.publish(force=True)
             self.assertEqual(100.0, json.loads(p.path.read_text())["pending_since"])
             event.done = True
+            now[0] += 0.2
             p.poll()
             p.publish(force=True)
             record = json.loads(p.path.read_text())
             self.assertEqual("idle", record["state"])
             self.assertEqual(now[0], record["completed"])
+
+    def test_query_rate_is_bounded_without_hiding_stalled_gpu(self):
+        with tempfile.TemporaryDirectory() as directory:
+            now = [100.0]
+            event = Event()
+            p = progress.Progress(directory, "decode", 0, event_factory=lambda: event, clock=lambda: now[0])
+            p.ready()
+            with p.stage("run_batch"):
+                now[0] += 1
+            initial = event.queries
+            for _ in range(1000):
+                now[0] += 0.0001
+                with p.stage("recv_requests"):
+                    pass
+            self.assertLessEqual(event.queries - initial, 2)
+            p.publish(force=True)
+            record = json.loads(p.path.read_text())
+            self.assertEqual("busy", record["state"])
+            self.assertEqual(100.0, record["pending_since"])
+            self.assertEqual(0, record["completed"])
 
     def test_cpu_stall_is_visible_before_gpu_event_exists(self):
         with tempfile.TemporaryDirectory() as directory:
