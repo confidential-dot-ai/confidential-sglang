@@ -75,11 +75,15 @@ def _diagnostic_requests(stream, directory, role, rank):
             raw = torch._C._distributed_c10d._dump_nccl_trace_json(True, False)
             records, rejected = project_trace(raw)
             del raw
-            for record in records:
-                _send_diagnostic(directory, {"event": "nccl_collective", "role": role,
-                                             "rank": rank, **record})
+            sent = 0
+            for record in reversed(records):
+                # Preserve the newest operation first if a damaged receiver
+                # cannot accept the complete bounded snapshot.
+                sent += bool(_send_diagnostic(directory, {"event": "nccl_collective", "role": role,
+                                                          "rank": rank, **record}))
             _send_diagnostic(directory, {"event": "nccl_snapshot", "role": role,
-                                         "rank": rank, "count": len(records), "rejected": rejected})
+                                         "rank": rank, "count": sent,
+                                         "rejected": rejected + len(records) - sent})
         except Exception:
             _send_diagnostic(directory, {"event": "nccl_snapshot_unavailable", "role": role,
                                          "rank": rank, "code": 2})
@@ -88,10 +92,16 @@ def _diagnostic_requests(stream, directory, role, rank):
 def _send_diagnostic(directory, record):
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sender:
-            sender.setblocking(False)
-            sender.sendto(json.dumps(record).encode(), str(Path(directory) / "events.sock"))
+            # Snapshot traffic comes from the diagnostic thread only. A short
+            # connected-socket wait handles the receiver's small datagram queue.
+            # At most 34 records bound this wait to 680ms per rank. Error events
+            # in the scheduler/watchdog remain nonblocking below.
+            sender.settimeout(0.02)
+            sender.connect(str(Path(directory) / "events.sock"))
+            sender.send(json.dumps(record).encode())
+        return True
     except OSError:
-        pass
+        return False
 
 
 def error_event(event, *, rank=None, code=None, count=None, bytes_count=None):
