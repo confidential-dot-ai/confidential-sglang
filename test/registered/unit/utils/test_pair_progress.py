@@ -24,6 +24,71 @@ class Event:
 
 
 class ProgressTests(unittest.TestCase):
+    def test_continuous_batches_bound_file_writes_and_preserve_busy_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            now = [100.0]
+            original = Path.write_text
+            with patch.object(Path, "write_text", autospec=True, side_effect=original) as writes:
+                p = progress.Progress(directory, "decode", 0, event_factory=Event, clock=lambda: now[0])
+                p.ready()
+                for index in range(1000):
+                    with p.stage("run_batch"):
+                        if index == 0:
+                            self.assertEqual("busy", json.loads(p.path.read_text())["state"])
+                        now[0] += 0.001
+                self.assertLessEqual(writes.call_count, 6)
+            p.publish(force=True)
+            record = json.loads(p.path.read_text())
+            self.assertEqual("busy", record["state"])
+            self.assertEqual(100.0, record["pending_since"])
+
+    def test_last_batch_stays_busy_until_idle_poll_observes_its_gpu_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            now = [100.0]
+            event = Event()
+            calls = []
+            def factory():
+                calls.append(now[0])
+                return event
+            p = progress.Progress(directory, "decode", 0, event_factory=factory, clock=lambda: now[0])
+            p.ready()
+            # A fast final batch ends before the marker cadence. It must still
+            # be visible as pending GPU work while the CPU runs idle stages.
+            with p.stage("run_batch"):
+                now[0] += 0.001
+            p.publish(force=True)
+            self.assertEqual([], calls)
+            self.assertEqual(100.0, json.loads(p.path.read_text())["pending_since"])
+            for _ in range(100):
+                now[0] += 0.001
+                with p.stage("recv_requests"):
+                    pass
+            self.assertEqual(1, len(calls))
+            p.publish(force=True)
+            self.assertEqual(100.0, json.loads(p.path.read_text())["pending_since"])
+            event.done = True
+            now[0] += 0.2
+            with p.stage("recv_requests"):
+                pass
+            p.publish(force=True)
+            self.assertEqual("idle", json.loads(p.path.read_text())["state"])
+
+    def test_marker_creation_is_bounded_and_keeps_oldest_unfinished_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            now = [100.0]
+            calls = []
+            def factory():
+                calls.append(now[0])
+                return Event()
+            p = progress.Progress(directory, "decode", 0, event_factory=factory, clock=lambda: now[0])
+            p.ready()
+            for _ in range(1000):
+                with p.stage("run_batch"):
+                    now[0] += 0.001
+            self.assertLessEqual(len(calls), 10)
+            p.publish(force=True)
+            self.assertEqual(100.0, json.loads(p.path.read_text())["pending_since"])
+
     def test_scheduler_snapshot_uses_lengths_without_request_content(self):
         private = "PRIVATE_PROMPT_RESPONSE_CREDENTIAL_CLIENT_ID"
         request = SimpleNamespace(origin_input_ids=[private] * 3,
