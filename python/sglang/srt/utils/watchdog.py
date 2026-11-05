@@ -23,7 +23,14 @@ logger = logging.getLogger(__name__)
 
 def _arm_fatal_exit(grace: float = 30.0) -> threading.Timer:
     """Arm before diagnostics or NCCL cleanup; either operation may block."""
-    timer = threading.Timer(grace, lambda: os._exit(1))
+    def fatal_exit():
+        try:
+            from sglang.srt.utils.pair_progress import error_event
+            error_event("fatal_exit_deadline")
+        finally:
+            os._exit(1)
+
+    timer = threading.Timer(grace, fatal_exit)
     timer.daemon = True
     timer.start()
     return timer
@@ -41,15 +48,20 @@ _STARTUP_WATCHDOG_TIMEOUT_SECONDS = 1800.0
 
 def _abort_pynccl_communicators() -> None:
     """Best effort; never let teardown fail on the way to exiting."""
+    from sglang.srt.utils.pair_progress import error_event
+
+    error_event("communicator_abort_started")
     try:
         from sglang.srt.distributed.device_communicators.pynccl import (
             abort_all_communicators,
         )
 
         aborted = abort_all_communicators()
+        error_event("communicator_abort_finished", code=aborted)
         if aborted:
             logger.error("Aborted %d pynccl communicator(s) before teardown", aborted)
     except Exception as e:
+        error_event("communicator_abort_failed")
         logger.error("Could not abort pynccl communicators: %s", e)
 
 

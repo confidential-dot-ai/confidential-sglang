@@ -264,7 +264,8 @@ class MooncakeTransferEngine:
             ret = -1
 
         if ret < 0:
-            error_event("kv_transfer_failed", code=int(ret))
+            fields = {"count": 1, "bytes_count": length} if type(length) is int and 0 <= length < 2**63 else {}
+            error_event("kv_transfer_failed", code=int(ret), **fields)
             logger.debug(
                 "Failed to transfer data from %s to %s - %s.",
                 buffer,
@@ -297,7 +298,10 @@ class MooncakeTransferEngine:
                 )
 
         if ret < 0:
-            error_event("kv_transfer_failed", code=int(ret))
+            fields = {}
+            if all(type(length) is int and 0 <= length < 2**63 for length in lengths) and sum(lengths) < 2**63:
+                fields = {"count": len(lengths), "bytes_count": sum(lengths)}
+            error_event("kv_transfer_failed", code=int(ret), **fields)
             logger.debug(
                 "Failed to batch transfer data. Buffers: %s, Session: %s, "
                 "Peer addresses: %s",
