@@ -50,6 +50,31 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --no-deps -r /tmp/requirements.lock \
     && find /opt/dsv41 -xdev -exec touch -h -d @0 {} +
 
+# FlashInfer's prebuilt kernels, matching flashinfer-python in the lock. Without
+# them FlashInfer JIT-compiles modules on first use inside the scheduler thread:
+# the sampling module (top-k/top-p renorm, needed by any batch that mixes greedy
+# and default requests under DSpark) takes ~65-86 s on B200, enough to trip a
+# 90 s heartbeat watchdog and restart the pair mid-build, over and over.
+# - flashinfer-jit-cache is only an index; the .so files are in its per-arch
+#   providers (sm100a = B200, sm103a = B300), so install those explicitly.
+# - flashinfer-cubin ships the trtllm-gen cubins otherwise fetched from NVIDIA's
+#   CDN on first use.
+# They live on FlashInfer's index, not PyPI, so they are not in the lock.
+ARG FLASHINFER_VERSION=0.7.2
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --no-deps --index-url https://flashinfer.ai/whl/cu130 \
+        "flashinfer-jit-cache==${FLASHINFER_VERSION}+cu130" \
+        "flashinfer-jit-cache-sm100a==${FLASHINFER_VERSION}+cu130" \
+        "flashinfer-jit-cache-sm103a==${FLASHINFER_VERSION}+cu130" \
+    && uv pip install --no-deps --index-url https://flashinfer.ai/whl \
+        "flashinfer-cubin==${FLASHINFER_VERSION}" \
+    && python -c "import flashinfer, flashinfer_jit_cache as j, flashinfer_cubin as c, pathlib; \
+assert flashinfer.__version__ == '${FLASHINFER_VERSION}', flashinfer.__version__; \
+root = pathlib.Path(j.__file__).parent / 'providers'; \
+missing = [a for a in ('sm100a', 'sm103a') if not (root / a / 'jit_cache/sampling/sampling.so').is_file()]; \
+assert not missing, f'jit-cache providers missing sampling.so: {missing}'; \
+print('flashinfer', flashinfer.__version__, 'jit-cache', j.__version__, 'cubin', c.__version__)"
+
 # Replaces the lock's PyPI sglang-router with the router built above; a later
 # layer, so a router change doesn't reinstall the environment.
 COPY --from=router /wheels /tmp/router-wheels
