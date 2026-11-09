@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import resource
 import signal
 import socket
 import subprocess
@@ -105,6 +106,21 @@ def parser():
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Refuse chat requests carrying video with 400; V4.1 has no video encoder",
+    )
+    p.add_argument(
+        "--router-circuit-breaker",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Router per-worker circuit breaker. Off by default: a pair has one "
+        "prefill, so an open circuit refuses every request (503) until it "
+        "half-opens, with no other worker to fail over to",
+    )
+    p.add_argument(
+        "--router-retry-max-retries",
+        type=int,
+        default=2,
+        help="Router attempts per request (router default 5); retries of an "
+        "overloaded pair add load rather than finding a free worker",
     )
     p.add_argument(
         "--router-max-concurrent-requests",
@@ -565,6 +581,8 @@ def resolve_pool_sizes(args):
 
 
 def validate(args):
+    if args.router_retry_max_retries < 1:
+        raise ValueError("--router-retry-max-retries must be at least 1")
     if args.router_max_concurrent_requests == 0 or args.router_max_concurrent_requests < -1:
         raise ValueError("--router-max-concurrent-requests must be positive, or -1")
     for flag, value in (
@@ -1128,6 +1146,9 @@ def build_router(args, workers):
 def router_admission_args(args):
     """The router's admission caps; each is left at the router default unless set."""
     caps = ["--reject-video"] if args.router_reject_video else []
+    if not args.router_circuit_breaker:
+        caps.append("--disable-circuit-breaker")
+    caps += ["--retry-max-retries", str(args.router_retry_max_retries)]
     for flag, value, unset in (
         ("--max-concurrent-requests", args.router_max_concurrent_requests, -1),
         ("--queue-size", args.router_queue_size, None),
@@ -1627,8 +1648,20 @@ def owned_cleanup_pids(processes, gpus, resident_engram_pid):
     return owned
 
 
+def raise_open_file_limit():
+    """Soft RLIMIT_NOFILE to the hard limit, inherited by every child. At docker's
+    default soft limit of 1024 the router ran out of sockets near 24 req/s
+    (2026-11-09): "error sending request" to the workers opened the circuit on
+    the pair's only prefill, and the router answered 503 to everything."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard != resource.RLIM_INFINITY and soft != resource.RLIM_INFINITY and soft < hard:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    return resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+
+
 def serve(args, plan):
     processes, logs = [], []
+    print(f"Open-file limit: {raise_open_file_limit()}", flush=True)
 
     def stop(_signum, _frame):
         raise KeyboardInterrupt

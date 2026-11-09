@@ -82,6 +82,11 @@ services:
     ulimits:
       memlock: -1
       stack: 67108864
+      # The router holds a socket per in-flight request; the launcher also raises
+      # the soft limit to the hard one.
+      nofile:
+        soft: 65535
+        hard: 524288
     deploy:
       resources:
         reservations:
