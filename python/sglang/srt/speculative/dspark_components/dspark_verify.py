@@ -26,7 +26,9 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_sample,
     simulated_bonus_sample_graph,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.oracle_decode.forced_token_pool import oracle_commit
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.overlap_utils import consume_deferred_seq_lens_cpu
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -154,6 +156,7 @@ class TargetVerifyExecutor:
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
         simulate_bonus_sampling_info=None,
+        oracle_window: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> AcceptOuts:
         """Produce the per-request accept outcome after target verify.
 
@@ -181,6 +184,27 @@ class TargetVerifyExecutor:
             fused_argmax=self._target_is_dsv41,
             block_verification=self._block_verification,
         )
+        simulated_correct_len = self._simulated_correct_len
+        if oracle_window is not None:
+            # Oracle rows commit the forced tokens; their length replaces any
+            # SGLANG_SIMULATE_ACC_LEN draw.
+            oracle_tokens, oracle_in_range = oracle_window
+            if layout is not None:
+                max_correct_len = layout.verify_lens.to(correct_len.device) - 1
+            else:
+                max_correct_len = torch.full_like(
+                    correct_len, self.verify_num_draft_tokens - 1
+                )
+            correct_len, bonus, cap_trim_lens = oracle_commit(
+                correct_len=correct_len,
+                bonus=bonus,
+                cap_trim_lens=cap_trim_lens,
+                window=oracle_tokens,
+                in_range=oracle_in_range,
+                max_correct_len=max_correct_len,
+                fixed_commit_len=envs.SGLANG_ORACLE_COMMIT_LEN.get(),
+            )
+            simulated_correct_len = None
         sync_site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
             if accept_sampling_info is None or accept_sampling_info.is_all_greedy
@@ -196,7 +220,7 @@ class TargetVerifyExecutor:
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_sync=self._tp_sync,
             sync_site=sync_site,
-            simulated_correct_len=self._simulated_correct_len,
+            simulated_correct_len=simulated_correct_len,
             target_logits=target_logits,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
         )

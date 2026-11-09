@@ -223,6 +223,30 @@ def parser():
         "but ages long ones by the prefill tokens processed while they wait",
     )
     p.add_argument(
+        "--worker-metrics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prometheus /metrics on each worker's HTTP port (--enable-metrics): "
+        "token rates, prefix-cache hits, KV use, evictions, HiCache traffic, "
+        "retractions, queues and latency histograms; loadtest/live_metrics.py "
+        "reads them",
+    )
+    p.add_argument(
+        "--oracle-decode",
+        action="store_true",
+        help="Benchmark only: accept forced_text (Oracle decoding, "
+        "loadtest/oracle_scorecard.py). Requests may then dictate their output; "
+        "never enable on a serving deployment",
+    )
+    p.add_argument(
+        "--oracle-commit-len",
+        type=int,
+        default=0,
+        help="With --oracle-decode: tokens DSpark commits per decode step for "
+        "forced requests (set to the production accept length); 0 = the "
+        "target's own acceptance of the forced tokens",
+    )
+    p.add_argument(
         "--request-time-stats",
         action="store_true",
         help="Log per-request phase durations (bootstrap, queue, forward, transfer) "
@@ -662,6 +686,16 @@ def resolve_pool_sizes(args):
 
 
 def validate(args):
+    if args.oracle_commit_len and not args.oracle_decode:
+        raise ValueError("--oracle-commit-len needs --oracle-decode")
+    if args.oracle_commit_len < 0 or (
+        args.oracle_commit_len and not args.no_dspark
+        and args.oracle_commit_len > args.dspark_block_size + 1
+    ):
+        raise ValueError(
+            "--oracle-commit-len must be 0..dspark-block-size+1 "
+            f"({args.dspark_block_size + 1})"
+        )
     if args.router_retry_max_retries < 1:
         raise ValueError("--router-retry-max-retries must be at least 1")
     if args.router_max_concurrent_requests == 0 or args.router_max_concurrent_requests < -1:
@@ -881,6 +915,11 @@ def build_plan(args):
         "SGLANG_TIMEOUT_KEEP_ALIVE": str(SERVER_KEEP_ALIVE_S),
         "SGLANG_DSV41_ENGRAM_CPU_STAGING": "1" if args.cpu_engram_staging else "0",
     }
+    if args.oracle_decode:
+        common_env.update(
+            SGLANG_ENABLE_ORACLE_DECODE="1",
+            SGLANG_ORACLE_COMMIT_LEN=str(args.oracle_commit_len),
+        )
     if args.transport == "intra-node-nvlink":
         # Mooncake checks MC_FORCE_TCP's presence; even "0" forces TCP.
         common_env.update(
@@ -1041,6 +1080,8 @@ def build_plan(args):
             command += ["--tokenizer-worker-num", str(args.tokenizer_workers)]
         if role == "prefill" and args.prefill_schedule_policy != "fcfs":
             command += ["--schedule-policy", args.prefill_schedule_policy]
+        if args.worker_metrics:
+            command += ["--enable-metrics"]
         if args.request_time_stats:
             command += ["--enable-request-time-stats-logging"]
         if role == "decode" and args.decode_polling_interval != 1:

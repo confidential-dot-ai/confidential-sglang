@@ -20,7 +20,9 @@ conversations concurrently, one session per conversation, with no think time.
   history is replayed verbatim and the model's reply is discarded.
 
 Output lengths follow the dataset (`max_tokens` with `ignore_eos`). The
-`forced_token_ids` are another tokenizer's ids and are not replayed. A 429 from
+`forced_token_ids` are another tokenizer's ids and are never sent; with
+`--oracle` the completion is sent as text (`forced_text`) and the server
+tokenizes it (see `READINESS.md`). A 429 from
 the router's admission queue is retried with backoff and counted.
 
 ## Running
@@ -42,6 +44,14 @@ Each run prints progress every `--report-every` seconds and ends with a line
 - 429 retries, context skips and errors.
 
 With `LOGS` set, the sweep also prints the prefill prefix-cache hit for each level.
+
+## Production-readiness suite
+
+`READINESS.md` defines the metrics every topology change reports and the two
+tests that produce them: `live_metrics.py` (live tracking beside any traffic)
+and `oracle_scorecard.py` (Oracle decoding, fixed window, pass/fail gates).
+`oracle_replay.py --oracle` sends each completion as text (`forced_text`); the
+server tokenizes it.
 
 ## Results (2026-11-09)
 

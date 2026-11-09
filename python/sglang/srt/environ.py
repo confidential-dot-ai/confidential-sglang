@@ -539,6 +539,15 @@ class Envs:
     # DSpark on HIP: apply the simulated correct_len / bonus inside the folded verify epilogue
     # (hip graph) instead of falling back to the eager accept + commit path.
     SGLANG_DSPARK_SIMULATE_FOLD = EnvBool(True)
+    # Oracle decoding (benchmark only): requests may carry forced_text, and
+    # each completion is that text, tokenized by the served tokenizer.
+    # Off by default; requests with forced_text are rejected while off.
+    SGLANG_ENABLE_ORACLE_DECODE = EnvBool(False)
+    # DSpark commit length per decode step for Oracle rows; 0 = the target's own
+    # greedy acceptance of the forced tokens as drafts.
+    SGLANG_ORACLE_COMMIT_LEN = EnvInt(0)
+    # Longest forced completion; sizes the per-slot device pool.
+    SGLANG_ORACLE_MAX_TOKENS = EnvInt(16384)
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
 

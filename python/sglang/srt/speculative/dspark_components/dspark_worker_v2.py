@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkabl
 
 import torch
 
+from sglang.srt.oracle_decode.forced_token_pool import get_oracle_pool, oracle_enabled
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
@@ -945,6 +946,26 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
+        # Oracle decoding: verify the forced tokens in place of the drafts, so the
+        # target runs on the tokens the request will emit; the accept below then
+        # commits them (oracle_decode/forced_token_pool.py).
+        oracle_window = None
+        if oracle_enabled():
+            oracle_pool = get_oracle_pool(
+                self.target_worker.model_runner.req_to_token_pool, device
+            )
+            if oracle_pool.sync(batch.reqs):
+                oracle_tokens, oracle_in_range = oracle_pool.window(
+                    batch.req_pool_indices,
+                    prefix_lens + 1,
+                    draft_tokens.shape[1] + 1,
+                )
+                draft_tokens = torch.where(
+                    oracle_in_range[:, :-1],
+                    oracle_tokens[:, :-1].to(draft_tokens.dtype),
+                    draft_tokens,
+                )
+                oracle_window = (oracle_tokens, oracle_in_range)
         if coordination_plan is not None:
             coordination_plan.apply(batch, "target", rank, local_only=target_local_only)
 
@@ -994,6 +1015,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 or self._verify_executor.verify_epilogue.simulate_fold
             )
             and not batch.has_grammar
+            # Oracle rows replace the accept, which the folded epilogue runs in-graph.
+            and oracle_window is None
         )
         self._verify_executor.begin_simulated_step()
         if fold_eligible and self._verify_executor.verify_epilogue.simulate_fold:
@@ -1066,6 +1089,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+            oracle_window=oracle_window,
         )
         self.model_runner.ngram_embedding_manager.update_after_verify(
             verify_ids_2d=verify_ids_2d,

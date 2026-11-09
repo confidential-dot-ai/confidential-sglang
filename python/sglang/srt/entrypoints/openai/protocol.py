@@ -388,6 +388,10 @@ class CompletionRequest(PDRoutingFields):
     ebnf: Optional[str] = None
     repetition_penalty: float = 1.0
     stop_token_ids: Optional[List[int]] = None
+    # Oracle decoding (benchmark only; the server needs
+    # SGLANG_ENABLE_ORACLE_DECODE=1): the completion is exactly this text,
+    # tokenized by the served model's tokenizer.
+    forced_text: Optional[str] = None
     stop_regex: Optional[Union[str, List[str]]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
@@ -950,6 +954,10 @@ class ChatCompletionRequest(PDRoutingFields):
     ebnf: Optional[str] = None
     repetition_penalty: Optional[float] = None
     stop_token_ids: Optional[List[int]] = None
+    # Oracle decoding (benchmark only; the server needs
+    # SGLANG_ENABLE_ORACLE_DECODE=1): the completion is exactly this text,
+    # tokenized by the served model's tokenizer.
+    forced_text: Optional[str] = None
     stop_regex: Optional[Union[str, List[str]]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
@@ -1157,6 +1165,7 @@ class ChatCompletionRequest(PDRoutingFields):
             "min_new_tokens": self.min_tokens,
             "stop": stop,
             "stop_token_ids": self.stop_token_ids,
+            "forced_text": self.forced_text,
             "stop_regex": self.stop_regex,
             "top_p": get_param("top_p"),
             "top_k": get_param("top_k"),
