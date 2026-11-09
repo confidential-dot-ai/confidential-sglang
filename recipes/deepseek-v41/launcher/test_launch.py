@@ -971,6 +971,92 @@ class TestLaunch(unittest.TestCase):
         with self.assertRaises(ValueError):
             launch.build_plan(self.args("--tokenizer-workers", "0"))
 
+    def test_container_env_files_plan(self):
+        # Every shipped profile must parse and plan as tp2-pd.sh launches it, on a
+        # 1 TiB host with the Engram holder running.
+        container = Path(launch.__file__).resolve().parent.parent / "container"
+        envs = sorted(container.glob("*.env"))
+        self.assertIn("dsv41-b200-1m.env", [env.name for env in envs])
+        for env in envs:
+            values = dict(
+                line.split("=", 1)
+                for line in env.read_text().splitlines()
+                if "=" in line and not line.startswith("#")
+            )
+            with self.subTest(env=env.name):
+                args = self.args(
+                    "--cpu-engram-staging", "--split-cuda-graphs",
+                    "--resident-engram-pid", "1", "--gpus", values["GPUS"],
+                    "--host-available-gib", "800",
+                    *values["DSV41_LAUNCH_ARGS"].split(),
+                )
+                plan = launch.build_plan(args)
+                if env.name == "dsv41-b200-1m.env":
+                    self.assertEqual(args.context_length, 1048576)
+                    self.assertEqual(plan["hicache_auto"]["ratio"], 8.0)
+                    prefill = [w for w in plan["workers"] if "--hicache-ratio" in w["command"]]
+                    self.assertEqual(len(prefill), 2)
+
+    def test_hicache_auto_ratio_fits_host_ram(self):
+        resident = ("--cpu-engram-staging", "--resident-engram-pid", "1")
+
+        def auto(host_gib, *extra):
+            return self.args(
+                "--max-total-tokens", "1572864", "--prefill-hicache-ratio", "auto",
+                "--host-available-gib", str(host_gib), *resident, *extra,
+            )
+
+        # 8x B200 with 1 TiB: Engram pinned once by the holder (~198 GiB), so
+        # ~800 GiB is available and the ratio hits the cap.
+        args = auto(800)
+        plan = launch.build_plan(args)
+        command = plan["workers"][0]["command"]
+        self.assertEqual(command[command.index("--hicache-ratio") + 1], "8.0")
+        self.assertEqual(plan["hicache_auto"]["ratio"], 8.0)
+        self.assertEqual(
+            plan["workers"][0]["env"]["SGLANG_ENABLE_HICACHE_SWA_TOMBSTONE_BACKUP"], "0"
+        )
+        # Validating again (serve's cleanup does) keeps the resolved ratio.
+        launch.validate(args)
+        self.assertEqual(args.prefill_hicache_ratio, 8.0)
+
+        # Below the cap: half-step multiple that fits after the reserve.
+        one = launch.hicache_host_bytes(args, 2, 1572864, ratio=1) / launch.GIB
+        args = auto(32 + 3.7 * one)
+        launch.validate(args)
+        self.assertEqual(args.prefill_hicache_ratio, 3.5)
+        # Two prefill workers split the room.
+        args = auto(32 + 7.4 * one, "--num-prefill", "2")
+        launch.validate(args)
+        self.assertEqual(args.prefill_hicache_ratio, 3.5)
+
+        # 4x B200 test VM: ~9 GiB free with Engram pinned -> HiCache off.
+        plan = launch.build_plan(auto(9))
+        self.assertNotIn("--enable-hierarchical-cache", plan["workers"][0]["command"])
+        self.assertIsNone(plan["hicache_auto"]["ratio"])
+        self.assertNotIn("SGLANG_ENABLE_HICACHE_SWA_TOMBSTONE_BACKUP", plan["workers"][0]["env"])
+
+        # Without a resident holder the workers' tables come out of the budget.
+        with patch.object(
+            launch, "checkpoint_budget",
+            return_value={"engram_bytes_per_instance": 200 * launch.GIB},
+        ):
+            args = self.args(
+                "--max-total-tokens", "1572864", "--prefill-hicache-ratio", "auto",
+                "--host-available-gib", str(32 + 200 + 3.7 * one), "--cpu-engram-staging",
+            )
+            launch.validate(args)
+        self.assertEqual(args.prefill_hicache_ratio, 3.5)
+        self.assertEqual(args.prefill_hicache_auto["engram_gib"], 200.0)
+        with self.assertRaisesRegex(ValueError, "resident-engram-pid or a readable"):
+            launch.validate(
+                self.args("--prefill-hicache-ratio", "auto", "--host-available-gib", "800")
+            )
+        with self.assertRaisesRegex(ValueError, "max-ratio must exceed 1"):
+            launch.validate(auto(800, "--prefill-hicache-max-ratio", "1"))
+        with self.assertRaisesRegex(ValueError, "exclusive"):
+            launch.validate(auto(800, "--prefill-hicache-size-gib", "96"))
+
     def test_hicache_is_prefill_only(self):
         plan = launch.build_plan(self.args("--prefill-hicache-ratio", "2"))
         for worker in plan["workers"]:
