@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.ced_boundary import (
     ced_boundary_for_forward,
 )
 from sglang.srt.environ import envs
+from sglang.srt.oracle_decode.forced_token_pool import get_oracle_pool, oracle_enabled
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
@@ -743,6 +744,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # marker is only valid for the planning regime (backend set) it was set
     # under; a fresh batch from init_new always starts unplanned.
     forward_metadata_ready: bool = False
+    # Oracle decoding: some request in this batch carries forced_token_ids
+    # (already written to the oracle token pool). See oracle_decode/.
+    oracle_active: bool = False
     # Shapes the batch had when it was marked (plan record). Lets the
     # judgment predicate detect staleness when DP padding
     # (prepare_mlp_sync_batch) reshapes the batch after pre-planning.
@@ -1281,6 +1285,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 window=model_runner.sliding_window_size,
                 device=device,
             )
+
+        if oracle_enabled() and not model_runner.is_draft_worker:
+            ret.oracle_active = get_oracle_pool(
+                model_runner.req_to_token_pool, device
+            ).sync(batch.reqs)
 
         return ret
 
