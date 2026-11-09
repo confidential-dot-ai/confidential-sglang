@@ -1,0 +1,436 @@
+"""Live production-readiness metrics for a DeepSeek-V4.1 deployment.
+
+Scrapes the Prometheus endpoints of the prefill and decode workers (started
+with --enable-metrics) and of the router (--prometheus-port), and every
+--interval seconds prints one line and appends one JSON record with rates over
+that window:
+
+  traffic      requests/s, input tok/s (total, cached, uncached), output tok/s,
+               served TPM in total and per GPU, output share
+  cache        prefix-cache hit, KV pool use (cache pressure), evictions/s,
+               HiCache host-tier use, write-back (GPU->host) and load-back
+               (host->GPU) tok/s
+  preemption   retracted requests/s and tokens/s, paused and aborted requests
+  queues       running and waiting requests, PD bootstrap/prealloc/transfer
+               queues, router admission in flight and rejections/s
+  latency      TTFT, inter-token latency, queue time and router request
+               duration (p50/p90/p99 of the window, from histogram deltas)
+  health       non-2xx router responses/s, KV-transfer and bootstrap failures,
+               prefill retries, speculative accept length
+
+It only reads metrics, so it can run beside any load: a load test, a soak, or
+production traffic. With --duration it stops on its own and prints a summary
+over the whole run; otherwise Ctrl-C prints the summary.
+
+In a PD deployment the input-side counters come from prefill and the output
+side from decode: both servers count every request's prompt, so summing them
+would double the input rate. A colocated (non-PD) worker is passed as --worker
+and supplies both sides.
+
+Standard library only, so it runs from the host python as well as the image.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import signal
+import sys
+import time
+import urllib.request
+from dataclasses import dataclass, field
+
+_SAMPLE = re.compile(r"^([A-Za-z_:][A-Za-z0-9_:]*)(\{[^}]*\})?\s+(\S+)")
+_LABEL = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)="((?:[^"\\]|\\.)*)"')
+
+
+@dataclass
+class Scrape:
+    """One endpoint's samples, summed over every label except `le`."""
+
+    values: dict[str, float] = field(default_factory=dict)
+    # histogram name -> {le: cumulative count}
+    buckets: dict[str, dict[float, float]] = field(default_factory=dict)
+    # labelled values kept for metrics whose labels matter (router status codes)
+    labelled: dict[str, dict[tuple, float]] = field(default_factory=dict)
+
+
+KEEP_LABELS = {"smg_http_responses_total": ("status",)}
+
+
+def parse(text: str) -> Scrape:
+    out = Scrape()
+    for line in text.splitlines():
+        if not line or line[0] == "#":
+            continue
+        m = _SAMPLE.match(line)
+        if not m:
+            continue
+        name, raw_labels, raw_value = m.groups()
+        try:
+            value = float(raw_value)
+        except ValueError:
+            continue
+        if math.isnan(value):
+            continue
+        labels = dict(_LABEL.findall(raw_labels or ""))
+        if name.endswith("_bucket") and "le" in labels:
+            le = math.inf if labels["le"] in ("+Inf", "inf") else float(labels["le"])
+            hist = out.buckets.setdefault(name[: -len("_bucket")], {})
+            hist[le] = hist.get(le, 0.0) + value
+            continue
+        if name.endswith("_created"):
+            continue
+        out.values[name] = out.values.get(name, 0.0) + value
+        keep = KEEP_LABELS.get(name)
+        if keep:
+            key = tuple(labels.get(k, "") for k in keep)
+            series = out.labelled.setdefault(name, {})
+            series[key] = series.get(key, 0.0) + value
+    return out
+
+
+def merge(scrapes: list[Scrape]) -> Scrape:
+    """Sum several endpoints of one role (e.g. two prefill workers)."""
+    out = Scrape()
+    for s in scrapes:
+        for k, v in s.values.items():
+            out.values[k] = out.values.get(k, 0.0) + v
+        for name, hist in s.buckets.items():
+            dst = out.buckets.setdefault(name, {})
+            for le, c in hist.items():
+                dst[le] = dst.get(le, 0.0) + c
+        for name, series in s.labelled.items():
+            dst = out.labelled.setdefault(name, {})
+            for key, v in series.items():
+                dst[key] = dst.get(key, 0.0) + v
+    return out
+
+
+def counter_delta(new: float | None, old: float | None) -> float | None:
+    """A counter's increase; a decrease means the process restarted."""
+    if new is None:
+        return None
+    if old is None:
+        return None
+    return new if new < old else new - old
+
+
+def histogram_quantiles(
+    new: dict[float, float] | None,
+    old: dict[float, float] | None,
+    qs=(50, 90, 99),
+) -> dict[str, float | None]:
+    """Quantiles of the observations made between two cumulative snapshots,
+    interpolated linearly inside a bucket (as Prometheus histogram_quantile)."""
+    empty = {f"p{q}": None for q in qs}
+    if not new:
+        return empty
+    old = old or {}
+    les = sorted(new)
+    counts = []
+    for le in les:
+        d = new[le] - old.get(le, 0.0)
+        counts.append(max(d, 0.0))
+    # Cumulative counts must be monotonic; a restart resets them.
+    if any(new[le] < old.get(le, 0.0) for le in les):
+        counts = [new[le] for le in les]
+    total = counts[-1] if counts else 0.0
+    if total <= 0:
+        return empty
+    out = {}
+    for q in qs:
+        rank = q / 100 * total
+        prev_le, prev_c = 0.0, 0.0
+        val = None
+        for le, c in zip(les, counts):
+            if c >= rank:
+                if math.isinf(le):
+                    val = prev_le  # beyond the last finite bucket
+                elif c == prev_c:
+                    val = le
+                else:
+                    val = prev_le + (le - prev_le) * (rank - prev_c) / (c - prev_c)
+                break
+            prev_le, prev_c = le, c
+        out[f"p{q}"] = val
+    return out
+
+
+def histogram_count(new, old) -> float:
+    if not new:
+        return 0.0
+    top = new.get(math.inf, max(new.values()))
+    before = (old or {}).get(math.inf, 0.0)
+    return top - before if top >= before else top
+
+
+@dataclass
+class Snapshot:
+    t: float
+    prefill: Scrape
+    decode: Scrape
+    router: Scrape | None
+
+
+def _rate(new: Scrape, old: Scrape, name: str, dt: float) -> float | None:
+    d = counter_delta(new.values.get(name), old.values.get(name))
+    return None if d is None else d / dt
+
+
+def _gauge(s: Scrape, name: str) -> float | None:
+    return s.values.get(name)
+
+
+def window(new: Snapshot, old: Snapshot, gpus: int | None) -> dict:
+    """Every marquee metric over the window between two snapshots."""
+    dt = new.t - old.t
+    p, p0, d, d0 = new.prefill, old.prefill, new.decode, old.decode
+    r, r0 = new.router, old.router
+
+    def rp(name):
+        return _rate(p, p0, name, dt)
+
+    def rd(name):
+        return _rate(d, d0, name, dt)
+
+    both = merge([p, d]) if p is not d else p
+    both0 = merge([p0, d0]) if p0 is not d0 else p0
+
+    def rb(name):
+        return _rate(both, both0, name, dt)
+
+    prompt = rp("sglang:prompt_tokens_total")
+    cached = rp("sglang:cached_tokens_total")
+    output = rd("sglang:generation_tokens_total")
+    served = None if prompt is None or output is None else prompt + output
+    rec = {
+        "t": round(new.t, 3),
+        "window_s": round(dt, 3),
+        "traffic": {
+            "requests_per_s": rd("sglang:num_requests_total"),
+            "input_tok_s": prompt,
+            "cached_input_tok_s": cached,
+            "uncached_input_tok_s": None
+            if prompt is None or cached is None
+            else prompt - cached,
+            "output_tok_s": output,
+            "served_tpm": None if served is None else served * 60,
+            "served_tpm_per_gpu": None
+            if served is None or not gpus
+            else served * 60 / gpus,
+            "output_share": None if not served else output / served,
+        },
+        "cache": {
+            "prefix_hit": None if not prompt else cached / prompt,
+            "prefill_kv_use": _gauge(p, "sglang:token_usage"),
+            "decode_kv_use": _gauge(d, "sglang:token_usage"),
+            "prefill_kv_used_tokens": _gauge(p, "sglang:kv_used_tokens"),
+            "prefill_kv_evictable_tokens": _gauge(p, "sglang:kv_evictable_tokens"),
+            "decode_kv_used_tokens": _gauge(d, "sglang:kv_used_tokens"),
+            "evicted_tok_s": rb("sglang:evicted_tokens_total"),
+            "hicache_host_used_tokens": _gauge(p, "sglang:hicache_host_used_tokens"),
+            "hicache_host_total_tokens": _gauge(p, "sglang:hicache_host_total_tokens"),
+            "hicache_writeback_tok_s": rb("sglang:hicache_backup_tokens_total"),
+            "hicache_loadback_tok_s": rb("sglang:load_back_tokens_total"),
+            "hicache_dropped_tok_s": rb("sglang:hicache_dropped_tokens_total"),
+        },
+        "preemption": {
+            "retracted_req_s": rb("sglang:num_retracted_requests_total"),
+            "retracted_input_tok_s": rb("sglang:num_retracted_input_tokens_total"),
+            "retracted_output_tok_s": rb("sglang:num_retracted_output_tokens_total"),
+            "paused_reqs": _gauge(both, "sglang:num_paused_reqs"),
+            "aborted_req_s": rb("sglang:num_aborted_requests_total"),
+        },
+        "queues": {
+            "prefill_running": _gauge(p, "sglang:num_running_reqs"),
+            "prefill_waiting": _gauge(p, "sglang:num_queue_reqs"),
+            "decode_running": _gauge(d, "sglang:num_running_reqs"),
+            "decode_waiting": _gauge(d, "sglang:num_queue_reqs"),
+            "prefill_bootstrap": _gauge(p, "sglang:num_prefill_bootstrap_queue_reqs"),
+            "prefill_inflight": _gauge(p, "sglang:num_prefill_inflight_queue_reqs"),
+            "decode_prealloc": _gauge(d, "sglang:num_decode_prealloc_queue_reqs"),
+            "decode_transfer": _gauge(d, "sglang:num_decode_transfer_queue_reqs"),
+            "router_inflight": None if r is None else _gauge(r, "smg_admission_inflight"),
+            "router_rejected_s": None
+            if r is None
+            else _rate(r, r0, "smg_admission_rejected_total", dt),
+        },
+        "latency_s": {
+            "ttft": histogram_quantiles(
+                d.buckets.get("sglang:time_to_first_token_seconds"),
+                d0.buckets.get("sglang:time_to_first_token_seconds"),
+            ),
+            "itl": histogram_quantiles(
+                d.buckets.get("sglang:inter_token_latency_seconds"),
+                d0.buckets.get("sglang:inter_token_latency_seconds"),
+            ),
+            "prefill_queue": histogram_quantiles(
+                p.buckets.get("sglang:queue_time_seconds"),
+                p0.buckets.get("sglang:queue_time_seconds"),
+            ),
+            "router_request": histogram_quantiles(
+                None if r is None else r.buckets.get("smg_http_request_duration_seconds"),
+                None if r0 is None else r0.buckets.get("smg_http_request_duration_seconds"),
+            ),
+        },
+        "health": {
+            "router_non2xx_s": None if r is None else _non2xx_rate(r, r0, dt),
+            "kv_transfer_failed_s": rb("sglang:num_transfer_failed_reqs_total"),
+            "bootstrap_failed_s": rb("sglang:num_bootstrap_failed_reqs_total"),
+            "prefill_retries_s": rp("sglang:num_prefill_retries_total"),
+            "spec_accept_length": _gauge(d, "sglang:spec_accept_length"),
+        },
+    }
+    return rec
+
+
+def _non2xx_rate(r: Scrape, r0: Scrape, dt: float) -> float | None:
+    new = r.labelled.get("smg_http_responses_total")
+    if new is None:
+        return None
+    old = r0.labelled.get("smg_http_responses_total", {})
+    total = 0.0
+    for key, v in new.items():
+        if key[0].startswith("2"):
+            continue
+        d = counter_delta(v, old.get(key, 0.0))
+        total += d or 0.0
+    return total / dt
+
+
+def fmt(v, kind="n"):
+    if v is None:
+        return "-"
+    if kind == "pct":
+        return f"{100 * v:.1f}%"
+    if kind == "s":
+        return f"{v:.2f}s" if v < 10 else f"{v:.0f}s"
+    if abs(v) >= 1e6:
+        return f"{v / 1e6:.2f}M"
+    if abs(v) >= 1e4:
+        return f"{v / 1e3:.0f}K"
+    if abs(v) >= 100:
+        return f"{v:.0f}"
+    return f"{v:.2f}"
+
+
+def line(rec: dict) -> str:
+    t, c, pr, q, lat = (
+        rec["traffic"],
+        rec["cache"],
+        rec["preemption"],
+        rec["queues"],
+        rec["latency_s"],
+    )
+    return (
+        f"req/s {fmt(t['requests_per_s'])}  in {fmt(t['input_tok_s'])} tok/s "
+        f"(hit {fmt(c['prefix_hit'], 'pct')})  out {fmt(t['output_tok_s'])} tok/s  "
+        f"TPM/GPU {fmt(t['served_tpm_per_gpu'])}  "
+        f"KV P/D {fmt(c['prefill_kv_use'], 'pct')}/{fmt(c['decode_kv_use'], 'pct')}  "
+        f"evict {fmt(c['evicted_tok_s'])}/s  host wb/lb {fmt(c['hicache_writeback_tok_s'])}/"
+        f"{fmt(c['hicache_loadback_tok_s'])}  retract {fmt(pr['retracted_req_s'])}/s  "
+        f"run/wait P {fmt(q['prefill_running'])}/{fmt(q['prefill_waiting'])} "
+        f"D {fmt(q['decode_running'])}/{fmt(q['decode_waiting'])}  "
+        f"TTFT p50/p99 {fmt(lat['ttft']['p50'], 's')}/{fmt(lat['ttft']['p99'], 's')}  "
+        f"ITL p50 {fmt(None if lat['itl']['p50'] is None else lat['itl']['p50'] * 1000)}ms"
+    )
+
+
+def fetch(url: str, timeout: float) -> Scrape:
+    with urllib.request.urlopen(url.rstrip("/") + "/metrics", timeout=timeout) as resp:
+        return parse(resp.read().decode("utf-8", "replace"))
+
+
+class Scraper:
+    def __init__(self, prefill, decode, workers, router, timeout):
+        if workers and (prefill or decode):
+            raise ValueError("--worker (colocated) cannot be combined with --prefill/--decode")
+        if not workers and not (prefill and decode):
+            raise ValueError("pass --prefill and --decode (PD) or --worker (colocated)")
+        self.prefill, self.decode = prefill or workers, decode or workers
+        self.colocated = bool(workers)
+        self.router, self.timeout = router, timeout
+
+    def snapshot(self) -> Snapshot:
+        t = time.time()
+        p = merge([fetch(u, self.timeout) for u in self.prefill])
+        d = p if self.colocated else merge([fetch(u, self.timeout) for u in self.decode])
+        r = fetch(self.router, self.timeout) if self.router else None
+        return Snapshot(t, p, d, r)
+
+
+def check_enabled(snap: Snapshot) -> list[str]:
+    """Names of required series missing from a scrape (metrics flag off, or a
+    different SGLang version)."""
+    missing = []
+    for role, s, names in (
+        ("prefill", snap.prefill, ["sglang:prompt_tokens_total", "sglang:token_usage"]),
+        ("decode", snap.decode, ["sglang:generation_tokens_total"]),
+    ):
+        missing += [f"{role}:{n}" for n in names if n not in s.values]
+    return missing
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("--prefill", action="append", default=[], help="prefill worker URL (repeatable)")
+    p.add_argument("--decode", action="append", default=[], help="decode worker URL (repeatable)")
+    p.add_argument("--worker", action="append", default=[], help="colocated worker URL (repeatable)")
+    p.add_argument("--router", default="", help="router Prometheus URL, e.g. http://127.0.0.1:29001")
+    p.add_argument("--gpus", type=int, default=0, help="physical GPUs serving, for per-GPU TPM")
+    p.add_argument("--interval", type=float, default=10.0)
+    p.add_argument("--duration", type=float, default=0, help="stop after S seconds (0 = until Ctrl-C)")
+    p.add_argument("--out", default="", help="append one JSON record per interval here")
+    p.add_argument("--timeout", type=float, default=5.0)
+    args = p.parse_args(argv)
+    if not args.prefill and not args.decode and not args.worker:
+        args.prefill, args.decode = ["http://127.0.0.1:8041"], ["http://127.0.0.1:8042"]
+        args.router = args.router or "http://127.0.0.1:29001"
+
+    scraper = Scraper(args.prefill, args.decode, args.worker, args.router, args.timeout)
+    first = prev = scraper.snapshot()
+    missing = check_enabled(first)
+    if missing:
+        print(
+            "Missing worker metrics (start the workers with --enable-metrics): "
+            + ", ".join(missing),
+            file=sys.stderr,
+        )
+        return 2
+    out = open(args.out, "a") if args.out else None
+    stop = {"now": False}
+    signal.signal(signal.SIGINT, lambda *_: stop.update(now=True))
+    signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
+    end = first.t + args.duration if args.duration else math.inf
+    while not stop["now"] and time.time() < end:
+        deadline = min(prev.t + args.interval, end)
+        while not stop["now"] and time.time() < deadline:
+            time.sleep(min(0.25, max(0.0, deadline - time.time())))
+        try:
+            snap = scraper.snapshot()
+        except OSError as e:
+            print(f"scrape failed: {e}", file=sys.stderr, flush=True)
+            continue
+        if snap.t - prev.t <= 0:
+            continue
+        rec = window(snap, prev, args.gpus)
+        print(f"[{snap.t - first.t:6.0f}s] " + line(rec), flush=True)
+        if out:
+            out.write(json.dumps(rec) + "\n")
+            out.flush()
+        prev = snap
+    if prev is not first:
+        summary = window(prev, first, args.gpus)
+        print("SUMMARY " + json.dumps(summary), flush=True)
+        if out:
+            out.write(json.dumps({"summary": summary}) + "\n")
+    if out:
+        out.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

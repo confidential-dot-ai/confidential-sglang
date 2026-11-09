@@ -154,6 +154,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "min_new_tokens": request.min_tokens,
             "stop": request.stop,
             "stop_token_ids": request.stop_token_ids,
+            "forced_text": request.forced_text,
             "stop_regex": request.stop_regex,
             "top_p": request.top_p,
             "top_k": request.top_k,
