@@ -67,6 +67,10 @@ def pool_size(text):
     return text if text == "auto" else int(text)
 
 
+def hicache_ratio(text):
+    return text if text == "auto" else float(text)
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", type=Path, required=True, help="Local V4.1 checkpoint")
@@ -288,9 +292,27 @@ def parser():
     )
     p.add_argument(
         "--prefill-hicache-ratio",
-        type=float,
+        type=hicache_ratio,
         help="Enable HiCache on prefill with a host pool this many times its GPU KV "
-        "pool; decode has no radix cache to extend",
+        "pool; decode has no radix cache to extend. auto sizes it from host RAM at "
+        "launch: MemAvailable, less Engram tables no resident holder already pins, "
+        "less --host-reserve-gib, split across prefill workers, rounded down to a "
+        "multiple of 0.5 and capped at --prefill-hicache-max-ratio; HiCache stays "
+        "off when that is not above 1",
+    )
+    p.add_argument(
+        "--prefill-hicache-max-ratio",
+        type=float,
+        default=8,
+        help="Cap for --prefill-hicache-ratio auto. 8 on dsv41.env's 1.5M-token pool "
+        "is ~90 GiB of pinned host RAM per prefill worker (estimate; ratio 4 measured "
+        "~56 GB)",
+    )
+    p.add_argument(
+        "--host-available-gib",
+        type=float,
+        help="Host RAM --prefill-hicache-ratio auto may use, instead of MemAvailable "
+        "at launch (to plan another machine with --dry-run)",
     )
     p.add_argument(
         "--prefill-hicache-size-gib",
@@ -546,25 +568,84 @@ def pool_estimate(args, role, tp, tokens=None):
     )
 
 
-def hicache_host_bytes(args, tp, tokens):
+def hicache_host_bytes(args, tp, tokens, ratio=None):
     """Host RAM of one prefill worker's HiCache pools (all ranks); 0 if off."""
     ranks = args.prefill_pp if args.prefill_pp > 1 else tp
     if args.prefill_hicache_size_gib is not None:
         return args.prefill_hicache_size_gib * GIB * ranks
-    if args.prefill_hicache_ratio is None:
+    ratio = args.prefill_hicache_ratio if ratio is None else ratio
+    if ratio is None:
         return 0
     rings = swa_rings(args, "prefill") * SWA_RING_BYTES
     if args.prefill_pp > 1 and args.ced_split:
         # Each stage mirrors only its own layers' device pool.
         return sum(
-            int(
-                args.prefill_hicache_ratio
-                * (tokens * stage["kv_bytes"] + rings * stage["ring_share"])
-            )
+            int(ratio * (tokens * stage["kv_bytes"] + rings * stage["ring_share"]))
             for stage in CED_PP2_STAGES
         )
     device = tokens * KV_BYTES_PER_TOKEN + rings
-    return int(args.prefill_hicache_ratio * device) * ranks
+    return int(ratio * device) * ranks
+
+
+def engram_host_bytes(args, budget):
+    """Host RAM the workers' Engram tables need, given checkpoint_budget()."""
+    if args.cpu_engram_staging:
+        # Staging shares the checkpoint's page cache across every worker.
+        return budget["engram_bytes_per_instance"]
+    return (args.num_prefill + args.num_decode) * budget["engram_bytes_per_instance"]
+
+
+def host_available_bytes():
+    return next(
+        int(line.split()[1]) * 1024
+        for line in Path("/proc/meminfo").read_text().splitlines()
+        if line.startswith("MemAvailable:")
+    )
+
+
+def resolve_hicache_ratio(args):
+    """Replace --prefill-hicache-ratio auto with a ratio that fits host RAM, once.
+
+    With a resident Engram holder (dsv41-engram-cache.service, passed as
+    --resident-engram-pid) the one shared copy of the tables is already pinned and
+    out of MemAvailable, and staged workers map those pages, so the tables are not
+    counted again; preflight still checks the measured credit. Without one, the
+    tables the workers will load come out of the budget."""
+    if args.prefill_hicache_ratio != "auto":
+        return
+    if args.host_available_gib is not None:
+        available = int(args.host_available_gib * GIB)
+    else:
+        available = host_available_bytes()
+    engram = 0
+    if not args.resident_engram_pid:
+        try:
+            budget = checkpoint_budget(args.model, (args.prefill_tp, args.decode_tp))
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                "--prefill-hicache-ratio auto needs --resident-engram-pid or a "
+                f"readable checkpoint to count Engram host RAM: {exc}"
+            ) from exc
+        engram = engram_host_bytes(args, budget)
+    room = available - engram - int(args.host_reserve_gib * GIB)
+    per_ratio = hicache_host_bytes(args, args.prefill_tp, args.max_total_tokens, ratio=1)
+    fit = max(0.0, room / args.num_prefill / per_ratio)
+    ratio = float(min(args.prefill_hicache_max_ratio, int(fit * 2) / 2))
+    args.prefill_hicache_auto = dict(
+        host_available_gib=round(available / GIB, 1),
+        engram_gib=round(engram / GIB, 1),
+        host_reserve_gib=args.host_reserve_gib,
+        fits_ratio=round(fit, 2),
+        ratio=ratio if ratio > 1 else None,
+    )
+    args.prefill_hicache_ratio = ratio if ratio > 1 else None
+    if args.prefill_hicache_ratio is None:
+        print(
+            f"HiCache off: {room / GIB:.1f} GiB of host RAM left after Engram and the "
+            f"reserve fits ratio {fit:.2f} per prefill worker (needs > 1)",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def resolve_pool_sizes(args):
@@ -635,8 +716,10 @@ def validate(args):
                 f"{CAPTURED_INDEXER_MAX_SEQ_LEN} is not validated with "
                 "--prefill-bounded-replay"
             )
-    if args.prefill_hicache_ratio is not None and args.prefill_hicache_ratio <= 1:
+    if args.prefill_hicache_ratio not in (None, "auto") and args.prefill_hicache_ratio <= 1:
         raise ValueError("--prefill-hicache-ratio must exceed 1")
+    if args.prefill_hicache_max_ratio <= 1:
+        raise ValueError("--prefill-hicache-max-ratio must exceed 1")
     if args.prefill_hicache_size_gib is not None:
         if args.prefill_hicache_ratio is not None:
             raise ValueError(
@@ -663,6 +746,7 @@ def validate(args):
     if args.prefill_pp > 1 and args.prefill_tp != 2:
         raise ValueError("--prefill-pp splits a two-GPU worker; needs --prefill-tp 2")
     resolve_pool_sizes(args)
+    resolve_hicache_ratio(args)
     num_gpus = args.num_prefill * args.prefill_tp + args.num_decode * args.decode_tp
     gpu_error = f"--gpus must contain {num_gpus} distinct nonnegative indices"
     try:
@@ -1075,6 +1159,8 @@ def build_plan(args):
         workers=workers,
         router=router,
     )
+    if getattr(args, "prefill_hicache_auto", None):
+        plan["hicache_auto"] = args.prefill_hicache_auto
     if args.memory_profile is not None:
         plan["memory"] = memory_summary(args)
     return plan
@@ -1412,11 +1498,7 @@ def preflight(args, plan):
             if not states or any(line != required for line in states):
                 errors.append(f"{name}: requires {required!r}; found {results[name]!r}")
     check("topology", lambda: run(["nvidia-smi", "topo", "-m"]))
-    available = next(
-        int(line.split()[1]) * 1024
-        for line in Path("/proc/meminfo").read_text().splitlines()
-        if line.startswith("MemAvailable:")
-    )
+    available = host_available_bytes()
     results["host_available_bytes"] = available
     locked_credit = 0
     if args.resident_engram_pid:
