@@ -45,7 +45,7 @@ With `LOGS` set, the sweep also prints the prefill prefix-cache hit for each lev
 
 ## Results (2026-11-09)
 
-Setup: one pair on 4x B200 (non-CED), `dsv41-262k.env` settings, HiCache off.
+Setup: one pair on 4x B200 (non-CED), `dsv41-262k.env` settings without HiCache (no host RAM for it).
 
 | Realmix sessions | Turns/s | Output tok/s | Prefill cache hit | TTFT p50 / p99 |
 |---|---|---|---|---|
@@ -67,5 +67,5 @@ No worker errors occurred at any level. The 256-session realmix level had 893
 The knee is about 32 realmix conversations, or 16–32 coding sessions, per pair.
 Past it, the sessions' working set no longer fits in prefill's prefix cache
 (1M tokens), so turns re-prefill their whole history. HiCache (a host-memory
-tier) is the lever for that; it was off here because the test VM's host RAM
-was held by the Engram cache.
+tier) is the lever for that. `dsv41-262k.env` enables it, but these results were
+measured without it: the test VM's host RAM was held by the Engram cache.
