@@ -654,6 +654,23 @@ class TestLaunch(unittest.TestCase):
         self.assertEqual(default.max_concurrent_requests, -1)
         self.assertEqual(default.max_inflight_images, 0)
         self.assertFalse(parsed("--no-router-reject-video").reject_video)
+        # One prefill per pair: an open circuit is an outage, so it is off, and
+        # an overloaded pair is retried twice, not five times.
+        self.assertTrue(default.disable_circuit_breaker)
+        self.assertEqual(default.retry_max_retries, 2)
+        self.assertFalse(parsed("--router-circuit-breaker").disable_circuit_breaker)
+        self.assertEqual(
+            parsed("--router-retry-max-retries", "5").retry_max_retries, 5
+        )
+
+    def test_open_file_soft_limit_is_raised_to_the_hard_limit(self):
+        with patch.object(
+            launch.resource, "getrlimit", side_effect=[(1024, 524288), (524288, 524288)]
+        ), patch.object(launch.resource, "setrlimit") as setrlimit:
+            self.assertEqual(launch.raise_open_file_limit(), 524288)
+        setrlimit.assert_called_once_with(
+            launch.resource.RLIMIT_NOFILE, (524288, 524288)
+        )
 
     def test_target_only_control_disables_speculation_on_both_sides(self):
         plan = launch.build_plan(self.args("--no-dspark"))
