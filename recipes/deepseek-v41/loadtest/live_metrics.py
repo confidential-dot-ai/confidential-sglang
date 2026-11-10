@@ -185,8 +185,19 @@ class Snapshot:
     router: Scrape | None
 
 
+def _counter(s: Scrape, name: str) -> float | None:
+    """A counter's value. SGLang's counters are labelled, and a labelled
+    Prometheus series appears only at its first increment, so on an endpoint
+    that exports anything an absent counter is 0 (e.g. cached_tokens_total
+    before the first prefix hit). An empty scrape (no endpoint) stays None."""
+    v = s.values.get(name)
+    if v is None and name.endswith("_total") and s.values:
+        return 0.0
+    return v
+
+
 def _rate(new: Scrape, old: Scrape, name: str, dt: float) -> float | None:
-    d = counter_delta(new.values.get(name), old.values.get(name))
+    d = counter_delta(_counter(new, name), _counter(old, name))
     return None if d is None else d / dt
 
 
@@ -237,7 +248,7 @@ def window(new: Snapshot, old: Snapshot, gpus: int | None) -> dict:
             "output_share": None if not served else output / served,
         },
         "cache": {
-            "prefix_hit": None if not prompt else cached / prompt,
+            "prefix_hit": None if not prompt or cached is None else cached / prompt,
             "prefill_kv_use": _gauge(p, "sglang:token_usage"),
             "decode_kv_use": _gauge(d, "sglang:token_usage"),
             "prefill_kv_used_tokens": _gauge(p, "sglang:kv_used_tokens"),
