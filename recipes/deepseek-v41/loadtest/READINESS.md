@@ -17,7 +17,16 @@ it runs beside a load test, a soak, or production. The workers need
 python3 live_metrics.py --gpus 8 --interval 10 --out live.jsonl      # PD defaults: 8041/8042, router 29001
 python3 live_metrics.py --prefill http://127.0.0.1:8041 --prefill http://127.0.0.1:8043 \
     --decode http://127.0.0.1:8042 --decode http://127.0.0.1:8044 --router http://127.0.0.1:29001 --gpus 8
+python3 live_metrics.py --router-only --router http://127.0.0.1:29001   # workers without metrics
 ```
+
+If a worker's `/metrics` is missing (a stack started without metrics), the
+tool exits 2 with that hint. `--router-only` still gives request rate, non-2xx
+rate, admission in flight and rejections, and request duration, but no token,
+cache, KV or TTFT/ITL numbers. Router admission in flight should return to 0
+when idle: a stuck nonzero value means admission slots are leaking (seen on
+the 4x B200 after aborted requests: 4 in flight, no request older than 0 s,
+both workers at 0 active).
 
 ## Test 2: Oracle scorecard (fixed workload, pass/fail)
 

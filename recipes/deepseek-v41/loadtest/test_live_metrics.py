@@ -61,6 +61,7 @@ smg_http_responses_total{status="200"} 10
 smg_http_responses_total{status="429"} 1
 smg_admission_rejected_total 1
 smg_admission_inflight 3
+smg_http_requests_total{method="POST",path="/v1/chat/completions"} 11
 """
 
 ROUTER_1 = """
@@ -69,6 +70,7 @@ smg_http_responses_total{status="429"} 6
 smg_http_responses_total{status="503"} 4
 smg_admission_rejected_total 6
 smg_admission_inflight 7
+smg_http_requests_total{method="POST",path="/v1/chat/completions"} 30
 """
 
 
@@ -162,6 +164,34 @@ class LiveMetricsTest(unittest.TestCase):
         text = lm.line(rec)
         self.assertIn("hit 95.0%", text)
         self.assertIn("TPM/GPU -", text)
+
+    def test_router_only_window_reports_router_side_and_nothing_else(self):
+        empty = lm.Scrape()
+        new = lm.Snapshot(10, empty, empty, lm.parse(ROUTER_1))
+        old = lm.Snapshot(0, empty, empty, lm.parse(ROUTER_0))
+        rec = lm.window(new, old, gpus=4)
+        self.assertAlmostEqual(rec["traffic"]["router_requests_per_s"], 1.9)
+        self.assertIsNone(rec["traffic"]["input_tok_s"])
+        self.assertIsNone(rec["latency_s"]["ttft"]["p50"])
+        text = lm.router_line(rec)
+        self.assertIn("router req/s 1.90", text)
+        self.assertIn("in flight 7", text)
+
+    def test_router_only_needs_a_router(self):
+        with self.assertRaises(ValueError):
+            lm.Scraper([], [], [], "", 1, router_only=True)
+        s = lm.Scraper(["p"], ["d"], [], "http://r", 1, router_only=True)
+        self.assertEqual((s.prefill, s.decode), ([], []))
+
+    def test_worker_without_metrics_endpoint_exits_with_a_hint(self):
+        def boom(url, timeout):
+            raise lm.MetricsUnavailable(url + "/metrics returned 404")
+
+        orig, lm.fetch = lm.fetch, boom
+        try:
+            self.assertEqual(lm.main(["--prefill", "http://p", "--decode", "http://d"]), 2)
+        finally:
+            lm.fetch = orig
 
 
 if __name__ == "__main__":
