@@ -193,6 +193,58 @@ class LiveMetricsTest(unittest.TestCase):
         finally:
             lm.fetch = orig
 
+    def test_unreachable_endpoint_exits_2(self):
+        self.assertEqual(lm.main(["--prefill", "http://127.0.0.1:1", "--decode", "http://127.0.0.1:2"]), 2)
+
+    def _rec(self):
+        return lm.window(
+            snap(10, PREFILL_1, DECODE_1, ROUTER_1), snap(0, PREFILL_0, DECODE_0, ROUTER_0), gpus=4
+        )
+
+    def test_exposition_has_gauges_quantiles_labels_and_skips_missing(self):
+        text = lm.exposition(self._rec(), {"topology": "1P1D"})
+        self.assertIn('inference_up{topology="1P1D"} 1', text)
+        self.assertIn('inference_traffic_input_tok_s{topology="1P1D"} 2000.0', text)
+        self.assertIn('inference_cache_prefix_hit{topology="1P1D"} 0.95', text)
+        self.assertIn('inference_latency_seconds{quantile="0.5",stage="ttft",topology="1P1D"} 0.5', text)
+        # TPM per GPU present with --gpus; spec accept length missing -> omitted
+        self.assertIn("inference_traffic_served_tpm_per_gpu", text)
+        self.assertNotIn("spec_accept_length", text)
+        # every sample line parses back with this module's own parser
+        back = lm.parse(text)
+        self.assertEqual(back.values["inference_up"], 1)
+        for ln in text.splitlines():
+            self.assertTrue(ln.startswith("# TYPE ") or lm._SAMPLE.match(ln), ln)
+
+    def test_label_values_are_escaped_and_bad_labels_rejected(self):
+        text = lm.exposition(None, {"note": 'a"b\\c'}, up=False)
+        self.assertIn('inference_up{note="a\\"b\\\\c"} 0', text)
+        self.assertEqual(lm.parse_labels(["topology=4x", "gpu=B200"]), {"topology": "4x", "gpu": "B200"})
+        for bad in (["novalue"], ["1x=a"], ["quantile=1"]):
+            with self.assertRaises(ValueError):
+                lm.parse_labels(bad)
+
+    def test_exporter_serves_latest_window_and_flags_failed_scrapes(self):
+        import urllib.request
+
+        ex = lm.Exporter("127.0.0.1", 0, {"topology": "t"})
+        try:
+            url = f"http://127.0.0.1:{ex.port}/metrics"
+            get = lambda: urllib.request.urlopen(url, timeout=5).read().decode()
+            self.assertIn('inference_up{topology="t"} 0', get())
+            ex.update(self._rec(), up=True)
+            body = get()
+            self.assertIn('inference_up{topology="t"} 1', body)
+            self.assertIn("inference_traffic_output_tok_s", body)
+            ex.update(None, up=False)
+            body = get()
+            self.assertIn('inference_up{topology="t"} 0', body)
+            self.assertIn("inference_traffic_output_tok_s", body)  # last values kept
+            with self.assertRaises(urllib.error.HTTPError):
+                urllib.request.urlopen(f"http://127.0.0.1:{ex.port}/other", timeout=5)
+        finally:
+            ex.close()
+
 
 if __name__ == "__main__":
     unittest.main()

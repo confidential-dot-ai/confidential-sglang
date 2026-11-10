@@ -22,6 +22,13 @@ It only reads metrics, so it can run beside any load: a load test, a soak, or
 production traffic. With --duration it stops on its own and prints a summary
 over the whole run; otherwise Ctrl-C prints the summary.
 
+With --serve PORT it also publishes the latest window as Prometheus gauges at
+http://HOST:PORT/metrics (prefix inference_, labels from --label k=v), so a
+Prometheus can scrape the derived numbers (TPM per GPU, hit rate, TTFT/ITL
+quantiles) without PromQL over the raw counters. inference_up is 0 when the last
+scrape of the workers or router failed; the other gauges then keep their last
+values.
+
 In a PD deployment the input-side counters come from prefill and the output
 side from decode: both servers count every request's prompt, so summing them
 would double the input rate. A colocated (non-PD) worker is passed as --worker
@@ -38,7 +45,9 @@ import math
 import re
 import signal
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -353,6 +362,112 @@ def line(rec: dict) -> str:
     )
 
 
+PROM_PREFIX = "inference_"
+_PROM_SECTIONS = ("traffic", "cache", "preemption", "queues", "health")
+_PROM_LABEL_OK = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _prom_labels(labels: dict) -> str:
+    if not labels:
+        return ""
+    esc = lambda v: str(v).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+    return "{" + ",".join(f'{k}="{esc(v)}"' for k, v in sorted(labels.items())) + "}"
+
+
+def _num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def exposition(rec: dict | None, labels: dict | None = None, up: bool = True) -> str:
+    """The window record as Prometheus text: one gauge per numeric field
+    (inference_<section>_<field>), latency quantiles as
+    inference_latency_seconds{stage,quantile}. Missing values are omitted."""
+    labels = dict(labels or {})
+    out = [
+        f"# TYPE {PROM_PREFIX}up gauge",
+        f"{PROM_PREFIX}up{_prom_labels(labels)} {1 if up else 0}",
+    ]
+    if rec is None:
+        return "\n".join(out) + "\n"
+    out += [
+        f"# TYPE {PROM_PREFIX}window_seconds gauge",
+        f"{PROM_PREFIX}window_seconds{_prom_labels(labels)} {rec['window_s']}",
+        f"# TYPE {PROM_PREFIX}window_end_timestamp_seconds gauge",
+        f"{PROM_PREFIX}window_end_timestamp_seconds{_prom_labels(labels)} {rec['t']}",
+    ]
+    for section in _PROM_SECTIONS:
+        for key, v in rec.get(section, {}).items():
+            if _num(v):
+                name = f"{PROM_PREFIX}{section}_{key}"
+                out += [f"# TYPE {name} gauge", f"{name}{_prom_labels(labels)} {v}"]
+    lat_name = f"{PROM_PREFIX}latency_seconds"
+    lat = [f"# TYPE {lat_name} gauge"]
+    for stage, qs in rec.get("latency_s", {}).items():
+        for q, v in qs.items():
+            if _num(v):
+                l = dict(labels, stage=stage, quantile=str(int(q[1:]) / 100))
+                lat.append(f"{lat_name}{_prom_labels(l)} {v}")
+    if len(lat) > 1:
+        out += lat
+    return "\n".join(out) + "\n"
+
+
+class Exporter:
+    """Serves the latest exposition at /metrics from a daemon thread."""
+
+    def __init__(self, host: str, port: int, labels: dict):
+        self.labels = labels
+        self._text = exposition(None, labels, up=False)
+        self._lock = threading.Lock()
+        exporter = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                if self.path.split("?")[0] != "/metrics":
+                    self.send_error(404)
+                    return
+                with exporter._lock:
+                    body = exporter._text.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.server = ThreadingHTTPServer((host, port), Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def update(self, rec: dict | None, up: bool) -> None:
+        with self._lock:
+            if rec is None:
+                # Keep the last values, flip inference_up.
+                lines = self._text.splitlines()
+                key = f"{PROM_PREFIX}up{_prom_labels(self.labels)} "
+                self._text = "\n".join(
+                    (key + ("1" if up else "0")) if ln.startswith(key) else ln for ln in lines
+                ) + "\n"
+            else:
+                self._text = exposition(rec, self.labels, up)
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def parse_labels(items: list[str]) -> dict:
+    labels = {}
+    for item in items:
+        k, sep, v = item.partition("=")
+        if not sep or not _PROM_LABEL_OK.match(k) or k in ("stage", "quantile"):
+            raise ValueError(f"bad --label {item!r}: want name=value (not stage/quantile)")
+        labels[k] = v
+    return labels
+
+
 class MetricsUnavailable(Exception):
     """An endpoint answered but serves no /metrics (metrics flag off)."""
 
@@ -422,6 +537,11 @@ def main(argv=None):
         help="scrape only the router (workers without --enable-metrics): request rate, "
         "status codes, admission and request duration; no token, cache or TTFT metrics",
     )
+    p.add_argument("--serve", type=int, default=0, metavar="PORT",
+                   help="also serve the latest window as Prometheus gauges on PORT (/metrics)")
+    p.add_argument("--serve-host", default="127.0.0.1", help="bind address for --serve")
+    p.add_argument("--label", action="append", default=[], metavar="K=V",
+                   help="constant label on served gauges, e.g. topology=4xB200-1P1D (repeatable)")
     args = p.parse_args(argv)
     if not args.prefill and not args.decode and not args.worker:
         args.prefill, args.decode = ["http://127.0.0.1:8041"], ["http://127.0.0.1:8042"]
@@ -442,6 +562,9 @@ def main(argv=None):
             file=sys.stderr,
         )
         return 2
+    except OSError as e:
+        print(f"Cannot reach a metrics endpoint: {e}", file=sys.stderr)
+        return 2
     missing = [] if args.router_only else check_enabled(first)
     if missing:
         print(
@@ -450,23 +573,39 @@ def main(argv=None):
             file=sys.stderr,
         )
         return 2
+    exporter = None
+    if args.serve:
+        try:
+            exporter = Exporter(args.serve_host, args.serve, parse_labels(args.label))
+        except ValueError as e:
+            p.error(str(e))
+        print(f"serving Prometheus gauges on http://{args.serve_host}:{exporter.port}/metrics",
+              file=sys.stderr, flush=True)
     out = open(args.out, "a") if args.out else None
     stop = {"now": False}
     signal.signal(signal.SIGINT, lambda *_: stop.update(now=True))
     signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
     end = first.t + args.duration if args.duration else math.inf
+    next_at = first.t + args.interval
     while not stop["now"] and time.time() < end:
-        deadline = min(prev.t + args.interval, end)
+        deadline = min(next_at, end)
         while not stop["now"] and time.time() < deadline:
             time.sleep(min(0.25, max(0.0, deadline - time.time())))
         try:
             snap = scraper.snapshot()
         except OSError as e:
             print(f"scrape failed: {e}", file=sys.stderr, flush=True)
+            if exporter:
+                exporter.update(None, up=False)
+            # Retry after a full interval; prev stays the last good scrape.
+            next_at = time.time() + args.interval
             continue
+        next_at = snap.t + args.interval
         if snap.t - prev.t <= 0:
             continue
         rec = window(snap, prev, args.gpus)
+        if exporter:
+            exporter.update(rec, up=True)
         text = router_line(rec) if scraper.router_only else line(rec)
         print(f"[{snap.t - first.t:6.0f}s] " + text, flush=True)
         if out:
@@ -480,6 +619,8 @@ def main(argv=None):
             out.write(json.dumps({"summary": summary}) + "\n")
     if out:
         out.close()
+    if exporter:
+        exporter.close()
     return 0
 
 
