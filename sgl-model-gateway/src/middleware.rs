@@ -53,6 +53,17 @@ use crate::{
 /// does not re-enter the ceiling immediately.
 const ADMISSION_RETRY_AFTER_SECONDS: u64 = 5;
 
+/// Returns permits to the bucket and republishes admission occupancy.
+///
+/// `smg_admission_inflight` is otherwise sampled only when a request is
+/// admitted, so after load stops it keeps the last admission's count (e.g. 32
+/// after a 32-session run) while `GET /admission` reports 0. Every release
+/// path goes through here so the gauge follows releases as well as admissions.
+fn release_permit(bucket: &TokenBucket, tokens: f64) {
+    bucket.return_tokens_sync(tokens);
+    Metrics::set_admission_state(bucket.capacity(), bucket.in_flight());
+}
+
 /// A body wrapper that holds a token and returns it when the body is fully consumed or dropped.
 /// This ensures that for streaming responses, the token is only returned after the entire
 /// stream has been sent to the client.
@@ -82,8 +93,8 @@ impl Drop for TokenGuardBody {
                 "TokenGuardBody: stream ended, returning {} tokens to bucket",
                 self.tokens
             );
-            // Use lock-free sync return - no runtime needed, guaranteed token return
-            bucket.return_tokens_sync(self.tokens);
+            // Sync return - no runtime needed, guaranteed token return
+            release_permit(&bucket, self.tokens);
         }
     }
 }
@@ -141,7 +152,7 @@ impl Drop for PermitGuard {
     fn drop(&mut self) {
         if let Some(bucket) = self.token_bucket.take() {
             debug!("PermitGuard: request dropped before response, returning token");
-            bucket.return_tokens_sync(self.tokens);
+            release_permit(&bucket, self.tokens);
         }
     }
 }
@@ -480,7 +491,7 @@ impl QueueProcessor {
                 // gone away (client disconnected, request cancelled) strands it.
                 if queued.permit_tx.send(Ok(())).is_err() {
                     debug!("Queue: waiter gone before handoff, returning token");
-                    self.token_bucket.return_tokens_sync(1.0);
+                    release_permit(&self.token_bucket, 1.0);
                 }
             } else {
                 // Need to wait for token
@@ -496,7 +507,7 @@ impl QueueProcessor {
                         debug!("Queue: acquired token after waiting");
                         if queued.permit_tx.send(Ok(())).is_err() {
                             debug!("Queue: waiter gone before handoff, returning token");
-                            token_bucket.return_tokens_sync(1.0);
+                            release_permit(&token_bucket, 1.0);
                         }
                     } else {
                         warn!("Queue: request timed out waiting for token");
@@ -1064,6 +1075,32 @@ pub async fn wasm_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn concurrency_bucket(capacity: f64) -> Arc<TokenBucket> {
+        // Refill 0: a pure concurrency ceiling, as --max-concurrent-requests builds.
+        Arc::new(TokenBucket::new(capacity as usize, 0))
+    }
+
+    #[tokio::test]
+    async fn permit_guard_drop_returns_the_permit() {
+        let bucket = concurrency_bucket(2.0);
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+        assert_eq!(bucket.in_flight(), 1.0);
+        drop(PermitGuard::new(bucket.clone(), 1.0));
+        assert_eq!(bucket.in_flight(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn token_guard_body_drop_returns_the_permit() {
+        let bucket = concurrency_bucket(2.0);
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+        let permit = PermitGuard::new(bucket.clone(), 1.0);
+        let body = TokenGuardBody::new(Body::empty(), permit.disarm(), 1.0);
+        // Disarmed: the guard no longer owns the return.
+        assert_eq!(bucket.in_flight(), 1.0);
+        drop(body);
+        assert_eq!(bucket.in_flight(), 0.0);
+    }
 
     #[test]
     fn test_normalize_path_no_ids() {
