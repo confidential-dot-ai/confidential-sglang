@@ -67,7 +67,14 @@ class Scrape:
     labelled: dict[str, dict[tuple, float]] = field(default_factory=dict)
 
 
-KEEP_LABELS = {"smg_http_responses_total": ("status",)}
+# metric -> label kept, by alternative names (the router labels responses
+# status_code; older builds used status).
+KEEP_LABELS = {"smg_http_responses_total": (("status_code", "status"),)}
+
+
+# Per-rank copies of one value (every TP rank reports its pool size): take one,
+# don't sum. Token and request counters come from rank 0 only, so they sum.
+MAX_OVER_LABELS = {"sglang:max_total_num_tokens", "sglang:max_total_num_tokens_swa"}
 
 
 def parse(text: str) -> Scrape:
@@ -93,10 +100,15 @@ def parse(text: str) -> Scrape:
             continue
         if name.endswith("_created"):
             continue
+        if name in MAX_OVER_LABELS:
+            out.values[name] = max(out.values.get(name, value), value)
+            continue
         out.values[name] = out.values.get(name, 0.0) + value
         keep = KEEP_LABELS.get(name)
         if keep:
-            key = tuple(labels.get(k, "") for k in keep)
+            key = tuple(
+                next((labels[k] for k in alts if k in labels), "") for alts in keep
+            )
             series = out.labelled.setdefault(name, {})
             series[key] = series.get(key, 0.0) + value
     return out
@@ -205,6 +217,14 @@ def _gauge(s: Scrape, name: str) -> float | None:
     return s.values.get(name)
 
 
+def _fill(s: Scrape) -> float | None:
+    pool = s.values.get("sglang:max_total_num_tokens")
+    used, evictable = s.values.get("sglang:kv_used_tokens"), s.values.get("sglang:kv_evictable_tokens")
+    if not pool or used is None or evictable is None:
+        return None
+    return (used + evictable) / pool
+
+
 def window(new: Snapshot, old: Snapshot, gpus: int | None) -> dict:
     """Every marquee metric over the window between two snapshots."""
     dt = new.t - old.t
@@ -250,6 +270,9 @@ def window(new: Snapshot, old: Snapshot, gpus: int | None) -> dict:
         "cache": {
             "prefix_hit": None if not prompt or cached is None else cached / prompt,
             "prefill_kv_use": _gauge(p, "sglang:token_usage"),
+            # PD prefill hands KV to decode, so its active use is ~0; its
+            # pressure is the prefix cache: (used + evictable) / pool.
+            "prefill_cache_fill": _fill(p),
             "decode_kv_use": _gauge(d, "sglang:token_usage"),
             "prefill_kv_used_tokens": _gauge(p, "sglang:kv_used_tokens"),
             "prefill_kv_evictable_tokens": _gauge(p, "sglang:kv_evictable_tokens"),
@@ -318,7 +341,8 @@ def _non2xx_rate(r: Scrape, r0: Scrape, dt: float) -> float | None:
     old = r0.labelled.get("smg_http_responses_total", {})
     total = 0.0
     for key, v in new.items():
-        if key[0].startswith("2"):
+        # An unlabelled series has no code; count only known non-2xx codes.
+        if not key[0] or key[0].startswith("2"):
             continue
         d = counter_delta(v, old.get(key, 0.0))
         total += d or 0.0
@@ -363,7 +387,7 @@ def line(rec: dict) -> str:
         f"req/s {fmt(t['requests_per_s'])}  in {fmt(t['input_tok_s'])} tok/s "
         f"(hit {fmt(c['prefix_hit'], 'pct')})  out {fmt(t['output_tok_s'])} tok/s  "
         f"TPM/GPU {fmt(t['served_tpm_per_gpu'])}  "
-        f"KV P/D {fmt(c['prefill_kv_use'], 'pct')}/{fmt(c['decode_kv_use'], 'pct')}  "
+        f"P cache {fmt(c['prefill_cache_fill'], 'pct')}  KV P/D {fmt(c['prefill_kv_use'], 'pct')}/{fmt(c['decode_kv_use'], 'pct')}  "
         f"evict {fmt(c['evicted_tok_s'])}/s  host wb/lb {fmt(c['hicache_writeback_tok_s'])}/"
         f"{fmt(c['hicache_loadback_tok_s'])}  retract {fmt(pr['retracted_req_s'])}/s  "
         f"run/wait P {fmt(q['prefill_running'])}/{fmt(q['prefill_waiting'])} "

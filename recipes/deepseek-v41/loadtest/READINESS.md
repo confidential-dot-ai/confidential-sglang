@@ -30,7 +30,7 @@ router themselves):
 python3 live_metrics.py --gpus 4 --serve 29100 --serve-host 0.0.0.0 \
     --label topology=4xB200-1P1D --label model=dsv41
 # inference_traffic_output_tok_s, inference_traffic_served_tpm_per_gpu,
-# inference_cache_prefix_hit, inference_cache_decode_kv_use,
+# inference_cache_prefix_hit, inference_cache_prefill_cache_fill, inference_cache_decode_kv_use,
 # inference_preemption_retracted_req_s, inference_queues_router_inflight,
 # inference_latency_seconds{stage="ttft|itl|prefill_queue|router_request",quantile="0.5|0.9|0.99"},
 # inference_health_router_non2xx_s, inference_up (0 = last scrape failed)
