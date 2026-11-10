@@ -20,6 +20,24 @@ python3 live_metrics.py --prefill http://127.0.0.1:8041 --prefill http://127.0.0
 python3 live_metrics.py --router-only --router http://127.0.0.1:29001   # workers without metrics
 ```
 
+For Prometheus, `--serve PORT` publishes the latest window as gauges at
+`/metrics`, so dashboards and alerts get the marquee numbers without PromQL over
+the raw counters (the raw counters stay scrapeable from the workers and the
+router themselves):
+
+```sh
+python3 live_metrics.py --gpus 4 --serve 29100 --serve-host 0.0.0.0 \
+    --label topology=4xB200-1P1D --label model=dsv41
+# inference_traffic_output_tok_s, inference_traffic_served_tpm_per_gpu,
+# inference_cache_prefix_hit, inference_cache_decode_kv_use,
+# inference_preemption_retracted_req_s, inference_queues_router_inflight,
+# inference_latency_seconds{stage="ttft|itl|prefill_queue|router_request",quantile="0.5|0.9|0.99"},
+# inference_health_router_non2xx_s, inference_up (0 = last scrape failed)
+```
+
+Each gauge is a rate or quantile over the last `--interval`, so set the
+Prometheus scrape interval to match it.
+
 If a worker's `/metrics` is missing (a stack started without metrics), the
 tool exits 2 with that hint. `--router-only` still gives request rate, non-2xx
 rate, admission in flight and rejections, and request duration, but no token,
