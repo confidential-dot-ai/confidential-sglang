@@ -468,7 +468,7 @@ def parse_labels(items: list[str]) -> dict:
     return labels
 
 
-class MetricsUnavailable(Exception):
+class MetricsUnavailable(OSError):
     """An endpoint answered but serves no /metrics (metrics flag off)."""
 
 
@@ -520,6 +520,27 @@ def check_enabled(snap: Snapshot) -> list[str]:
     return missing
 
 
+def first_snapshot(scraper: "Scraper", retry_every: float) -> Snapshot:
+    """The first scrape, and the worker-metrics check. retry_every > 0 (an
+    exporter, e.g. a sidecar started before the model is up) keeps retrying
+    until every endpoint answers with metrics; 0 raises at once."""
+    announced = None
+    while True:
+        try:
+            snap = scraper.snapshot()
+            missing = [] if scraper.router_only else check_enabled(snap)
+            if missing:
+                raise MetricsUnavailable("missing worker series: " + ", ".join(missing))
+            return snap
+        except OSError as e:
+            if retry_every <= 0:
+                raise
+            if str(e) != announced:
+                print(f"waiting for metrics: {e}", file=sys.stderr, flush=True)
+                announced = str(e)
+            time.sleep(retry_every)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--prefill", action="append", default=[], help="prefill worker URL (repeatable)")
@@ -551,9 +572,16 @@ def main(argv=None):
         scraper = Scraper(
             args.prefill, args.decode, args.worker, args.router, args.timeout, args.router_only
         )
-        first = prev = scraper.snapshot()
+        labels = parse_labels(args.label)
     except ValueError as e:
         p.error(str(e))
+    exporter = None
+    if args.serve:
+        exporter = Exporter(args.serve_host, args.serve, labels)
+        print(f"serving Prometheus gauges on http://{args.serve_host}:{exporter.port}/metrics",
+              file=sys.stderr, flush=True)
+    try:
+        first = prev = first_snapshot(scraper, args.interval if exporter else 0)
     except MetricsUnavailable as e:
         print(
             f"No worker metrics: {e}. Start the workers with --enable-metrics (the "
@@ -565,22 +593,8 @@ def main(argv=None):
     except OSError as e:
         print(f"Cannot reach a metrics endpoint: {e}", file=sys.stderr)
         return 2
-    missing = [] if args.router_only else check_enabled(first)
-    if missing:
-        print(
-            "Missing worker metrics (start the workers with --enable-metrics): "
-            + ", ".join(missing),
-            file=sys.stderr,
-        )
-        return 2
-    exporter = None
-    if args.serve:
-        try:
-            exporter = Exporter(args.serve_host, args.serve, parse_labels(args.label))
-        except ValueError as e:
-            p.error(str(e))
-        print(f"serving Prometheus gauges on http://{args.serve_host}:{exporter.port}/metrics",
-              file=sys.stderr, flush=True)
+    except KeyboardInterrupt:
+        return 130
     out = open(args.out, "a") if args.out else None
     stop = {"now": False}
     signal.signal(signal.SIGINT, lambda *_: stop.update(now=True))

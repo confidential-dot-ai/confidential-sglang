@@ -245,6 +245,30 @@ class LiveMetricsTest(unittest.TestCase):
         finally:
             ex.close()
 
+    def test_first_snapshot_waits_for_metrics_when_serving(self):
+        good = snap(0, PREFILL_0, DECODE_0)
+        calls = []
+
+        class Flaky:
+            router_only = False
+
+            def snapshot(self):
+                calls.append(1)
+                if len(calls) == 1:
+                    raise ConnectionRefusedError("down")
+                if len(calls) == 2:
+                    return lm.Snapshot(0, lm.parse(""), lm.parse(""), None)  # metrics off
+                return good
+
+        self.assertIs(lm.first_snapshot(Flaky(), 0.001), good)
+        self.assertEqual(len(calls), 3)
+        calls.clear()
+        with self.assertRaises(ConnectionRefusedError):
+            lm.first_snapshot(Flaky(), 0)
+
+    def test_metrics_unavailable_is_a_scrape_failure(self):
+        self.assertTrue(issubclass(lm.MetricsUnavailable, OSError))
+
 
 if __name__ == "__main__":
     unittest.main()

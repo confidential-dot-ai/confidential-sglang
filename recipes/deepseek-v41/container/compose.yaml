@@ -105,6 +105,27 @@ services:
       start_period: 60m
       start_interval: 15s
 
+  # Prometheus endpoint for the pair's marquee metrics (inference_* gauges:
+  # tok/s, TPM per GPU, prefix hit, KV use, preemption, queues, TTFT/ITL
+  # quantiles), derived from the workers' and router's own /metrics, which stay
+  # scrapeable too. It waits for the pair, so it does not depend on it.
+  metrics:
+    image: ${DSV41_IMAGE:-dsv41-pd:latest}
+    command: [metrics]
+    environment:
+      GPUS: ${GPUS:-4,5,6,7}
+      PORT: ${PORT:-8040}
+      ROUTER_METRICS_PORT: ${ROUTER_METRICS_PORT:-29001}
+      DSV41_LAUNCH_ARGS: ${DSV41_LAUNCH_ARGS:-}
+      METRICS_PORT: ${METRICS_PORT:-29100}
+      # 127.0.0.1 keeps it on the node; 0.0.0.0 for a Prometheus elsewhere.
+      METRICS_HOST: ${METRICS_HOST:-127.0.0.1}
+      METRICS_INTERVAL: ${METRICS_INTERVAL:-10}
+      # Space-separated k=v labels on every gauge, e.g. "topology=8xB200-2P2D model=dsv41".
+      METRICS_LABELS: ${METRICS_LABELS:-}
+    network_mode: host
+    restart: unless-stopped
+
 volumes:
   # The holder's ready file (its PID); tmpfs, so it never survives the holder's node.
   run:

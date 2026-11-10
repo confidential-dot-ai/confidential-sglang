@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # `checkpoint` assembles $MODEL from pinned Hub sources when CHECKPOINT_SPEC names
 # one, `engram` holds the Engram pages, `pd` runs one PD pair through tp2-pd.sh
-# with the holder's PID; anything else runs as given (e.g. a probe).
+# with the holder's PID, `metrics` serves the pair's derived metrics to
+# Prometheus; anything else runs as given (e.g. a probe).
 set -euo pipefail
 cd /opt/sglang
 export MODEL="${MODEL:-/data/DeepSeek-V4.1-Flash}"
@@ -54,6 +55,34 @@ pd)
     # For the compose healthcheck, which finds smoke.json there.
     echo "$OUTPUT_DIR" > /tmp/output-dir
     exec recipes/deepseek-v41/tp2-pd.sh --resident-engram-pid "$pid" "$@"
+    ;;
+metrics)
+    # Prometheus exporter for the pair's derived metrics (loadtest/live_metrics.py
+    # --serve): a sidecar beside `pd`, with the same PORT, GPUS and
+    # DSV41_LAUNCH_ARGS, from which it finds the workers. The launcher puts
+    # prefill i on PORT+1+i and decode j on PORT+1+num_prefill+j. It waits for
+    # the workers, so it can start before the model is up.
+    shift
+    read -r -a launch <<< "${DSV41_LAUNCH_ARGS:-}"
+    num_prefill=1 num_decode=1
+    for ((i = 0; i < ${#launch[@]}; i++)); do
+        case "${launch[i]}" in
+            --num-prefill) num_prefill="${launch[i + 1]}" ;;
+            --num-prefill=*) num_prefill="${launch[i]#*=}" ;;
+            --num-decode) num_decode="${launch[i + 1]}" ;;
+            --num-decode=*) num_decode="${launch[i]#*=}" ;;
+        esac
+    done
+    base="${PORT:-8040}"
+    args=()
+    for ((i = 0; i < num_prefill; i++)); do args+=(--prefill "http://127.0.0.1:$((base + 1 + i))"); done
+    for ((j = 0; j < num_decode; j++)); do args+=(--decode "http://127.0.0.1:$((base + 1 + num_prefill + j))"); done
+    IFS=, read -r -a gpus <<< "${GPUS:-}"
+    for label in ${METRICS_LABELS:-}; do args+=(--label "$label"); done
+    exec python recipes/deepseek-v41/loadtest/live_metrics.py "${args[@]}" \
+        --router "http://127.0.0.1:${ROUTER_METRICS_PORT:-29001}" --gpus "${#gpus[@]}" \
+        --interval "${METRICS_INTERVAL:-10}" \
+        --serve "${METRICS_PORT:-29100}" --serve-host "${METRICS_HOST:-127.0.0.1}" "$@"
     ;;
 *)
     exec "$@"
