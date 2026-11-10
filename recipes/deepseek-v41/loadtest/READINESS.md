@@ -49,10 +49,11 @@ endpoints at start instead of exiting, and reports `inference_up 0` meanwhile.
 If a worker's `/metrics` is missing (a stack started without metrics), the
 tool exits 2 with that hint. `--router-only` still gives request rate, non-2xx
 rate, admission in flight and rejections, and request duration, but no token,
-cache, KV or TTFT/ITL numbers. Router admission in flight should return to 0
-when idle: a stuck nonzero value means admission slots are leaking (seen on
-the 4x B200 after aborted requests: 4 in flight, no request older than 0 s,
-both workers at 0 active).
+cache, KV or TTFT/ITL numbers. Router admission in flight returns to 0 when
+idle. Before the router fix in this PR, `smg_admission_inflight` was set only
+when a request was admitted, so after load it kept the last admission's count
+(32 after a 32-session replay) while `GET /admission` reported 0. If it stays
+nonzero while idle, compare it with `GET /admission` before suspecting a leak.
 
 ## Test 2: Oracle scorecard (fixed workload, pass/fail)
 
