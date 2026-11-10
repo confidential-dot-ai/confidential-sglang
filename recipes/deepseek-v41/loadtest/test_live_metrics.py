@@ -57,17 +57,17 @@ sglang:time_to_first_token_seconds_bucket{le="+Inf"} 100
 """
 
 ROUTER_0 = """
-smg_http_responses_total{status="200"} 10
-smg_http_responses_total{status="429"} 1
+smg_http_responses_total{error_code="",status_code="200"} 10
+smg_http_responses_total{error_code="",status_code="429"} 1
 smg_admission_rejected_total 1
 smg_admission_inflight 3
 smg_http_requests_total{method="POST",path="/v1/chat/completions"} 11
 """
 
 ROUTER_1 = """
-smg_http_responses_total{status="200"} 20
-smg_http_responses_total{status="429"} 6
-smg_http_responses_total{status="503"} 4
+smg_http_responses_total{error_code="",status_code="200"} 20
+smg_http_responses_total{error_code="",status_code="429"} 6
+smg_http_responses_total{error_code="",status_code="503"} 4
 smg_admission_rejected_total 6
 smg_admission_inflight 7
 smg_http_requests_total{method="POST",path="/v1/chat/completions"} 30
@@ -289,6 +289,32 @@ class LiveMetricsTest(unittest.TestCase):
         self.assertIsNone(rec["traffic"]["input_tok_s"])
         self.assertIsNone(rec["cache"]["prefix_hit"])
         lm.line(rec)  # renders
+
+    def test_router_status_label_old_name_still_counts(self):
+        r0 = lm.parse('smg_http_responses_total{status="200"} 1\n')
+        r1 = lm.parse('smg_http_responses_total{status="200"} 11\nsmg_http_responses_total{status="503"} 5\n')
+        self.assertEqual(lm._non2xx_rate(r1, r0, 10), 0.5)
+
+    def test_all_200s_is_no_errors(self):
+        # Seen on the 4x: every response 200 was reported as non-2xx.
+        r0 = lm.parse('smg_http_responses_total{status_code="200",error_code=""} 10\n')
+        r1 = lm.parse('smg_http_responses_total{status_code="200",error_code=""} 410\n')
+        self.assertEqual(lm._non2xx_rate(r1, r0, 10), 0.0)
+
+    def test_prefill_cache_fill_takes_pool_size_once_per_worker(self):
+        # As on the 4x: both TP ranks report the pool; rank 0 the KV gauges.
+        text = (
+            'sglang:max_total_num_tokens{tp_rank="0"} 1048576\n'
+            'sglang:max_total_num_tokens{tp_rank="1"} 1048576\n'
+            'sglang:kv_used_tokens{tp_rank="0"} 0\n'
+            'sglang:kv_evictable_tokens{tp_rank="0"} 726272\n'
+        )
+        one = lm.parse(text)
+        self.assertEqual(one.values["sglang:max_total_num_tokens"], 1048576)
+        self.assertAlmostEqual(lm._fill(one), 726272 / 1048576)
+        two = lm.merge([one, lm.parse(text)])  # two prefill workers
+        self.assertAlmostEqual(lm._fill(two), 726272 / 1048576)
+        self.assertIsNone(lm._fill(lm.Scrape()))
 
 
 if __name__ == "__main__":
