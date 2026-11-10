@@ -39,6 +39,7 @@ import re
 import signal
 import sys
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -211,6 +212,9 @@ def window(new: Snapshot, old: Snapshot, gpus: int | None) -> dict:
         "window_s": round(dt, 3),
         "traffic": {
             "requests_per_s": rd("sglang:num_requests_total"),
+            "router_requests_per_s": None
+            if r is None
+            else _rate(r, r0, "smg_http_requests_total", dt),
             "input_tok_s": prompt,
             "cached_input_tok_s": cached,
             "uncached_input_tok_s": None
@@ -317,6 +321,16 @@ def fmt(v, kind="n"):
     return f"{v:.2f}"
 
 
+def router_line(rec: dict) -> str:
+    t, q, lat, h = rec["traffic"], rec["queues"], rec["latency_s"], rec["health"]
+    rr = lat["router_request"]
+    return (
+        f"router req/s {fmt(t['router_requests_per_s'])}  non-2xx {fmt(h['router_non2xx_s'])}/s  "
+        f"in flight {fmt(q['router_inflight'])}  rejected {fmt(q['router_rejected_s'])}/s  "
+        f"duration p50/p99 {fmt(rr['p50'], 's')}/{fmt(rr['p99'], 's')}"
+    )
+
+
 def line(rec: dict) -> str:
     t, c, pr, q, lat = (
         rec["traffic"],
@@ -339,23 +353,40 @@ def line(rec: dict) -> str:
     )
 
 
+class MetricsUnavailable(Exception):
+    """An endpoint answered but serves no /metrics (metrics flag off)."""
+
+
 def fetch(url: str, timeout: float) -> Scrape:
-    with urllib.request.urlopen(url.rstrip("/") + "/metrics", timeout=timeout) as resp:
-        return parse(resp.read().decode("utf-8", "replace"))
+    full = url.rstrip("/") + "/metrics"
+    try:
+        with urllib.request.urlopen(full, timeout=timeout) as resp:
+            return parse(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise MetricsUnavailable(f"{full} returned 404") from None
+        raise
 
 
 class Scraper:
-    def __init__(self, prefill, decode, workers, router, timeout):
-        if workers and (prefill or decode):
+    def __init__(self, prefill, decode, workers, router, timeout, router_only=False):
+        if router_only:
+            if not router:
+                raise ValueError("--router-only needs --router")
+            prefill = decode = workers = []
+        elif workers and (prefill or decode):
             raise ValueError("--worker (colocated) cannot be combined with --prefill/--decode")
-        if not workers and not (prefill and decode):
+        elif not workers and not (prefill and decode):
             raise ValueError("pass --prefill and --decode (PD) or --worker (colocated)")
         self.prefill, self.decode = prefill or workers, decode or workers
-        self.colocated = bool(workers)
+        self.colocated = bool(workers) or router_only
+        self.router_only = router_only
         self.router, self.timeout = router, timeout
 
     def snapshot(self) -> Snapshot:
         t = time.time()
+        if self.router_only:
+            return Snapshot(t, Scrape(), Scrape(), fetch(self.router, self.timeout))
         p = merge([fetch(u, self.timeout) for u in self.prefill])
         d = p if self.colocated else merge([fetch(u, self.timeout) for u in self.decode])
         r = fetch(self.router, self.timeout) if self.router else None
@@ -385,14 +416,33 @@ def main(argv=None):
     p.add_argument("--duration", type=float, default=0, help="stop after S seconds (0 = until Ctrl-C)")
     p.add_argument("--out", default="", help="append one JSON record per interval here")
     p.add_argument("--timeout", type=float, default=5.0)
+    p.add_argument(
+        "--router-only",
+        action="store_true",
+        help="scrape only the router (workers without --enable-metrics): request rate, "
+        "status codes, admission and request duration; no token, cache or TTFT metrics",
+    )
     args = p.parse_args(argv)
     if not args.prefill and not args.decode and not args.worker:
         args.prefill, args.decode = ["http://127.0.0.1:8041"], ["http://127.0.0.1:8042"]
         args.router = args.router or "http://127.0.0.1:29001"
 
-    scraper = Scraper(args.prefill, args.decode, args.worker, args.router, args.timeout)
-    first = prev = scraper.snapshot()
-    missing = check_enabled(first)
+    try:
+        scraper = Scraper(
+            args.prefill, args.decode, args.worker, args.router, args.timeout, args.router_only
+        )
+        first = prev = scraper.snapshot()
+    except ValueError as e:
+        p.error(str(e))
+    except MetricsUnavailable as e:
+        print(
+            f"No worker metrics: {e}. Start the workers with --enable-metrics (the "
+            "launcher's --worker-metrics, on by default), or pass --router-only for the "
+            "router's view alone.",
+            file=sys.stderr,
+        )
+        return 2
+    missing = [] if args.router_only else check_enabled(first)
     if missing:
         print(
             "Missing worker metrics (start the workers with --enable-metrics): "
@@ -417,7 +467,8 @@ def main(argv=None):
         if snap.t - prev.t <= 0:
             continue
         rec = window(snap, prev, args.gpus)
-        print(f"[{snap.t - first.t:6.0f}s] " + line(rec), flush=True)
+        text = router_line(rec) if scraper.router_only else line(rec)
+        print(f"[{snap.t - first.t:6.0f}s] " + text, flush=True)
         if out:
             out.write(json.dumps(rec) + "\n")
             out.flush()
