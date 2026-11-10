@@ -269,6 +269,27 @@ class LiveMetricsTest(unittest.TestCase):
     def test_metrics_unavailable_is_a_scrape_failure(self):
         self.assertTrue(issubclass(lm.MetricsUnavailable, OSError))
 
+    def test_counters_absent_before_their_first_event_count_as_zero(self):
+        # Seen on the 4x: after the smoke request, prompt_tokens_total existed
+        # but cached_tokens_total did not (no prefix hit yet).
+        p0 = 'sglang:prompt_tokens_total{m="a"} 100\nsglang:token_usage{m="a"} 0.1\n'
+        p1 = 'sglang:prompt_tokens_total{m="a"} 1100\nsglang:token_usage{m="a"} 0.1\n'
+        d = 'sglang:generation_tokens_total{m="a"} 5\n'
+        rec = lm.window(snap(10, p1, d), snap(0, p0, d), gpus=4)
+        self.assertEqual(rec["cache"]["prefix_hit"], 0.0)
+        self.assertEqual(rec["traffic"]["cached_input_tok_s"], 0.0)
+        # the counter appears mid-window: the whole value is this window's
+        p2 = p1 + 'sglang:cached_tokens_total{m="a"} 500\n'
+        p3 = 'sglang:prompt_tokens_total{m="a"} 2100\nsglang:cached_tokens_total{m="a"} 500\n'
+        rec = lm.window(snap(10, p2, d), snap(0, p0, d), gpus=4)
+        self.assertEqual(rec["traffic"]["cached_input_tok_s"], 50.0)
+        # an empty scrape (no endpoint) still reports nothing
+        rec = lm.window(lm.Snapshot(10, lm.Scrape(), lm.Scrape(), None),
+                        lm.Snapshot(0, lm.Scrape(), lm.Scrape(), None), gpus=4)
+        self.assertIsNone(rec["traffic"]["input_tok_s"])
+        self.assertIsNone(rec["cache"]["prefix_hit"])
+        lm.line(rec)  # renders
+
 
 if __name__ == "__main__":
     unittest.main()
