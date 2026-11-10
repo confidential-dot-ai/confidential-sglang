@@ -15,8 +15,9 @@ it runs beside a load test, a soak, or production. The workers need
 
 ```sh
 python3 live_metrics.py --gpus 8 --interval 10 --out live.jsonl      # PD defaults: 8041/8042, router 29001
-python3 live_metrics.py --prefill http://127.0.0.1:8041 --prefill http://127.0.0.1:8043 \
-    --decode http://127.0.0.1:8042 --decode http://127.0.0.1:8044 --router http://127.0.0.1:29001 --gpus 8
+# 2P2D: the launcher puts prefill i on PORT+1+i, decode j on PORT+1+num_prefill+j
+python3 live_metrics.py --prefill http://127.0.0.1:8041 --prefill http://127.0.0.1:8042 \
+    --decode http://127.0.0.1:8043 --decode http://127.0.0.1:8044 --router http://127.0.0.1:29001 --gpus 8
 python3 live_metrics.py --router-only --router http://127.0.0.1:29001   # workers without metrics
 ```
 
@@ -37,6 +38,13 @@ python3 live_metrics.py --gpus 4 --serve 29100 --serve-host 0.0.0.0 \
 
 Each gauge is a rate or quantile over the last `--interval`, so set the
 Prometheus scrape interval to match it.
+
+In a deployment it runs as the `metrics` service in `container/compose.yaml`
+(entrypoint mode `metrics`): it reads the pair's `PORT`, `GPUS` and
+`DSV41_LAUNCH_ARGS` to find the workers, waits for them, and serves on
+`METRICS_PORT` (29100) at `METRICS_HOST` (127.0.0.1; 0.0.0.0 for a remote
+Prometheus), with `METRICS_LABELS`. With `--serve`, the tool waits for the
+endpoints at start instead of exiting, and reports `inference_up 0` meanwhile.
 
 If a worker's `/metrics` is missing (a stack started without metrics), the
 tool exits 2 with that hint. `--router-only` still gives request rate, non-2xx
