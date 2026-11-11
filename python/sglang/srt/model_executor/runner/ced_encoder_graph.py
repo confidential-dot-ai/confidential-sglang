@@ -54,6 +54,8 @@ class CedEncoderGraph:
         self.invalid = False
         self.graph = BreakableCUDAGraph()
         self.q_pad_buffer = None
+        # Whether this graph captured q_pad_buffer (it may not grow after that).
+        self.q_pad_captured = False
         self.pool = getattr(model, "_ced_encoder_pool", None)
         if self.pool is None:
             self.pool = model._ced_encoder_pool = torch.cuda.graph_pool_handle()
@@ -155,11 +157,13 @@ class CedEncoderGraph:
         old_loc = core.swa_out_cache_loc
         metadata = backend.forward_metadata
         old_q_pad = metadata.q_pad_buffer
+        old_q_pad_captured = metadata.q_pad_captured
         try:
             get_flags().capture.disable_dispose_tensor = True
             backend.ced_encoder_graph = True
             core.swa_out_cache_loc = self.swa_loc
             metadata.q_pad_buffer = self.q_pad_buffer
+            metadata.q_pad_captured = self.q_pad_captured
             with (
                 enable_breakable_cuda_graph(),
                 set_tc_piecewise_forward_context(
@@ -177,7 +181,10 @@ class CedEncoderGraph:
             # Warmup allocates this outside the graph pool. Keep a strong
             # reference: graph nodes retain addresses, not Tensor lifetimes.
             self.q_pad_buffer = metadata.q_pad_buffer
+            self.q_pad_captured = metadata.q_pad_captured
             metadata.q_pad_buffer = old_q_pad
+            # The capture marks the swapped-in buffer, not the live one.
+            metadata.q_pad_captured = old_q_pad_captured
             core.swa_out_cache_loc = old_loc
             backend.ced_encoder_graph = old_graph
             get_flags().capture.disable_dispose_tensor = old_dispose
