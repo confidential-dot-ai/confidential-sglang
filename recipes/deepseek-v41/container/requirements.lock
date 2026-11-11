@@ -31,6 +31,9 @@ cuda-tile==1.6.0rc5
 cuda-toolkit==13.0.3.0
 cython==3.3.0
 datasets==5.1.0
+# deepseek-recipe: V4/V4.1 chat rendering since upstream #45315; its own
+# dependencies were not re-resolved (uv pip compile) when this line was added.
+deepseek-recipe==0.2.0
 dill==0.4.1
 diskcache==5.6.3
 distro==1.9.0
