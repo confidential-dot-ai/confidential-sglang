@@ -363,7 +363,11 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             )
         with (
             _autotune_process_group(sync_group),
-            torch.inference_mode(),
+            # no_grad, not inference_mode: lazy buffers first allocated by the
+            # dummy forwards here (e.g. the mega backend's packed query) are
+            # written in place later by prefill graph capture, which runs
+            # under no_grad (Scheduler.init_all_cuda_graphs).
+            torch.no_grad(),
             autotune(
                 True,
                 cache=None if reuse_cache else str(autotune_cache),
