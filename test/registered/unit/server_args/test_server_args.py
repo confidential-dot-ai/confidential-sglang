@@ -4668,7 +4668,6 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args = self._args(moe_a2a_backend="deepep")
         check_two_batch_overlap(args)
 
-
 class TestKvCacheShardingCompatibility(CustomTestCase):
     def setUp(self):
         super().setUp()
@@ -5482,7 +5481,9 @@ class TestDcpCommBackendDefault(CustomTestCase):
     def test_no_dcp_is_ag_rs(self):
         self.assertEqual(self._resolved(dcp_size=1), "ag_rs")
 
-    @override_platform(is_npu=True, is_cuda=False, is_hip=False, is_xpu=False)
+    @override_platform(
+        is_npu=True, is_cuda=False, is_hip=False, is_xpu=False, is_sm100=False
+    )
     def test_npu_supports_dcp(self):
         with patch(
             "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False

@@ -127,5 +127,56 @@ def test_engram_gather_rows_per_program_bit_exact(
         _assert_bits_equal(gather(rows_per_program, ids), gather(1, ids))
 
 
+def _table(rows: int, mxfp4: bool, *, host: bool):
+    gen = torch.Generator().manual_seed(0)
+    if mxfp4:
+        weight = torch.randint(
+            0, 256, (rows, _DIM // 2), dtype=torch.uint8, generator=gen
+        )
+    else:
+        weight = torch.randn(rows, _DIM, generator=gen).to(torch.float8_e4m3fn)
+    # Include byte 0 (2**-127, the e8m0 no-zero case) and extreme exponents.
+    exps = torch.randint(0, 255, (rows, _DIM // _BLOCK), generator=gen)
+    exps[0, 0] = 0
+    scale = exps.to(torch.uint8).view(torch.float8_e8m0fnu)
+    if host:
+        return weight.pin_memory(), scale.pin_memory()
+    return weight.cuda(), scale.cuda()
+
+
+def _dequant(weight: torch.Tensor, scale: torch.Tensor, mxfp4: bool) -> torch.Tensor:
+    values = (unpack_mxfp4_rows(weight) if mxfp4 else weight).float()
+    values = values.unflatten(-1, (-1, _BLOCK)) * scale.float().unsqueeze(-1)
+    return values.flatten(-2).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("mxfp4", [False, True])
+@pytest.mark.parametrize("host", [False, True])
+def test_gather_reads_host_and_device_tables_and_zeros_unowned_rows(mxfp4, host):
+    """A row range [row_lo, row_hi) of a device or pinned host table: owned ids
+    match the torch dequantization, the others come out zero."""
+    rows, row_lo = 97, 1000
+    weight, scale = _table(rows, mxfp4, host=host)
+    ids = torch.tensor([1000, 1096, 1048, 999, 1097, 1000, 0], device="cuda")
+    out = torch.empty(ids.numel(), _DIM, dtype=torch.bfloat16, device="cuda")
+    engram_gather(
+        weight.data_ptr(),
+        scale.data_ptr(),
+        ids,
+        out,
+        _DIM,
+        _BLOCK,
+        row_lo=row_lo,
+        row_hi=row_lo + rows,
+        mxfp4=mxfp4,
+    )
+    local = (ids - row_lo).cpu()
+    owned = (local >= 0) & (local < rows)
+    clamped = local.clamp(0, rows - 1)
+    want = _dequant(weight.cpu()[clamped], scale.cpu()[clamped], mxfp4)
+    want[~owned] = 0
+    torch.testing.assert_close(out.cpu(), want, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

@@ -102,30 +102,38 @@ class DFlashVerifyInput(SpecInput):
             # before init_new snapshots them into the verify ForwardBatch.
             # Same hook eagle/ngram/dspark run before TARGET_VERIFY.
             prepare_mamba_track_for_verify(batch)
-        verify_forward_batch = ForwardBatch.init_new(
-            batch,
-            target_worker.model_runner,
-            capture_hidden_mode=self.capture_hidden_mode,
-            return_hidden_states_before_norm=False,
-            ragged_verify_layout=self.ragged_verify_layout,
-            iteration_ids=self.iteration_ids,
-            write_cols=self.iteration_cols,
-        )
+        if batch.spec_algorithm.is_dspark():
+            verify_forward_batch = ForwardBatch.init_dspark_target_verify(
+                batch,
+                target_worker.model_runner,
+                capture_hidden_mode=self.capture_hidden_mode,
+                return_hidden_states_before_norm=False,
+                ragged_verify_layout=self.ragged_verify_layout,
+                iteration_ids=self.iteration_ids,
+                write_cols=self.iteration_cols,
+            )
+        else:
+            verify_forward_batch = ForwardBatch.init_new(
+                batch,
+                target_worker.model_runner,
+                capture_hidden_mode=self.capture_hidden_mode,
+                return_hidden_states_before_norm=False,
+                ragged_verify_layout=self.ragged_verify_layout,
+                iteration_ids=self.iteration_ids,
+                write_cols=self.iteration_cols,
+            )
+        runner = target_worker.model_runner.decode_cuda_graph_runner
 
         can_run_cuda_graph = bool(
-            target_worker.model_runner.decode_cuda_graph_runner
-            and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
-                verify_forward_batch
-            )
+            runner and runner.can_run_graph(verify_forward_batch)
         )
         if _is_npu or defer_metadata_init:
             # DP padding can change the live rows and graph eligibility.
             # ModelRunner owns planning after final batch preparation.
             return verify_forward_batch, can_run_cuda_graph
-        elif can_run_cuda_graph:
-            target_worker.model_runner.decode_cuda_graph_runner.load_batch(
-                verify_forward_batch
-            )
+
+        if can_run_cuda_graph:
+            runner.stage_batch(verify_forward_batch)
         elif not batch.forward_mode.is_idle():
             target_worker.model_runner.attn_backend.init_forward_metadata(
                 verify_forward_batch

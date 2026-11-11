@@ -20,6 +20,8 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
     plan_topk_v2,
+    selection_page_indices,
+    sort_selection_,
     topk_transform_paged,
     topk_transform_paged_v2,
 )
@@ -496,6 +498,10 @@ def topk_transform_paged_from_metadata(
             metadata.compressed_page_size,
         )
         return
+    # Positions are sorted before the slots are derived from them: the slots of a
+    # position change with the allocation, so only position order repeats.
+    if out_raw_indices is None:
+        out_raw_indices = torch.empty_like(out_page_indices)
     if metadata.use_topk_v2:
         topk_transform_paged_v2(
             logits,
@@ -515,6 +521,12 @@ def topk_transform_paged_from_metadata(
             metadata.compressed_page_size,
             out_raw_indices,
         )
+    sort_selection_(out_raw_indices)
+    out_page_indices.copy_(
+        selection_page_indices(
+            out_raw_indices, page_table, metadata.compressed_page_size
+        )
+    )
 
 
 class C4IndexerBackendMixin:

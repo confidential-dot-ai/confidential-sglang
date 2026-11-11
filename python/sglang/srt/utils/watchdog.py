@@ -20,6 +20,29 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import (
 
 logger = logging.getLogger(__name__)
 
+# Grace between asking the parent to tear the group down and exiting anyway.
+# Long enough for an orderly shutdown to win, short enough that a wedged rank
+# does not sit in rotation.
+_SELF_TERMINATE_GRACE_SECONDS = 30.0
+
+# Budget for startup, which is active but advances no forward counter.
+# Measured on the B300 rig: ~17 min weight load plus ~3.5 min graph capture.
+_STARTUP_WATCHDOG_TIMEOUT_SECONDS = 1800.0
+
+
+def _abort_pynccl_communicators() -> None:
+    """Best effort; never let teardown fail on the way to exiting."""
+    try:
+        from sglang.srt.distributed.device_communicators.pynccl import (
+            abort_all_communicators,
+        )
+
+        aborted = abort_all_communicators()
+        if aborted:
+            logger.error("Aborted %d pynccl communicator(s) before teardown", aborted)
+    except Exception as e:
+        logger.error("Could not abort pynccl communicators: %s", e)
+
 
 class Watchdog:
     @staticmethod
@@ -114,6 +137,7 @@ class WatchdogRaw:
         soft: bool = False,
         dump_info: Optional[Callable[[], str]] = None,
         before_crash: Optional[Callable[[], None]] = None,
+        is_starting_up: Optional[Callable[[], bool]] = None,
     ):
         self.debug_name = debug_name
         self.get_counter = get_counter
@@ -125,6 +149,11 @@ class WatchdogRaw:
         # process tree; this thread runs even while the stuck main thread is
         # blocked in C with the GIL released.
         self.before_crash = before_crash
+        self.is_starting_up = is_starting_up
+        # Startup counts as active but never advances the forward counter, so
+        # weight load and graph capture run against this budget instead. Held
+        # at or above the serving timeout so lowering that cannot kill a boot.
+        self.startup_timeout = max(watchdog_timeout, _STARTUP_WATCHDOG_TIMEOUT_SECONDS)
 
         self.parent_process = psutil.Process().parent()
         # CI containers lack CAP_SYS_PTRACE, so py-spy cannot attach without this.
@@ -142,6 +171,11 @@ class WatchdogRaw:
                 f"{self.debug_name} watchdog thread crashed: {e}", exc_info=True
             )
 
+    def _current_timeout(self) -> float:
+        if self.is_starting_up is not None and self.is_starting_up():
+            return self.startup_timeout
+        return self.watchdog_timeout
+
     def _watchdog_once(self):
         watchdog_last_counter = 0
         watchdog_last_time = time.perf_counter()
@@ -151,11 +185,13 @@ class WatchdogRaw:
             if self.is_active():
                 current_counter = self.get_counter()
                 if watchdog_last_counter == current_counter:
-                    if current > watchdog_last_time + self.watchdog_timeout:
+                    if current > watchdog_last_time + self._current_timeout():
                         break
                 else:
                     watchdog_last_counter = current_counter
                     watchdog_last_time = current
+            # Paced off the serving timeout so a short one still gets
+            # sub-timeout resolution during startup.
             time.sleep(self.watchdog_timeout / 2)
 
         if self.dump_info is not None and (info_msg := self.dump_info()):
@@ -175,9 +211,29 @@ class WatchdogRaw:
                     self.before_crash()
                 except BaseException:  # e.g. a Rust panic; SIGQUIT must still go
                     logger.exception(f"{self.debug_name} watchdog: before_crash failed")
+            # A collective spinning on the GPU keeps the process alive through
+            # SIGTERM and holds its HBM, so abort the communicators first: the
+            # kernels poll the abort flag and exit, and teardown can proceed.
+            _abort_pynccl_communicators()
+
             # Wait for some time so that the parent process can print the error.
             time.sleep(5)
             self.parent_process.send_signal(signal.SIGQUIT)
+            # SIGQUIT to the parent is a request, not a guarantee: a parent that
+            # is wedged on the same collective never reaps us, and the caller
+            # re-arms this thread, so the rank stays up logging a timeout every
+            # interval instead of going down. Exit on our own after a grace.
+            time.sleep(_SELF_TERMINATE_GRACE_SECONDS)
+            logger.error(
+                f"{self.debug_name} still alive {_SELF_TERMINATE_GRACE_SECONDS}s "
+                f"after SIGQUIT to parent pid={self.parent_process.pid}; "
+                f"self-terminating so the worker is removed from rotation"
+            )
+            sys.stderr.flush()
+            sys.stdout.flush()
+            # _exit, not sys.exit: this is a daemon thread, and a SystemExit
+            # here would only unwind this thread and leave the process hung.
+            os._exit(1)
 
 
 class SubprocessWatchdog:

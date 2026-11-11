@@ -10,7 +10,10 @@ from sglang.kernels.ops.quantization.fp4_indexer_quant import (
 )
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kernels.deepseek_v4.common import quantize_fp4_indexer_ref
+from sglang.test.kernels.deepseek_v4.common import (
+    fold_fp4_negative_zero,
+    quantize_fp4_indexer_ref,
+)
 
 register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
@@ -33,7 +36,24 @@ def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
     x_fp4, x_sf = quantize_fp4_indexer_tensor(x)
     ref_fp4, ref_sf = quantize_fp4_indexer_ref(x)
 
-    torch.testing.assert_close(x_fp4.view(torch.uint8), ref_fp4)
+    torch.testing.assert_close(fold_fp4_negative_zero(x_fp4), ref_fp4)
+    torch.testing.assert_close(x_sf, ref_sf)
+
+
+def test_quantize_fp4_indexer_rounds_midpoints_to_even() -> None:
+    # A value of 6.0 makes the UE8M0 scale exactly 1.0. This leaves the E2M1
+    # midpoints unchanged and locks native PTX's nibble order and tie behavior.
+    midpoints = torch.tensor(
+        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0],
+        device=get_device(),
+        dtype=torch.float32,
+    )
+    values = torch.cat((midpoints, -midpoints)).repeat(8).reshape(1, HEAD_DIM)
+
+    x_fp4, x_sf = quantize_fp4_indexer_tensor(values)
+    ref_fp4, ref_sf = quantize_fp4_indexer_ref(values)
+
+    torch.testing.assert_close(fold_fp4_negative_zero(x_fp4), ref_fp4)
     torch.testing.assert_close(x_sf, ref_sf)
 
 

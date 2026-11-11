@@ -56,6 +56,7 @@ from sglang.srt.disaggregation.checksum import (
     state_indices_for_request,
 )
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.divergence_debug import log_metadata_slot
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -64,6 +65,11 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreResult,
 )
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
+from sglang.srt.disaggregation.ced_boundary import (
+    build_ced_boundary_injection,
+    ced_boundary_enabled,
+    take_ced_boundary_slot,
+)
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
     KVClassType,
@@ -75,6 +81,9 @@ from sglang.srt.disaggregation.utils import (
     all_reduce_flags,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    ced_split_enabled,
+    ced_tail_start,
+    disagg_swa_transfer_window,
     end_network_transfer,
     get_dsa_tail_state_indices,
     get_kv_class,
@@ -177,6 +186,8 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
+_CED_TAIL_MAX_REQS = 16
+
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
@@ -186,6 +197,20 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.storage import KVStorage
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
+
+# Cap on the fraction of the KV pool that in-flight (transfer-queue)
+# pre-allocations may pin at once. The per-request admission gates subtract
+# `retractable_tokens` (sum of full lengths of RUNNING requests), so a large
+# running batch makes them effectively unbounded: the FIFO loop burst-admits
+# until the pool is full of idle in-transfer KV, the running batch then
+# drains with no admissible replacements (observed: token usage 0.95 with
+# #running-req 1-2 and ~100 requests parked in transfer), and admission
+# oscillates between burst and famine. Values >= 1.0 disable the cap.
+import os as _os
+
+DECODE_PREALLOC_CAP_FRAC = float(
+    _os.environ.get("SGLANG_DECODE_PREALLOC_CAP_FRAC", "0.5")
+)
 
 
 @dataclass
@@ -204,6 +229,23 @@ class _HostStagedAdmissionStats:
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
+
+
+def decode_radix_max_prefix(
+    prompt_len: int, page_size: int, sliding_window_size: Optional[int]
+) -> int:
+    """Longest decode-radix prefix a prompt may reuse, page aligned.
+
+    Never the whole prompt: a full match leaves an empty transfer and an empty
+    extend. Under SWA it also ends before the window prefill sends fresh, which
+    under the CED split covers the tail decode replays through every layer, so
+    the replay never writes a page the tree owns.
+    """
+    max_prefix = (prompt_len - 1) // page_size * page_size
+    if sliding_window_size:
+        fresh = disagg_swa_transfer_window(sliding_window_size, page_size)
+        max_prefix = min(max_prefix, max(0, prompt_len - fresh) // page_size * page_size)
+    return max(max_prefix, 0)
 
 
 def _bind_root_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
@@ -1674,6 +1716,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             len(r.origin_input_ids) + len(r.output_ids)
             for r in self.scheduler.running_batch.reqs
         )
+        # Tokens already pinned by requests sitting in the transfer queue
+        # (allocated, not yet running) -- the base for the aggregate
+        # in-flight prealloc cap applied inside the admission loop below.
+        inflight_prealloc_tokens = self.num_tokens_pre_allocated
 
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
         window_allocatable_tokens = None
@@ -1828,6 +1874,30 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len = prefix_match.l1_prefix_len
                 total_prefix_len = prefix_match.decode_prefix_len
 
+                # Never match the entire prompt: a full match leaves an empty
+                # transfer suffix (zero pages) and an empty extend region (a
+                # zero-token eager batch crashes the fused-MoE kernel inside
+                # DFlash's draft-KV recompute). Page-aligned prompts CAN fully match
+                # (e.g. 16896 = 264 * page 64), so clamp the promised prefix
+                # to the last page boundary strictly below the prompt length,
+                # mirroring the aggregated scheduler's last-token rule.
+                page = self.token_to_kv_pool_allocator.page_size
+                max_prefix = decode_radix_max_prefix(
+                    fill_len,
+                    page,
+                    self.scheduler.sliding_window_size
+                    or getattr(
+                        self.token_to_kv_pool_allocator.get_kvcache(),
+                        "sliding_window",
+                        None,
+                    ),
+                )
+                if total_prefix_len > max_prefix:
+                    total_prefix_len = max_prefix
+                if prefix_len > max_prefix:
+                    prefix_len = max_prefix
+                    prefix_indices = prefix_indices[:max_prefix]
+
                 # Decode transfers the SWA tail fresh, so retain only the
                 # full-attention prefix lock needed for reuse.
                 if (
@@ -1868,6 +1938,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.req, required_alloc_tokens, prefix_len, retractable_tokens
             )
             window_admission_tokens = None
+            # Aggregate in-flight prealloc cap (see DECODE_PREALLOC_CAP_FRAC
+            # above): stop admitting once transfer-queue pre-allocations
+            # would pin more than the configured pool fraction, keeping the
+            # remainder available to the RUNNING batch instead of idle
+            # in-transfer KV. Uses this tick's starting in-flight total plus
+            # what this loop has admitted so far.
+            if DECODE_PREALLOC_CAP_FRAC < 1.0 and (
+                inflight_prealloc_tokens + required_alloc_tokens
+                > DECODE_PREALLOC_CAP_FRAC * self.scheduler.max_total_num_tokens
+            ):
+                if prefix_match is not None and prefix_match.l1_prefix_len > 0:
+                    self._release_matched_prefix_lock(decode_req.req)
+                break
+
             if uses_swa_tail_prealloc:
                 _, window_required = self._prealloc_required(decode_req.req)
                 window_lens = self._window_tails(pre_alloc_fill_len(decode_req.req))
@@ -1954,6 +2038,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 total_prefix_len,
             )
             decode_req.prefix_match = prefix_match
+            inflight_prealloc_tokens += required_alloc_tokens
+            if use_decode_radix_cache:
+                # Lifetime accumulator for the decode-side prefix cache hit
+                # rate logged in metrics_reporter.report_decode_stats: hit =
+                # L1 (device-resident) match against this request's full
+                # prompt length, at the point of actual admission (not at
+                # match time -- a match here can still be rejected below by
+                # the memory-budget checks above).
+                self.scheduler.metrics_reporter.decode_radix_hit_tokens += (
+                    prefix_len
+                )
+                self.scheduler.metrics_reporter.decode_radix_total_tokens += (
+                    fill_len
+                )
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
@@ -2662,8 +2760,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     @property
     def num_tokens_pre_allocated(self):
+        # extend_len, not extend_end: extend_end is the request's full
+        # promised fill length, which double-counts radix-shared prefix
+        # pages once per queued request and includes the L2/L3 promised gap
+        # not yet on device -- 100 in-transfer 20k-token requests then
+        # report "pre-allocated usage" > 1.0 against a pool that is not in
+        # fact over-allocated. extend_len is the suffix actually allocated
+        # for this request's transfer.
         return sum(
-            decode_req.req.extend_end
+            decode_req.req.extend_len
             for decode_req in self.transfer_queue.queue.items()
             if not decode_req.host_staged
         )
@@ -3389,6 +3494,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Keep the checksum before the metadata slot is freed; it is verified
         # when the request enters a batch.
         idx = decode_req.metadata_buffer_index
+        if envs.SGLANG_DEBUG_PD_DIVERGENCE.get():
+            log_metadata_slot(
+                side="decode-recv",
+                room=decode_req.req.bootstrap_room,
+                buffers=self.metadata_buffers.transfer_buffers(),
+                index=idx,
+            )
         if self.scheduler.kv_checksum_computer is not None:
             digest, signature = self.metadata_buffers.get_kv_checksum(idx)
             decode_req.req.expected_kv_checksum = (
@@ -3410,6 +3522,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_dsa_topk_indices,
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
+        if ced_boundary_enabled() and self.metadata_buffers.ced_boundary is not None:
+            # Copy the handed-off window state out before the slot is freed.
+            decode_req.req.ced_boundary_state = take_ced_boundary_slot(
+                req=decode_req.req,
+                slots=self.metadata_buffers.ced_boundary,
+                idx=idx,
+                layout=self.metadata_buffers.ced_boundary_layout,
+            )
 
         # Validate bootstrap_room to detect context corruption
         actual_room = output_bootstrap_room[0].item()
@@ -3467,7 +3587,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         resumes_output = decode_req.is_rebootstrap
         if resumes_output:
             assert len(decode_req.req.output_ids) > 0, decode_req.req.rid
-        else:
+        # A CED-split prefill never reaches the late layers, so its handoff token
+        # is meaningless; decode samples the first token when it replays the tail.
+        from_prefill = not ced_split_enabled()
+        if from_prefill and not resumes_output:
             if _is_fake_transfer(decode_req.req):
                 committed_output_id = _generate_fake_prefill_handoff_output_id(
                     decode_req.req
@@ -3532,7 +3655,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.mm_audio_tokens = cached_tokens[5].item()
         decode_req.req.mm_video_tokens = cached_tokens[6].item()
         decode_req.req.mm_token_counts_ready = True
-        if not self.spec_algorithm.is_none():
+        if from_prefill and not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
             decode_req.req.hidden_states_tensor = output_hidden_states
@@ -4201,8 +4324,21 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
-        # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
+        if ced_split_enabled():
+            # The prebuilt path below is the other caller; without this a grammar
+            # request never reaches preallocation, so prefill waits on its bootstrap.
+            self._promote_ready_grammar_requests()
+            running_batch = self._merge_ced_tail_batch(running_batch)
+            tail_batch = self._get_new_ced_tail_batch(running_batch)
+            if tail_batch is not None:
+                set_schedule_time_batch(tail_batch)
+                return NextBatchPlan(
+                    batch_to_run=tail_batch, running_batch=running_batch
+                )
+            new_prebuilt_batch = None
+        else:
+            # Process pending prebuilt batch: output processing + filter + merge
+            new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
             assert self.chunked_req is None
             self.batch_result_processor.process_batch_result_prebuilt(
@@ -4232,6 +4368,119 @@ class SchedulerDisaggregationDecodeMixin:
         if ret:
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _merge_ced_tail_batch(self: Scheduler, running_batch: ScheduleBatch):
+        # Same hand-over as the aggregated scheduler after a prefill batch.
+        last_batch = self.last_batch
+        if last_batch is None or not last_batch.forward_mode.is_extend():
+            return running_batch
+        # The replay ran; a promoted tail batch must not replay from it again.
+        last_batch.ced_boundary_injection = None
+        last_batch.filter_batch()
+        if last_batch.is_empty():
+            return running_batch
+        # The tail replay's requests sit in prefill_launched_reqs (moved there when
+        # the tail batch was built); like the aggregated merge, they run from here.
+        move(
+            [req for req in last_batch.reqs if req not in self.running_reqs],
+            self.running_reqs,
+        )
+        if running_batch.is_empty():
+            return last_batch
+        running_batch.merge_batch(last_batch)
+        return running_batch
+
+    def _get_new_ced_tail_batch(
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> Optional[ScheduleBatch]:
+        """Replay transferred prompt tails through every layer (CED split)."""
+        if len(self.waiting_queue) == 0:
+            return None
+        free_slots = (
+            min(self.req_to_token_pool.size, self.max_running_requests)
+            - running_batch.batch_size()
+        )
+        # Arbitrary cap bounding one replay's rows (<= ~383 per request).
+        num_reqs = min(free_slots, len(self.waiting_queue), _CED_TAIL_MAX_REQS)
+        if num_reqs <= 0:
+            return None
+        target = max(
+            1, min(_CED_TAIL_MAX_REQS, envs.SGLANG_DSV41_CED_TAIL_BATCH_SIZE.get())
+        )
+        if target > 1:
+            if self._defer_ced_tail_batch(running_batch, min(target, free_slots)):
+                return None
+            num_reqs = min(num_reqs, target)
+        reqs = list(self.waiting_queue)[:num_reqs]
+        # The tail replay is these requests' launched prefill: they leave the
+        # waiting queue for prefill_launched_reqs until the tail merge.
+        move(reqs, self.prefill_launched_reqs)
+        set_time_batch(reqs, "set_forward_entry_time")
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        # A decode-radix request keeps the prefix its admission matched and
+        # locked; matching again here would move last_node and the protected
+        # length off the KV row the transfer filled.
+        tree_cache = (
+            None
+            if get_disagg().disaggregation_decode_enable_radix_cache
+            else self.tree_cache
+        )
+        for req in reqs:
+            req.init_next_round_input(tree_cache)
+            seq_len = len(req.origin_input_ids)
+            tail_start = ced_tail_start(seq_len, self.sliding_window_size, page_size)
+            req.prefix_len = tail_start
+            req.extend_end = seq_len
+            # The prompt before the tail was computed on prefill, not cached here.
+            req.already_computed = tail_start
+
+        batch = ScheduleBatch.init_new(
+            reqs,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+        batch.prepare_for_extend(preallocated=True)
+        if ced_boundary_enabled():
+            batch.ced_boundary_injection = build_ced_boundary_injection(
+                reqs=reqs, device=batch.device
+            )
+        if self.enable_overlap:
+            # A finished request can still have one redundant forward in flight.
+            self.schedule_stream.wait_stream(self.forward_stream)
+        return batch
+
+    def _defer_ced_tail_batch(self: Scheduler, running_batch, target: int) -> bool:
+        """Coalesce ready tails while continuing decode; never sleep the scheduler.
+
+        Queue-entry timestamps are local to each rank. Consensus is essential:
+        independently crossing a deadline would put TP ranks in different
+        forward modes and deadlock their next GPU collective.
+        """
+        if running_batch.is_empty():
+            return False
+        if self.last_batch is not None and self.last_batch.forward_mode.is_extend():
+            # Even a backlog of full tail batches yields a running decode step.
+            return True
+        oldest = self.waiting_queue[0].time_stats.wait_queue_entry_time
+        max_wait = max(0, envs.SGLANG_DSV41_CED_TAIL_MAX_WAIT_MS.get()) / 1000.0
+        dispatch = torch.tensor(
+            [
+                len(self.waiting_queue) >= target
+                or time.perf_counter() - oldest >= max_wait
+            ],
+            dtype=torch.int32,
+            device="cpu",
+        )
+        if get_parallel().tp_size > 1:
+            torch.distributed.all_reduce(
+                dispatch, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
+            )
+        return not bool(dispatch.item())
 
     def get_new_prebuilt_batch(
         self, running_batch: ScheduleBatch
@@ -4378,14 +4627,17 @@ class SchedulerDisaggregationDecodeMixin:
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
 
+    def _promote_ready_grammar_requests(self: Scheduler) -> None:
+        """Queue requests whose grammar finished compiling for preallocation."""
+        if self.grammar_manager.has_waiting_grammars():
+            for req in self.grammar_manager.get_ready_grammar_requests():
+                self._add_request_to_queue(req)
+
     def _get_new_prebuilt_batch(
         self: Scheduler, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
-        if self.grammar_manager.has_waiting_grammars():
-            ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
-            for req in ready_grammar_requests:
-                self._add_request_to_queue(req)
+        self._promote_ready_grammar_requests()
 
         if len(self.waiting_queue) == 0:
             return None

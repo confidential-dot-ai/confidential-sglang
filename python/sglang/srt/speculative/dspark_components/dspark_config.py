@@ -31,21 +31,49 @@ def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
     return bool(_cfg_get(draft_hf_config, "sample_from_anchor", True))
 
 
-def draft_uses_compressed_kv_attention() -> bool:
+def _draft_uses_compressed_kv_attention(
+    *,
+    draft_model_path: Optional[str],
+    trust_remote_code: bool,
+    revision: Optional[str],
+    json_model_override_args: str,
+    model_config_parser: Optional[str],
+) -> bool:
     from sglang.srt.configs.model_config import uses_compressed_kv_attention
     from sglang.srt.hf_transformers import get_config
 
-    draft_model_path = get_spec().speculative_draft_model_path
     if not draft_model_path:
         return False
     draft_hf_config = get_config(
         draft_model_path,
-        trust_remote_code=get_model().trust_remote_code,
-        revision=get_spec().speculative_draft_model_revision,
-        model_override_args=json.loads(get_model().json_model_override_args),
-        model_config_parser=get_model().model_config_parser,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        model_override_args=json.loads(json_model_override_args),
+        model_config_parser=model_config_parser,
     )
     return draft_hf_config is not None and uses_compressed_kv_attention(draft_hf_config)
+
+
+def draft_uses_compressed_kv_attention() -> bool:
+    return _draft_uses_compressed_kv_attention(
+        draft_model_path=get_spec().speculative_draft_model_path,
+        trust_remote_code=get_model().trust_remote_code,
+        revision=get_spec().speculative_draft_model_revision,
+        json_model_override_args=get_model().json_model_override_args,
+        model_config_parser=get_model().model_config_parser,
+    )
+
+
+def draft_uses_compressed_kv_attention_from_args(server_args: ServerArgs) -> bool:
+    """draft_uses_compressed_kv_attention for resolution time, before the config
+    bags publish."""
+    return _draft_uses_compressed_kv_attention(
+        draft_model_path=server_args.speculative_draft_model_path,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.speculative_draft_model_revision,
+        json_model_override_args=server_args.json_model_override_args,
+        model_config_parser=server_args.model_config_parser,
+    )
 
 
 def dspark_gamma_from_num_draft_tokens(num_draft_tokens: int) -> int:

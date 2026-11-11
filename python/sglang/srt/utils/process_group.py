@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import pickle
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 import numpy as np
 import torch
@@ -57,10 +57,17 @@ def broadcast_pyobj(
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
     force_cpu_device: bool = True,
+    encode_fn: Callable[[List[Any]], bytes] = pickle.dumps,
+    decode_fn: Callable[[bytes], List[Any]] = pickle.loads,
 ):
     """Broadcast inputs from src rank to all other ranks with torch.dist backend.
     The `rank` here refer to the source rank on global process group (regardless
     of dist_group argument).
+
+    `encode_fn`/`decode_fn` default to pickle, matching every existing caller's
+    behavior. Pass a different codec (e.g. a msgspec-msgpack-based one) only
+    for payloads known to be safe for it -- see
+    sglang.srt.managers.io_struct.msgpack_encode_list/msgpack_decode_list.
     """
     device = torch.device(
         "cuda"
@@ -75,7 +82,7 @@ def broadcast_pyobj(
             tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
-            serialized_data = pickle.dumps(data)
+            serialized_data = encode_fn(data)
             size = len(serialized_data)
 
             tensor_data = torch.ByteTensor(
@@ -98,7 +105,7 @@ def broadcast_pyobj(
         dist.broadcast(tensor_data, src=src, group=dist_group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
-        data = pickle.loads(serialized_data)
+        data = decode_fn(serialized_data)
         return data
 
 

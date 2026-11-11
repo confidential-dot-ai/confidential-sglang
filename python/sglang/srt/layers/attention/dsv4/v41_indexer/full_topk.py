@@ -14,6 +14,10 @@ from sglang.kernels.ops.attention.deep_select import (
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
+from sglang.srt.disaggregation.divergence_debug import (
+    LAYER_PROBES_ENABLED,
+    layer_probe,
+)
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 
 from .scoring import (
@@ -22,6 +26,7 @@ from .scoring import (
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
     prefill_requests,
+    score_tiles,
     select_decode,
     sharded_dense_prefill_topk,
     write_prefill,
@@ -33,6 +38,23 @@ from .types import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+
+def _probe_dense_prefill(layer_id: int, data, kv) -> None:
+    """Hashes the eager prefill indexer's operands, and its scores twice: a mismatch
+    within one run is the kernel, a match that differs across runs is its inputs."""
+    layer_probe(layer_id=layer_id, point="index_q", tensor=data.q_fp4)
+    layer_probe(layer_id=layer_id, point="index_w", tensor=data.weights)
+    for point in ("scores", "scores_again"):
+        for tile, logits in score_tiles(data, kv):
+            layer_probe(
+                layer_id=layer_id,
+                point=point,
+                tensor=logits,
+                row_offset=tile.start,
+                valid_cols=data.compress_lens[tile],
+            )
+            del logits
 
 
 class FullTopKIndexer:
@@ -72,11 +94,19 @@ class FullTopKIndexer:
         kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
             inputs.layer_id, data.k_slots
         )
+        if LAYER_PROBES_ENABLED:
+            _probe_dense_prefill(inputs.layer_id, data, kv)
         out = inputs.out_raw_indices[: data.num_rows]
         if inputs.row_shard is None:
             dense_prefill_topk(data, kv, out=out)
         else:
             sharded_dense_prefill_topk(data, kv, out=out, shard=inputs.row_shard)
+        if LAYER_PROBES_ENABLED:
+            layer_probe(
+                layer_id=inputs.layer_id,
+                point="selected",
+                tensor=out,
+            )
         data.write_page_indices(inputs)
 
     def _torch_prefill(self, inputs: PrefillInputs) -> None:
