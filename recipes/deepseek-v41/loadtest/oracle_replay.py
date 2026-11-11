@@ -19,6 +19,15 @@ turn, ~20 tokens).
 
 429s (router admission queue timeout) are retried with backoff, as an agent
 client would; each retry is counted.
+
+--oracle sends each step's completion as forced_text (Oracle decoding: the
+server tokenizes it with its own tokenizer and emits exactly those tokens; it
+needs SGLANG_ENABLE_ORACLE_DECODE=1). Every turn's output is then the trace's
+own text, so the next turn's history matches what the server generated and the
+prefix-cache hit is fixed by the dataset. The text is the next step's opening
+assistant turn where the dataset has one (realmix); otherwise the step's
+forced_token_ids are decoded with the tokenizer that built the dataset
+(--source-tokenizer, MiniMax-M3 for the Oracle datasets).
 """
 
 import argparse
@@ -27,6 +36,7 @@ import json
 import random
 import statistics
 import time
+from pathlib import Path
 
 import aiohttp
 
@@ -45,11 +55,18 @@ def tool_call(cid):
 class Stats:
     def __init__(self):
         self.rows, self.retries_429, self.errors = [], 0, {}
+        self.error_times = []
         self.skipped_context = 0
+        self.active_sessions = 0
         self.t0 = time.time()
 
+    def error(self, key):
+        self.errors[key] = self.errors.get(key, 0) + 1
+        self.error_times.append(time.time() - self.t0)
 
-async def run_step(session, args, sid, idx, history, max_tokens, stats, out):
+
+async def run_step(session, args, sid, idx, history, max_tokens, stats, out, forced=None):
+    # forced: Oracle decoding text; the server sets max_new_tokens to its length.
     body = {
         "model": args.model,
         "messages": history,
@@ -59,6 +76,8 @@ async def run_step(session, args, sid, idx, history, max_tokens, stats, out):
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if forced is not None:
+        body["forced_text"] = forced
     payload = json.dumps(body)
     retries = 0
     while True:
@@ -78,8 +97,7 @@ async def run_step(session, args, sid, idx, history, max_tokens, stats, out):
                     continue
                 if resp.status != 200:
                     msg = (await resp.text())[:200]
-                    key = f"{resp.status}: {msg}"
-                    stats.errors[key] = stats.errors.get(key, 0) + 1
+                    stats.error(f"{resp.status}: {msg}")
                     return None
                 async for raw in resp.content:
                     line = raw.decode().strip()
@@ -99,8 +117,7 @@ async def run_step(session, args, sid, idx, history, max_tokens, stats, out):
                                 ttft = time.time() - t0
                             text.append(piece)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            key = f"conn: {type(e).__name__}"
-            stats.errors[key] = stats.errors.get(key, 0) + 1
+            stats.error(f"conn: {type(e).__name__}")
             return None
         end = time.time()
         usage = usage or {}
@@ -112,6 +129,7 @@ async def run_step(session, args, sid, idx, history, max_tokens, stats, out):
             "ttft": ttft,
             "latency": end - t0,
             "prompt_tokens": usage.get("prompt_tokens"),
+            "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
             "completion_tokens": usage.get("completion_tokens"),
             "target_output": max_tokens,
             "retries_429": retries,
@@ -122,6 +140,14 @@ async def run_step(session, args, sid, idx, history, max_tokens, stats, out):
 
 
 async def run_session(session, args, sid, steps, stats, out, deadline, est_ratio):
+    stats.active_sessions += 1
+    try:
+        await _run_session(session, args, sid, steps, stats, out, deadline, est_ratio)
+    finally:
+        stats.active_sessions -= 1
+
+
+async def _run_session(session, args, sid, steps, stats, out, deadline, est_ratio):
     history, calls = [], 0
     for idx, step in enumerate(steps[: args.max_steps or None]):
         if time.time() > deadline:
@@ -133,12 +159,13 @@ async def run_session(session, args, sid, steps, stats, out, deadline, est_ratio
                 history = []
             history = history + [{"role": m["role"], "content": m["content"]} for m in step["messages"]]
             max_tokens = len(step["forced_token_ids"]) or step["max_new_tokens"]
+            forced = step["_forced_text"] if args.oracle else None
             if args.context_limit:
                 est = sum(len(m["content"] or "") for m in history) / 3.5 + 12 * len(history)
                 if est + max_tokens > args.context_limit:
                     stats.skipped_context += 1
                     return
-            if await run_step(session, args, sid, idx, history, max_tokens, stats, out) is None:
+            if await run_step(session, args, sid, idx, history, max_tokens, stats, out, forced) is None:
                 return  # this format cannot resume past a failed turn coherently
             continue
         if step["reset_history"] or idx == 0:
@@ -160,13 +187,16 @@ async def run_session(session, args, sid, steps, stats, out, deadline, est_ratio
                 new.append({"role": m["role"], "content": m["content"]})
         history = history + new
         max_tokens = step["workload"].get("target_output_tokens") or len(step["forced_token_ids"])
+        forced = None
+        if args.oracle:
+            forced = step["_forced_text"]
         if args.context_limit:
             est = sum(len(m.get("content") or "") for m in history) / est_ratio + 12 * len(history)
             if est + max_tokens > args.context_limit:
                 stats.skipped_context += 1
                 history = []  # the session cannot continue past an oversized prompt
                 continue
-        text = await run_step(session, args, sid, idx, history, max_tokens, stats, out)
+        text = await run_step(session, args, sid, idx, history, max_tokens, stats, out, forced)
         if text is None:
             history = []  # failed step: next step resumes from a fresh history
             continue
@@ -189,7 +219,7 @@ async def reporter(stats, stop, interval):
         )
 
 
-async def main():
+def parser():
     p = argparse.ArgumentParser()
     p.add_argument("dataset")
     p.add_argument("--url", default="http://127.0.0.1:8040")
@@ -198,48 +228,88 @@ async def main():
     p.add_argument("--max-steps", type=int, default=0, help="steps per session (0 = all)")
     p.add_argument("--time-limit", type=float, default=0, help="stop starting steps after S seconds")
     p.add_argument("--context-limit", type=int, default=0, help="skip steps whose est. prompt+output exceeds this")
+    p.add_argument("--oracle", action="store_true", help="send each completion as forced_text (Oracle decoding)")
+    p.add_argument(
+        "--source-tokenizer",
+        default="",
+        help="tokenizer.json (or its directory) the dataset's forced_token_ids use; "
+        "--oracle decodes them where the dataset has no completion text",
+    )
     p.add_argument("--output", default="oracle.jsonl")
     p.add_argument("--report-every", type=float, default=30)
     p.add_argument("--request-timeout", type=float, default=3600)
-    args = p.parse_args()
+    return p
 
+
+def attach_forced_text(convs, source_tokenizer):
+    """Set step["_forced_text"]: the completion's text, from the next step's
+    opening assistant turn when there is one, else decoded from the step's
+    forced_token_ids with the dataset's tokenizer. Returns (from text, decoded)."""
+    decoder, counts = None, [0, 0]
+    for conv in convs:
+        for i, step in enumerate(conv):
+            nxt = conv[i + 1]["messages"] if "workload" not in step and i + 1 < len(conv) else []
+            if nxt and nxt[0]["role"] == "assistant" and nxt[0].get("content"):
+                step["_forced_text"] = nxt[0]["content"]
+                counts[0] += 1
+                continue
+            if decoder is None:
+                if not source_tokenizer:
+                    raise SystemExit(
+                        "--oracle: some steps have no completion text; pass --source-tokenizer "
+                        "(the tokenizer.json the dataset was built with) to decode them"
+                    )
+                from tokenizers import Tokenizer
+
+                path = Path(source_tokenizer)
+                decoder = Tokenizer.from_file(str(path / "tokenizer.json" if path.is_dir() else path))
+            step["_forced_text"] = decoder.decode(step["forced_token_ids"], skip_special_tokens=False) or "."
+            counts[1] += 1
+    return counts
+
+
+def load(args):
     with open(args.dataset) as f:
         data = json.load(f)
     convs = data["conversations"]
-    if args.sessions:
-        convs = convs[: args.sessions]
-    stats = Stats()
+    convs = convs[: args.sessions] if args.sessions else convs
+    if args.oracle:
+        from_text, decoded = attach_forced_text(convs, args.source_tokenizer)
+        print(f"Oracle text: {from_text} steps from the next turn, {decoded} decoded", flush=True)
+    return convs
+
+
+async def replay(args, convs, stats):
+    """Run every session to completion (or the time limit); fills `stats`."""
     deadline = stats.t0 + (args.time_limit or 1e12)
     conn = aiohttp.TCPConnector(limit=0)
     timeout = aiohttp.ClientTimeout(total=args.request_timeout)
     stop = asyncio.Event()
-    print(
-        f"Oracle replay: {len(convs)} sessions, "
-        f"{sum(len(c[: args.max_steps or None]) for c in convs)} steps, url {args.url}",
-        flush=True,
-    )
     with open(args.output, "w") as out:
         async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
             rep = asyncio.create_task(reporter(stats, stop, args.report_every))
-            await asyncio.gather(
-                *(run_session(session, args, i, c, stats, out, deadline, 4.997) for i, c in enumerate(convs))
-            )
-            stop.set()
-            await rep
+            try:
+                await asyncio.gather(
+                    *(run_session(session, args, i, c, stats, out, deadline, 4.997) for i, c in enumerate(convs))
+                )
+            finally:
+                stop.set()
+                await rep
 
-    rows = stats.rows
-    el = max((r["end"] for r in rows), default=time.time() - stats.t0)
+
+def summarize(rows, el, convs, stats):
     ttft = [r["ttft"] for r in rows if r["ttft"] is not None]
     lat = [r["latency"] for r in rows]
     inp = sum(r["prompt_tokens"] or 0 for r in rows)
     outp = sum(r["completion_tokens"] or 0 for r in rows)
+    cached = [r["cached_tokens"] for r in rows if r.get("cached_tokens") is not None]
     # Decode time per output token, excluding the first.
     tpot = [
         (r["latency"] - r["ttft"]) / (r["completion_tokens"] - 1)
         for r in rows
         if r["ttft"] is not None and (r["completion_tokens"] or 0) > 1
     ]
-    summary = {
+    return {
         "sessions": len(convs),
         "steps_ok": len(rows),
         "duration_s": round(el, 1),
@@ -247,6 +317,7 @@ async def main():
         "prompt_tokens_per_s": round(inp / el) if el else None,
         "output_tokens_per_s": round(outp / el) if el else None,
         "mean_prompt_tokens": round(inp / len(rows)) if rows else None,
+        "client_cache_hit": round(sum(cached) / inp, 4) if cached and inp else None,
         "ttft_s": {q: round(pct(ttft, q), 2) for q in (50, 90, 99)},
         "step_latency_s": {q: round(pct(lat, q), 2) for q in (50, 90, 99)},
         "tpot_ms": {q: round(1000 * pct(tpot, q), 1) for q in (50, 90, 99)},
@@ -254,7 +325,22 @@ async def main():
         "skipped_context": stats.skipped_context,
         "errors": stats.errors,
     }
-    print("SUMMARY " + json.dumps(summary), flush=True)
+
+
+async def main():
+    args = parser().parse_args()
+    convs = load(args)
+    stats = Stats()
+    print(
+        f"Oracle replay: {len(convs)} sessions, "
+        f"{sum(len(c[: args.max_steps or None]) for c in convs)} steps, url {args.url}"
+        + (", oracle decoding" if args.oracle else ""),
+        flush=True,
+    )
+    await replay(args, convs, stats)
+    rows = stats.rows
+    el = max((r["end"] for r in rows), default=time.time() - stats.t0)
+    print("SUMMARY " + json.dumps(summarize(rows, el, convs, stats)), flush=True)
 
 
 if __name__ == "__main__":

@@ -169,6 +169,12 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     )
     temperature: float = 1.0
     top_p: float = 1.0
+    # Oracle decoding (benchmark only; SGLANG_ENABLE_ORACLE_DECODE): the
+    # completion is exactly this text, tokenized by the served model's own
+    # tokenizer in normalize(). See oracle_decode/forced_token_pool.py.
+    forced_text: Optional[str] = None
+    # Internal: forced_text's token ids, set by normalize(); not an API input.
+    forced_token_ids: Optional[List[int]] = None
     top_k: int = TOP_K_ALL
     min_p: float = 0.0
     frequency_penalty: float = 0.0
@@ -306,6 +312,17 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                     f"min_new_tokens must be in [0, max_new_tokens({self.max_new_tokens})], got "
                     f"{self.min_new_tokens}."
                 )
+        if self.forced_token_ids is not None:
+            if self.forced_text is None:
+                raise ValueError(
+                    "forced_token_ids is internal; send the forced completion as forced_text."
+                )
+            for token_id in self.forced_token_ids:
+                if type(token_id) is not int or not 0 <= token_id < vocab_size:
+                    raise ValueError(
+                        f"forced_text tokenized to an id outside [0, {vocab_size - 1}]: "
+                        f"{token_id}."
+                    )
         if self.logit_bias is not None:
             for token_id, bias in self.logit_bias.items():
                 if not 0 <= int(token_id) < vocab_size:
@@ -355,6 +372,29 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             )
 
     def normalize(self, tokenizer):
+        if self.forced_token_ids is not None and self.forced_text is None:
+            raise ValueError(
+                "forced_token_ids is internal; send the forced completion as forced_text."
+            )
+        if self.forced_text is not None and self.forced_token_ids is None:
+            from sglang.srt.oracle_decode.forced_token_pool import oracle_enabled
+
+            if not oracle_enabled():
+                raise ValueError(
+                    "forced_text needs a server started with "
+                    "SGLANG_ENABLE_ORACLE_DECODE=1 (benchmark only)."
+                )
+            if not self.forced_text:
+                raise ValueError("forced_text must be non-empty if set.")
+            if tokenizer is None:
+                raise ValueError("forced_text needs the server's tokenizer.")
+            self.forced_token_ids = list(
+                tokenizer.encode(self.forced_text, add_special_tokens=False)
+            )
+            if not self.forced_token_ids:
+                raise ValueError("forced_text encodes to no tokens.")
+            # The completion is exactly the forced text: it ends at its length.
+            self.max_new_tokens = len(self.forced_token_ids)
         # Process stop strings
         if self.stop_strs is None:
             self.stop_strs = []
