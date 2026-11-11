@@ -60,7 +60,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # - flashinfer-cubin ships the trtllm-gen cubins otherwise fetched from NVIDIA's
 #   CDN on first use.
 # They live on FlashInfer's index, not PyPI, so they are not in the lock.
-ARG FLASHINFER_VERSION=0.7.2
+ARG FLASHINFER_VERSION=0.7.3
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --no-deps --index-url https://flashinfer.ai/whl/cu130 \
         "flashinfer-jit-cache==${FLASHINFER_VERSION}+cu130" \
