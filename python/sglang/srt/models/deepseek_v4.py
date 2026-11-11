@@ -150,8 +150,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
+    forward_context,
     get_attn_backend,
+    get_forward_context,
     get_token_to_kv_pool,
+    has_forward_context,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.model_executor.runner import (
@@ -4302,58 +4305,66 @@ class DeepseekV4Model(nn.Module):
         the loop's final read.
         """
         assert _is_cuda
-        state = mhc.HcState(residual, pre)
-        residual_batch.start(forward_batch)
-        hidden_states = residual_batch.set_written(state, forward_batch)
-        for i in range(start, end):
-            layer = self.layers[i]
-            capture = capture_dspark and i in self.dspark_layers_to_capture
-            if layer.engram is not None or capture:
+        # MoE layers read their padded-row bound from the forward context: bind
+        # this span's batch, whose count a CED graph owns, not the enclosing
+        # forward's (a captured graph would keep that batch's tensor address).
+        with (
+            forward_context(get_forward_context(), forward_batch=forward_batch)
+            if has_forward_context()
+            else nullcontext()
+        ):
+            state = mhc.HcState(residual, pre)
+            residual_batch.start(forward_batch)
+            hidden_states = residual_batch.set_written(state, forward_batch)
+            for i in range(start, end):
+                layer = self.layers[i]
+                capture = capture_dspark and i in self.dspark_layers_to_capture
+                if layer.engram is not None or capture:
+                    call = hc_boundary.LayerCall(input_ids, input_ids_global)
+                    next_boundary = (
+                        hc_boundary.HcRead(layer, True)
+                        .bind(forward_batch, call)
+                        .next_boundary
+                    )
+                    hidden_states = state = hc_boundary.materialize(
+                        hidden_states, forward_batch, next=next_boundary
+                    )
+                if layer.engram is not None:
+                    # The Engram gate leaves V4.1 image rows ungated itself.
+                    hidden_states = layer.engram(
+                        state.residual,
+                        hash_ids[:, layer.engram.layer_hash_index],
+                        forward_batch,
+                        input_ids=input_ids,
+                    )
+                    state = state.with_residual(hidden_states)
+                    hidden_states = residual_batch.set_written(state, forward_batch)
+                if capture:
+                    dspark_aux_hidden_states.append(state.residual.mean(dim=1))
+                hidden_states = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    input_ids_global=input_ids_global,
+                )
+            if next_layer is not None:
                 call = hc_boundary.LayerCall(input_ids, input_ids_global)
                 next_boundary = (
-                    hc_boundary.HcRead(layer, True)
+                    hc_boundary.HcRead(next_layer, True)
                     .bind(forward_batch, call)
                     .next_boundary
                 )
-                hidden_states = state = hc_boundary.materialize(
+                state = hc_boundary.materialize(
                     hidden_states, forward_batch, next=next_boundary
                 )
-            if layer.engram is not None:
-                # The Engram gate leaves V4.1 image rows ungated itself.
-                hidden_states = layer.engram(
-                    state.residual,
-                    hash_ids[:, layer.engram.layer_hash_index],
-                    forward_batch,
-                    input_ids=input_ids,
+                residual_batch.clear(forward_batch)
+            else:
+                state = residual_batch.read_output(
+                    hidden_states, forward_batch, hc_boundary.FinalRead(), None
                 )
-                state = state.with_residual(hidden_states)
-                hidden_states = residual_batch.set_written(state, forward_batch)
-            if capture:
-                dspark_aux_hidden_states.append(state.residual.mean(dim=1))
-            hidden_states = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                input_ids=input_ids,
-                forward_batch=forward_batch,
-                input_ids_global=input_ids_global,
-            )
-        if next_layer is not None:
-            call = hc_boundary.LayerCall(input_ids, input_ids_global)
-            next_boundary = (
-                hc_boundary.HcRead(next_layer, True)
-                .bind(forward_batch, call)
-                .next_boundary
-            )
-            state = hc_boundary.materialize(
-                hidden_states, forward_batch, next=next_boundary
-            )
-            residual_batch.clear(forward_batch)
-        else:
-            state = residual_batch.read_output(
-                hidden_states, forward_batch, hc_boundary.FinalRead(), None
-            )
-        state = state.materialized(self.layers[end - 1].hc_cfg)
-        return state.residual, state.pre
+            state = state.materialized(self.layers[end - 1].hc_cfg)
+            return state.residual, state.pre
 
     def _ced_boundary_state(
         self,
