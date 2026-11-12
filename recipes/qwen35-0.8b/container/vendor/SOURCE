@@ -1,0 +1,7 @@
+Copied unchanged from confidential-dot-ai/confidential-inference at
+00b679016a4246ed16aa8065b684789d83b7b646 (images/sglang/). The chart runs them
+by these paths, so keep them in step with the chart version you deploy.
+
+wait_for_model.py  -> /usr/local/bin/wait-for-model   fafd1bf8dcffd7c6d651ea15e3efe4e800c91fc0393a19df950da11e1d59c28a
+fetch_model.py     -> /usr/local/bin/fetch-model      84d2144c4dea66a2323f2e3b6b326daffea23ed5ad78e309be69dcd3f002b23e
+dcgm-counters.csv  -> /etc/dcgm-exporter/counters.csv adf12881c7b2b63507f31924630529d0337b20a0c420a13284d66cb1b8329aef

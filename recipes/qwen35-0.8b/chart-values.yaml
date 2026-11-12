@@ -1,0 +1,47 @@
+# confidential-inference values layer: Qwen3.5-0.8B on one GPU per worker,
+# with this recipe's image. Apply it after release/values.yaml and
+# release/staging/values.yaml, then the deployment's own values, which add
+#   images.sglangWorker: ghcr.io/confidential-dot-ai/sglang-qwen35-0.8b@sha256:...
+# and the model volume (inference.model.c8sVolumeSource / volumeNames) holding
+# this revision, or inference.model.cache with recipes/qwen35-0.8b/container/
+# model-manifest.json as the manifest.
+#
+# The worker argv the chart renders from this file is serve.sh's server_args.
+inference:
+  mode: model
+  gpusPerReplica: 1
+  gpuArchitectures:
+    - BLACKWELL
+  # Set to the node's GPU count when several workers share one node: the
+  # driver evidence lists every GPU in the CVM.
+  attestedGpuCount: 0
+  resources:
+    cpu: "8"
+    memory: 32Gi
+  model:
+    name: Qwen/Qwen3.5-0.8B
+    revision: 2fc06364715b967f1860aea9cf38778875588b17
+    mountVerification:
+      expectedFileList:
+        - path: .model-lock-local-manifest.json
+          sha256: 625963f6a7f159fd2a3e8ad97642a11ac275d1735adaadca8df39452b9fbd8fa
+        - path: config.json
+          sha256: b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204
+        - path: tokenizer_config.json
+          sha256: 49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c
+  toolCallParser: qwen3_coder
+  reasoningParser: qwen3
+  speculativeAlgorithm: ""
+  moeRunnerBackend: auto
+  # release/values.yaml adds DeepSeek-V4 flags here (--attention-backend=dsv4,
+  # --context-length=131072, ...); none apply to this model.
+  workerExtraArgs: []
+  gpuMetricsEnabled: true
+  pd:
+    enabled: false
+gateway:
+  usage:
+    models:
+      Qwen/Qwen3.5-0.8B:
+        served_model: Qwen/Qwen3.5-0.8B
+        model_revision: 2fc06364715b967f1860aea9cf38778875588b17
