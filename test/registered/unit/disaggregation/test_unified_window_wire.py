@@ -19,6 +19,7 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.utils import (
     align_window_tails,
+    ced_target_state_wire,
     check_stage_state_wires,
     check_state_wire,
     record_network_transfer,
@@ -365,6 +366,59 @@ class TestStateEntryAgreement(CustomTestCase):
             check_stage_state_wires([[["swa", None]]] * 2, decode_wire)
         # A stage not registered yet leaves the coverage to be judged later.
         check_stage_state_wires([[["swa", None]], None], decode_wire)
+
+    def test_a_ced_split_decode_takes_no_draft_state_from_prefill(self):
+        """BUG REGRESSION. Under the CED split the encoder-only prefill runs no
+        DSpark, so it registers only the target entries, while its DSpark decode
+        adds the draft window and request rows, which it seeds itself."""
+        target = [["swa", None], ["c128_state", None]]
+        draft = [["swa", None], ["request_row", None]]
+        info = PrefillServerInfo(
+            attn_tp_size=1,
+            attn_cp_size=1,
+            dp_size=1,
+            pp_size=2,
+            page_size=256,
+            kv_cache_dtype="fp8_e4m3",
+            follow_bootstrap_room=True,
+            state_wire=target,
+        )
+
+        def decode(wire, layout):
+            return SimpleNamespace(
+                pp_size=1,
+                pp_rank=0,
+                dsv41_spec_layout=layout,
+                kv_args=SimpleNamespace(
+                    state_types=[entry[0] for entry in wire],
+                    state_wire_keys=[None] * len(wire),
+                    state_window_tails=[None] * len(wire),
+                ),
+            )
+
+        ced = {"ced_split": True, "target_state_type": "swa"}
+        CommonKVManager._check_prefill_state_entries(decode(target + draft, ced), info)
+        # A unified pool's draft ring is a swa_ring entry.
+        ring = [["swa_ring", None], ["request_row", None]]
+        CommonKVManager._check_prefill_state_entries(decode(target + ring, ced), info)
+        # Without the CED split the prefill must send the draft entries.
+        with self.assertRaisesRegex(RuntimeError, "PD state entry mismatch"):
+            CommonKVManager._check_prefill_state_entries(
+                decode(target + draft, None), info
+            )
+        # Only the trailing draft pair is excused: a target mismatch is not.
+        with self.assertRaisesRegex(RuntimeError, "PD state entry mismatch"):
+            CommonKVManager._check_prefill_state_entries(
+                decode([["swa", None]] + draft, ced), info
+            )
+        # The prefill's pipeline stages are judged against the target entries.
+        staged = dataclasses.replace(
+            info, state_wire=None, state_wires=[[["swa", None]], target]
+        )
+        CommonKVManager._check_prefill_state_entries(decode(target + draft, ced), staged)
+        self.assertEqual(ced_target_state_wire(target), target)
+        self.assertEqual(ced_target_state_wire(draft), draft)
+        self.assertIsNone(ced_target_state_wire(None))
 
     def test_ranks_of_one_stage_must_agree(self):
         server = CommonKVBootstrapServer("127.0.0.1", 0)

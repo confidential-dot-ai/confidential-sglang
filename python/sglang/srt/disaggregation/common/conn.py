@@ -46,6 +46,7 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    ced_target_state_wire,
     check_stage_state_wires,
     check_state_wire,
     filter_kv_indices_for_cp_rank,
@@ -1397,6 +1398,10 @@ class CommonKVManager(BaseKVManager):
         """Refuse a prefill whose state entries cannot pair with this server's:
         its own stage when the stage counts match, else every prefill stage."""
         decode_wire = state_wire(self.kv_args)
+        if (getattr(self, "dsv41_spec_layout", None) or {}).get("ced_split"):
+            # The encoder-only prefill sends no DSpark draft state; decode
+            # seeds its own in the tail replay.
+            decode_wire = ced_target_state_wire(decode_wire)
         if info.state_wire is not None or not info.state_wires:
             check_state_wire(info.state_wire, decode_wire)
             return
