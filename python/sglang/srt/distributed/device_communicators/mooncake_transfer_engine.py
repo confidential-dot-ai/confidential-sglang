@@ -14,6 +14,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils.common import run_with_deadline
 from sglang.srt.utils.network import NetworkAddress, get_free_port, get_local_ip_auto
+from sglang.srt.utils.pair_progress import error_event
 
 if TYPE_CHECKING:
     pass
@@ -263,6 +264,8 @@ class MooncakeTransferEngine:
             ret = -1
 
         if ret < 0:
+            fields = {"count": 1, "bytes_count": length} if type(length) is int and 0 <= length < 2**63 else {}
+            error_event("kv_transfer_failed", code=int(ret), **fields)
             logger.debug(
                 "Failed to transfer data from %s to %s - %s.",
                 buffer,
@@ -295,6 +298,10 @@ class MooncakeTransferEngine:
                 )
 
         if ret < 0:
+            fields = {}
+            if all(type(length) is int and 0 <= length < 2**63 for length in lengths) and sum(lengths) < 2**63:
+                fields = {"count": len(lengths), "bytes_count": sum(lengths)}
+            error_event("kv_transfer_failed", code=int(ret), **fields)
             logger.debug(
                 "Failed to batch transfer data. Buffers: %s, Session: %s, "
                 "Peer addresses: %s",
