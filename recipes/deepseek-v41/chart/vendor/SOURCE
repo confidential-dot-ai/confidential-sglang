@@ -3,9 +3,10 @@ a59231ae06142cf7ddd75290531f3e6de228cc5b. The chart runs them by these paths,
 so keep them in step with the chart version you deploy.
 
 All files are unchanged except one line in harden_http.py: the "pd" variant's
-SOURCE_HASHES. confidential-inference pins the http_server.py and
-launch_server.py of this fork before the upstream 314bce7 sync (dc94f008:
-fbaa29e4..., 374976475...). This copy pins this branch's files instead
+SOURCE_HASHES. confidential-inference pins upstream a7fd2e1's
+http_server.py and launch_server.py (fbaa29e4..., 374976475...), which its own
+SGLang image builds from and which this fork carried unchanged before the
+upstream 314bce7 sync. This copy pins this branch's files instead
 (fcd651b9..., 0d47833b...). The policy itself is unchanged. It was reviewed
 against the new files: 91 routes go to 41, the same serving set as before
 (the get_load and sagemaker_chat_completions handlers no longer exist
@@ -14,8 +15,8 @@ upstream). New routes such as /plugin_weight_update and
 imports, and every field the frontend guard reads still exists. The new
 granian, multi-worker uvicorn and reuseport paths serve the same hardened app.
 The Rust-server sidecar runs only under SGLANG_RUST_SERVER, which the guard
-rejects. The same hash change belongs in confidential-inference
-images/sglang/harden_http.py.
+rejects. confidential-inference keeps its own hashes: its image
+still builds from a7fd2e1.
 
 images/sglang/wait_for_model.py          -> /usr/local/bin/wait-for-model        fafd1bf8dcffd7c6d651ea15e3efe4e800c91fc0393a19df950da11e1d59c28a
 images/sglang/fetch_model.py             -> /usr/local/bin/fetch-model           84d2144c4dea66a2323f2e3b6b326daffea23ed5ad78e309be69dcd3f002b23e
