@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""Wait for a verified model mount (c8s dm-verity volume or plain cache), then supervise the server process."""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import errno
+import hashlib
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# Every model file is hashed before the server starts. Hashing threads release
+# the GIL inside hashlib, so parallel reads keep a large volume's check short.
+HASH_WORKERS = max(1, min(16, os.cpu_count() or 1))
+HASH_BLOCK_BYTES = 8 * 1024 * 1024
+PROGRESS_STEP = 0.1
+
+
+class ModelMountError(ValueError):
+    """The model mount does not match the release contract."""
+
+
+class MountUnavailable(ModelMountError):
+    """The c8s sidecar has not propagated the model mount yet."""
+
+
+def decode_mount_path(value: str) -> str:
+    for encoded, decoded in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n"), ("\\134", "\\")):
+        value = value.replace(encoded, decoded)
+    return value
+
+
+def mount_record(path: Path, mountinfo: Path) -> tuple[set[str], str, str, set[str]] | None:
+    target = str(path.resolve())
+    active = None
+    for line in mountinfo.read_text(encoding="utf-8").splitlines():
+        left, separator, right = line.partition(" - ")
+        if not separator:
+            continue
+        fields = left.split()
+        after = right.split()
+        if len(fields) < 6 or len(after) < 3:
+            continue
+        if decode_mount_path(fields[4]) == target:
+            # Linux lists a later mount over the earlier mount at the same
+            # target. c8s overlays its EROFS mapper over Kubernetes emptyDir.
+            active = (
+                set(fields[5].split(",")),
+                after[0],
+                after[1],
+                set(after[2].split(",")),
+            )
+    return active
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(HASH_BLOCK_BYTES), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def parse_expected_file(value: str) -> tuple[str, str]:
+    name, separator, digest = value.partition("=")
+    if not separator or not name or name.startswith("/") or ".." in Path(name).parts:
+        raise argparse.ArgumentTypeError("an expected file must use RELATIVE_PATH=SHA256")
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise argparse.ArgumentTypeError("an expected file needs a lowercase SHA-256 value")
+    return name, digest
+
+
+def verify_revision(
+    path: Path,
+    metadata_name: str,
+    repository: str,
+    expected: str,
+    expected_files: dict[str, str],
+) -> dict[str, tuple[str, int]]:
+    metadata = path / metadata_name
+    try:
+        value = json.loads(metadata.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError) as error:
+        raise ModelMountError("the model revision manifest is invalid") from error
+    expected_keys = {
+        "canonical_local_manifest_sha256", "classification", "files", "immutable_ref",
+        "immutable_revision", "repository", "schema", "source_remote_inventory_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise ModelMountError("the model revision manifest has invalid fields")
+    if value["schema"] != "confidential-benchmark/local-model-byte-manifest/v1":
+        raise ModelMountError("the model revision manifest has an invalid schema")
+    if value["classification"] != "verified_local_snapshot_bytes":
+        raise ModelMountError("the model revision manifest has an invalid classification")
+    if value["repository"] != repository or value["immutable_revision"] != expected:
+        raise ModelMountError("the model revision manifest does not match the release")
+    if value["immutable_ref"] != f"{repository}@{expected}":
+        raise ModelMountError("the model revision manifest reference does not match the release")
+    if not isinstance(value["files"], list) or not value["files"]:
+        raise ModelMountError("the model revision manifest has no file inventory")
+    for digest_name in ("canonical_local_manifest_sha256", "source_remote_inventory_sha256"):
+        digest = value[digest_name]
+        if not isinstance(digest, str) or len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ModelMountError("the model revision manifest has an invalid digest")
+    inventory = {}
+    for item in value["files"]:
+        if not isinstance(item, dict) or set(item) != {"content_sha256", "path", "size"}:
+            raise ModelMountError("the model revision manifest has an invalid file record")
+        name = item["path"]
+        digest = item["content_sha256"]
+        size = item["size"]
+        if (
+            not isinstance(name, str) or not name or name.startswith("/") or ".." in Path(name).parts
+            or name in inventory or not isinstance(size, int) or size < 1
+            or not isinstance(digest, str) or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ModelMountError("the model revision manifest has an invalid file record")
+        inventory[name] = (digest, size)
+    for name, expected_digest in expected_files.items():
+        if name == metadata_name:
+            continue
+        if inventory.get(name) != (expected_digest, (path / name).stat().st_size):
+            raise ModelMountError("the model revision manifest file inventory does not match the release")
+    if metadata_name in inventory:
+        raise ModelMountError("the model revision manifest lists itself")
+    return inventory
+
+
+def list_model_files(path: Path) -> set[str]:
+    """List every regular file below the mount. Anything else fails closed."""
+    found = set()
+    for directory, directories, files in os.walk(path, followlinks=False):
+        base = Path(directory)
+        for name in directories:
+            if (base / name).is_symlink():
+                raise ModelMountError(f"the model volume contains a symbolic link: {(base / name).relative_to(path)}")
+        for name in files:
+            candidate = base / name
+            relative = str(candidate.relative_to(path))
+            if candidate.is_symlink() or not candidate.is_file():
+                raise ModelMountError(f"the model volume contains a non-regular file: {relative}")
+            found.add(relative)
+    return found
+
+
+def verify_every_file(path: Path, metadata_name: str, inventory: dict[str, tuple[str, int]]) -> None:
+    """Check every file on the volume against the pinned byte manifest.
+
+    The manifest is trusted because its own SHA-256 is pinned in the
+    release argv. A file that is missing, extra, of the wrong size, or of the
+    wrong digest stops the worker before the server reads any weight.
+    """
+    found = list_model_files(path)
+    expected = set(inventory) | {metadata_name}
+    missing = sorted(expected - found)
+    if missing:
+        raise ModelMountError(f"the model volume is missing a manifest file: {missing[0]}")
+    extra = sorted(found - expected)
+    if extra:
+        raise ModelMountError(f"the model volume contains a file the manifest does not list: {extra[0]}")
+    for name, (_digest, size) in inventory.items():
+        if (path / name).stat().st_size != size:
+            raise ModelMountError(f"the model file has the wrong size: {name}")
+    total = sum(size for _digest, size in inventory.values())
+    done = 0
+    next_report = PROGRESS_STEP
+    started = time.monotonic()
+    print(
+        f"model-mount: hashing {len(inventory)} files, {total} bytes, with {HASH_WORKERS} threads",
+        file=sys.stderr,
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=HASH_WORKERS) as pool:
+        # Largest files first, so the slowest hash does not start last.
+        order = sorted(inventory, key=lambda name: inventory[name][1], reverse=True)
+        futures = {pool.submit(sha256_file, path / name): name for name in order}
+        try:
+            for future in concurrent.futures.as_completed(futures):
+                name = futures[future]
+                if future.result() != inventory[name][0]:
+                    raise ModelMountError(f"the model file has the wrong digest: {name}")
+                done += inventory[name][1]
+                if total and done / total >= next_report:
+                    print(
+                        f"model-mount: hashed {done * 100 // total}% "
+                        f"in {time.monotonic() - started:.0f}s",
+                        file=sys.stderr,
+                    )
+                    while next_report <= done / total:
+                        next_report += PROGRESS_STEP
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
+    print(
+        f"model-mount: every model file matches the manifest ({time.monotonic() - started:.0f}s)",
+        file=sys.stderr,
+    )
+
+
+def verify_index(path: Path) -> None:
+    """Check the shard index, or the one weight file of an unsharded model."""
+    index = path / "model.safetensors.index.json"
+    if not os.path.lexists(index):
+        single = path / "model.safetensors"
+        if single.is_symlink() or not single.is_file() or single.stat().st_size == 0:
+            raise ModelMountError("the model has no index and no single model.safetensors file")
+        return
+    try:
+        value = json.loads(index.read_text(encoding="utf-8"))
+        weight_map = value["weight_map"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise ModelMountError("the model index is invalid") from error
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ModelMountError("the model index has no weights")
+    shards = set(weight_map.values())
+    if any(not isinstance(name, str) or Path(name).name != name for name in shards):
+        raise ModelMountError("the model index contains an invalid shard name")
+    missing = [name for name in sorted(shards) if not (path / name).is_file() or (path / name).stat().st_size == 0]
+    if missing:
+        raise ModelMountError(f"the model index references a missing shard: {missing[0]}")
+
+
+def verify_no_write(path: Path) -> None:
+    probe = path / f".c8s-write-probe-{os.getpid()}"
+    try:
+        descriptor = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as error:
+        if error.errno in {errno.EROFS, errno.EACCES, errno.EPERM}:
+            return
+        raise ModelMountError(f"the write probe failed unexpectedly: {error}") from error
+    else:
+        os.close(descriptor)
+        probe.unlink(missing_ok=True)
+        raise ModelMountError("the model mount permits writes")
+
+
+def verify_once(args: argparse.Namespace) -> None:
+    path = args.path.resolve()
+    record = mount_record(path, args.mountinfo)
+    if record is None:
+        raise MountUnavailable("the model path is not a mount point")
+    _mount_options, _filesystem, source, _super_options = record
+    # Kubernetes can hide the host filesystem type and report rw flags for a
+    # read-only c8s bind mount. Require the c8s dm-verity source and a failed
+    # write probe. These are the actual integrity and write-protection checks.
+    # A plain cache (public weights on a host-readable disk) has no dm-verity
+    # source: its integrity is the full byte check below, on every start.
+    if not args.plain_cache and "c8s-verity-" not in source:
+        raise MountUnavailable(
+            "the c8s dm-verity mapping is not attached yet "
+            f"(filesystem={_filesystem}, source={source})"
+        )
+    verify_no_write(path)
+    for name, expected in args.expected_file:
+        candidate = path / name
+        if not candidate.is_file():
+            raise ModelMountError(f"the required model file is missing: {name}")
+        if sha256_file(candidate) != expected:
+            raise ModelMountError(f"the required model file has the wrong digest: {name}")
+    expected_files = dict(args.expected_file)
+    if args.revision_metadata not in expected_files:
+        raise ModelMountError("the release does not pin the model byte manifest digest")
+    inventory = verify_revision(
+        path,
+        args.revision_metadata,
+        args.expected_repository,
+        args.expected_revision,
+        expected_files,
+    )
+    verify_index(path)
+    verify_every_file(path, args.revision_metadata, inventory)
+
+
+def supervise(child: subprocess.Popen) -> int:
+    """Run as PID 1: pass SIGTERM/SIGINT straight to the child, then exit with its code.
+
+    SGLang drains on SIGTERM: /health answers 503, so the router stops picking
+    this worker, and the server exits once its in-flight requests finish.
+    Kubernetes kills the pod after terminationGracePeriodSeconds.
+    """
+
+    def forward(signum: int, _frame: object) -> None:
+        if child.poll() is None:
+            child.send_signal(signum)
+
+    signal.signal(signal.SIGTERM, forward)
+    signal.signal(signal.SIGINT, forward)
+    return child.wait()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--path", required=True, type=Path)
+    parser.add_argument("--timeout-seconds", required=True, type=int)
+    parser.add_argument("--poll-seconds", type=float, default=1.0)
+    parser.add_argument("--expected-revision", required=True)
+    parser.add_argument("--expected-repository", required=True)
+    parser.add_argument("--revision-metadata", required=True)
+    parser.add_argument("--expected-file", action="append", type=parse_expected_file, default=[])
+    parser.add_argument("--plain-cache", action="store_true",
+                        help="the path is a read-only plain cache that fetch-model filled, not a c8s dm-verity volume")
+    parser.add_argument("--gpu-metrics-port", type=int)
+    parser.add_argument("--private-server-output", action="store_true",
+                        help="discard native server output; export no unreviewed request or exception text")
+    parser.add_argument("--mountinfo", type=Path, default=Path("/proc/self/mountinfo"), help=argparse.SUPPRESS)
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    if args.timeout_seconds < 1 or args.poll_seconds <= 0:
+        parser.error("the timeout and poll interval must be positive")
+    if len(args.expected_revision) != 40 or any(character not in "0123456789abcdef" for character in args.expected_revision):
+        parser.error("the expected revision must be a lowercase 40-character commit")
+    if not args.expected_repository or "@" in args.expected_repository or args.expected_repository.startswith("/"):
+        parser.error("the expected repository is invalid")
+    if len(args.expected_file) < 3:
+        parser.error("at least three expected model files are required")
+    if args.gpu_metrics_port is not None and not 1024 <= args.gpu_metrics_port <= 65535:
+        parser.error("the GPU metrics port must be between 1024 and 65535")
+    if not args.command or args.command[0] != "--" or len(args.command) == 1:
+        parser.error("a command must follow --")
+    args.command = args.command[1:]
+    return args
+
+
+def main() -> int:
+    args = parse_args()
+    if os.geteuid() == 0:
+        print("model-mount: the wrapper must run as a non-root user", file=sys.stderr)
+        return 1
+    deadline = time.monotonic() + args.timeout_seconds
+    last_error = "the model mount is unavailable"
+    while True:
+        try:
+            verify_once(args)
+            break
+        except MountUnavailable as error:
+            last_error = str(error)
+        except (ModelMountError, OSError, UnicodeError) as error:
+            print(f"model-mount: rejected: {error}", file=sys.stderr)
+            return 1
+        if time.monotonic() >= deadline:
+            print(f"model-mount: timeout: {last_error}", file=sys.stderr)
+            return 1
+        time.sleep(min(args.poll_seconds, max(0.0, deadline - time.monotonic())))
+    print(f"model-mount: verified {args.path}", file=sys.stderr)
+    if args.gpu_metrics_port is not None:
+        try:
+            # NVIDIA dcgm-exporter with an embedded DCGM host engine; it sees
+            # only the GPUs granted to this container.
+            subprocess.Popen(
+                [
+                    "/usr/local/bin/dcgm-exporter",
+                    "--collectors=/etc/dcgm-exporter/counters.csv",
+                    f"--address=:{args.gpu_metrics_port}",
+                ],
+                env={**os.environ, "LD_LIBRARY_PATH": "/opt/dcgm/lib"},
+                stdin=subprocess.DEVNULL,
+                close_fds=True,
+            )
+        except OSError as error:
+            # Metrics must not stop inference. Prometheus reports this failure
+            # because the worker metrics target stays down.
+            print(f"model-mount: GPU metrics did not start: {error}", file=sys.stderr)
+    output = subprocess.DEVNULL if args.private_server_output else None
+    child = subprocess.Popen(args.command, stdout=output, stderr=output)
+    code = supervise(child)
+    if args.private_server_output:
+        print(json.dumps({"event": "worker_exit", "code": code}), flush=True)
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
