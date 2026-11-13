@@ -29,9 +29,9 @@ recipes/deepseek-v41/chart/check-image.sh ghcr.io/confidential-dot-ai/sglang-dsv
   `launch_server` refuses every frontend except the Python HTTP one. The script
   checks the SHA-256 of `http_server.py` and `launch_server.py` first, so a
   change to either fails the build until someone reviews the policy against
-  it. The vendored copy pins this branch's files, the upstream 314bce7 sync.
-  confidential-inference still pins the fork before that sync.
-  `vendor/SOURCE` records that review.
+  it. The vendored copy pins this branch's files (the upstream 314bce7 sync).
+  confidential-inference pins upstream a7fd2e1, which its own image builds
+  from. `vendor/SOURCE` records the review.
 - uid 1001, `HOME=/tmp`, `/opt` read-only to the runtime user, no entrypoint.
 
 ## Chart contracts
@@ -51,4 +51,6 @@ table and the source record.
 - Engine: this branch's SGLang ran on the 4x B200 in the docker recipe
   (functional suite and realmix load).
 - The image itself has not booted on a GPU under the chart. The first staging
-  deploy is that test.
+  deploy is that test. confidential-inference#300 selects it in the 8-GPU B200
+  PD layer. Every worker argv of that layer parses with this branch's
+  `ServerArgs`.
