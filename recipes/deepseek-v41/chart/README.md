@@ -40,7 +40,15 @@ recipes/deepseek-v41/chart/check-image.sh ghcr.io/confidential-dot-ai/sglang-dsv
 | --- | --- |
 | aggregated (`inference.pd.enabled: false`) | `wait-for-model … -- python3 -m sglang.launch_server …`, `fetch-model`, `dcgm-exporter` |
 | PD (`inference.pd.enabled: true`) | `/opt/dsv41/bin/python` (`inference.pd.python`), `launcher/hold_engram_cache.py` (`inference.pd.engramHolder.script`), `/bin/sh` and `curl` for the start gate |
-| paired PD (`inference.pd.paired.enabled: true`) | `/opt/dsv41/bin/python /usr/local/bin/sglang-pair` |
+| paired PD (`inference.pd.paired.enabled: true`) | `/opt/dsv41/bin/python /usr/local/bin/sglang-pair`, and the per-rank progress records of `sglang.srt.utils.pair_progress` |
+
+Paired PD is the v0 layout: one pod per prefill/decode pair, both workers in
+one `sglang-pair` container, KV over NVLink (CUDA IPC) inside the pod. CUDA
+IPC needs the importing process to share the exporter's PID namespace and see
+its GPU, which separate containers or pods do not have under C8s. `sglang-pair`
+marks a worker ready only after its scheduler ranks write progress records, so
+the image's SGLang must carry `pair_progress` (this branch's base, #5); without
+it prefill comes up healthy and decode is never started.
 
 `check-image.sh` checks all of them without a GPU. It runs as uid 1001, with a
 read-only root filesystem and no network. It also checks the hardened route

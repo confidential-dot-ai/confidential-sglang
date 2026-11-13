@@ -23,6 +23,8 @@ test "$(readlink -f "$(command -v python3)")" = "$(readlink -f /opt/dsv41/bin/py
 /opt/dsv41/bin/python /usr/local/bin/sglang-pair --help >/dev/null
 /opt/dsv41/bin/python /opt/sglang/recipes/deepseek-v41/launcher/hold_engram_cache.py --help >/dev/null
 /opt/dsv41/bin/python -I -B /usr/local/bin/pair_diagnostics.py
+# sglang-pair marks a worker ready only from these per-rank progress records.
+/opt/dsv41/bin/python -B -c "from sglang.srt.utils import pair_progress; pair_progress.initialize; pair_progress.scheduler_ready; pair_progress.stage"
 /opt/dsv41/bin/python -B - <<PY
 import json, pathlib
 import sglang.srt.entrypoints.http_server as http
