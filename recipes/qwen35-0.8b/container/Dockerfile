@@ -18,6 +18,11 @@
 #   python3 on PATH                the image's SGLang environment
 #   uid 1001, HOME=/tmp            the chart's securityContext
 # The three helpers are copied from confidential-inference (vendor/SOURCE).
+#
+# The HTTP server is hardened as confidential-inference's own SGLang images
+# are: harden_http.py --variant pd removes every non-serving route, the OpenAPI
+# and docs routes, and every listener other than the Python HTTP frontend. Its
+# pinned source hashes are this fork's post-314bce7 files (vendor/SOURCE).
 ARG BASE_IMAGE=ghcr.io/confidential-dot-ai/dsv41-pd@sha256:8e1b54fb0aff6d94c0b68c0c3b895841853acbb134d1049675630663d217317e
 FROM nvcr.io/nvidia/k8s/dcgm-exporter@sha256:148b0c025e5f2850256816fa33754fbf4733b7a086697a95613fc0ba3db5b003 AS dcgm-exporter
 
@@ -45,9 +50,11 @@ WORKDIR /opt/sglang
 RUN rm -rf /opt/sglang/python /opt/sglang/recipes /opt/sglang/SOURCE_RECORD.json
 COPY python python
 COPY recipes/qwen35-0.8b recipes/qwen35-0.8b
-# Byte-compiled here: the runtime user cannot write the root-owned tree. The
-# import needs no GPU; the GPU boot is the kernel check.
-RUN python -c "import sglang, sglang.srt.models.qwen3_5" \
+# Hardened, then byte-compiled (the runtime user cannot write the root-owned
+# tree). The imports need no GPU; the GPU boot is the kernel check.
+RUN --mount=type=bind,source=recipes/qwen35-0.8b/container/vendor/harden_http.py,target=/run-src/harden-http.py,readonly \
+    python -I -B /run-src/harden-http.py --root /opt/sglang/python/sglang --variant pd \
+    && python -c "import sglang, sglang.srt.models.qwen3_5, sglang.launch_server, sglang.srt.entrypoints.http_server" \
     && python -m compileall -q python/sglang > /dev/null \
     && chmod -R go-w /opt/sglang
 

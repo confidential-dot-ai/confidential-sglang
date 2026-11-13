@@ -9,7 +9,7 @@ whole confidential-inference path here before they reach a production model.
 
 | File | What it is |
 | --- | --- |
-| `container/Dockerfile` | The image: the DeepSeek-V4.1 image's Python environment, this checkout's SGLang, and the chart's helpers |
+| `container/Dockerfile` | The image: the DeepSeek-V4.1 image's Python environment, this checkout's SGLang (HTTP server hardened to the serving routes, as confidential-inference's images are), and the chart's helpers |
 | `container/build.sh` | Builds it from a clean checkout, tagged by commit |
 | `container/serve.sh` | Entrypoint for `docker run`: fetch the model, or verify it and serve |
 | `container/model-manifest.json` | Byte manifest of the pinned revision (`fetch-model manifest` output) |
