@@ -1,0 +1,26 @@
+Copied from confidential-dot-ai/confidential-inference at
+a59231ae06142cf7ddd75290531f3e6de228cc5b. The chart runs them by these paths,
+so keep them in step with the chart version you deploy.
+
+All files are unchanged except one line in harden_http.py: the "pd" variant's
+SOURCE_HASHES. confidential-inference pins the http_server.py and
+launch_server.py of this fork before the upstream 314bce7 sync (dc94f008:
+fbaa29e4..., 374976475...). This copy pins this branch's files instead
+(fcd651b9..., 0d47833b...). The policy itself is unchanged. It was reviewed
+against the new files: 91 routes go to 41, the same serving set as before
+(the get_load and sagemaker_chat_completions handlers no longer exist
+upstream). New routes such as /plugin_weight_update and
+/get_hicache_l3_cache_layout are removed. launch_server.py only renamed two
+imports, and every field the frontend guard reads still exists. The new
+granian, multi-worker uvicorn and reuseport paths serve the same hardened app.
+The Rust-server sidecar runs only under SGLANG_RUST_SERVER, which the guard
+rejects. The same hash change belongs in confidential-inference
+images/sglang/harden_http.py.
+
+images/sglang/wait_for_model.py          -> /usr/local/bin/wait-for-model        fafd1bf8dcffd7c6d651ea15e3efe4e800c91fc0393a19df950da11e1d59c28a
+images/sglang/fetch_model.py             -> /usr/local/bin/fetch-model           84d2144c4dea66a2323f2e3b6b326daffea23ed5ad78e309be69dcd3f002b23e
+images/sglang/pair_supervisor.py         -> /usr/local/bin/sglang-pair           51769868df0f650f1c1c76c5332c3d59c04a72773a8635e7b8449c540ddb80a5
+images/sglang/pair_diagnostics.py        -> /usr/local/bin/pair_diagnostics.py   a5e0b806e20a4cf1aa95f888259169fada855b3e66cc7f36cbb199d87f78fa61
+images/sglang-router/private_log_sink.py -> /usr/local/bin/private_log_sink.py   1a865cfd68398df1f5ba74fa595a9fdbb22296c1d3267d21360e4a099f06bd09
+images/sglang/harden_http.py             -> build time only (--variant pd)       d6591a6993d0674235f1f62f64426a9c641d4934c1adbac5fedb0641109e08a5 (upstream 8878d6cd..., hashes above)
+images/sglang/dcgm-counters.csv          -> /etc/dcgm-exporter/counters.csv      adf12881c7b2b63507f31924630529d0337b20a0c420a13284d66cb1b8329aef
