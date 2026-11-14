@@ -41,6 +41,9 @@ _CORE_INPUTS = (
     "c2_sparse_topk_lengths",
     "c1_sparse_raw_indices",
     "c2_sparse_raw_indices",
+    # Mega attention ropes its output with these rows' positions.
+    "positions_casual",
+    "seq_lens_casual",
 )
 
 
@@ -193,7 +196,14 @@ class CedLateGraph:
         # The caller's top-k is the layer-20 seed, not scratch for layers 24+.
         # Preserve it across warmup/capture/replay and the independent check.
         self.source_metadata = copy.copy(self.live_metadata)
-        self.source_metadata.core_attn_metadata = self.metadata.core_attn_metadata
+        # The graph's copy holds the capture batch's page table and lengths; breaks
+        # read the live ones, and write top-k into the buffers the graph replays.
+        core = copy.copy(self.live_metadata.core_attn_metadata)
+        for name in _CORE_INPUTS:
+            owned = getattr(self.metadata.core_attn_metadata, name)
+            if owned is not None:
+                setattr(core, name, owned)
+        self.source_metadata.core_attn_metadata = core
         # Fresh per replay: this replay's index-source breaks share one index plan
         # per ratio (upstream's per-forward cache; the copy would share the live
         # metadata's dict).
