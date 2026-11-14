@@ -438,6 +438,27 @@ def check_state_wire(
     )
 
 
+def ced_target_state_wire(
+    decode_wire: Optional[List[List[Optional[str]]]],
+) -> Optional[List[List[Optional[str]]]]:
+    """A CED-split decode's state entries that its prefill sends: all but the
+    DSpark draft's trailing window and request-row entries. The encoder-only
+    prefill runs no DSpark and registers no draft entries; decode seeds its
+    draft ring and rows in its own tail replay (see get_dsv41_spec_layout), and
+    the transfer pairs only the prefill's entries, so the draft ones are never
+    written by the peer."""
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    if (
+        decode_wire is not None
+        and len(decode_wire) > 2
+        and decode_wire[-1][0] == StateType.REQUEST_ROW.value
+        and decode_wire[-2][0] in (StateType.SWA.value, StateType.SWA_RING.value)
+    ):
+        return decode_wire[:-2]
+    return decode_wire
+
+
 def check_stage_state_wires(
     stage_wires: List[Optional[List[List[Optional[str]]]]],
     decode_wire: Optional[List[List[Optional[str]]]],
