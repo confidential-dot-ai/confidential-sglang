@@ -161,6 +161,58 @@ def test_late_source_break_uses_current_batch_and_publishes_owned_indices():
             assert getattr(graph.live_metadata.core_attn_metadata, name).eq(value).all()
 
 
+def test_replay_refreshes_the_positions_mega_attention_ropes_with():
+    # Stale capture positions roped every late layer's output at the wrong offsets.
+    assert {"positions_casual", "seq_lens_casual"} <= set(_CORE_INPUTS)
+
+
+def test_late_source_break_reads_the_live_request_state():
+    # A break that read the capture batch's page table scored the wrong request's KV.
+    graph = CedLateGraph.__new__(CedLateGraph)
+    graph.break_sources = True
+    graph.metadata = SimpleNamespace(
+        core_attn_metadata=SimpleNamespace(
+            page_table=torch.zeros(1, 4, dtype=torch.int32),
+            raw_out_loc=torch.zeros(2, dtype=torch.int32),
+            **{name: torch.zeros(2, 3, dtype=torch.int32) for name in _CORE_INPUTS},
+        )
+    )
+    owned = {
+        name: getattr(graph.metadata.core_attn_metadata, name) for name in _CORE_INPUTS
+    }
+    seen = []
+    backend = SimpleNamespace(forward_metadata=graph.metadata)
+
+    def source(*, forward_batch):
+        core = backend.forward_metadata.core_attn_metadata
+        seen.append((core.page_table, core.raw_out_loc))
+        for name in _CORE_INPUTS:
+            assert getattr(core, name) is owned[name]
+
+    backend.forward_low_ratio_sources = source
+    graph.backend = backend
+    for value in (7, 19):
+        live_core = SimpleNamespace(
+            page_table=torch.full((1, 4), value, dtype=torch.int32),
+            raw_out_loc=torch.full((2,), value, dtype=torch.int32),
+            **{
+                name: torch.full((2, 3), value, dtype=torch.int32)
+                for name in _CORE_INPUTS
+            },
+        )
+        graph.live_batch = object()
+        graph.live_metadata = SimpleNamespace(core_attn_metadata=live_core)
+        with graph.source_breaks():
+            backend.forward_low_ratio_sources(forward_batch=None)
+        page_table, raw_out_loc = seen[-1]
+        assert page_table is live_core.page_table
+        assert raw_out_loc is live_core.raw_out_loc
+        for name in _CORE_INPUTS:
+            assert getattr(live_core, name) is not owned[name]
+            assert getattr(live_core, name).eq(value).all()
+    assert graph.metadata.core_attn_metadata.page_table.eq(0).all()
+
+
 def test_tail_start_source_layer_is_eager_and_precedes_the_full_graph():
     # Decoder SWA bounded replay starts the tail at the last kv_source layer,
     # which still owns its compressor (skipped inside the tail) and indexer.
