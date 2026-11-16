@@ -82,7 +82,7 @@ production accept length:
 python oracle_scorecard.py DATASET.json --source-tokenizer TOKENIZERS/minimax-m3 \
     --concurrency 32 --gpus 8 --gpu-model B200 --topology "1 node; 2P TP2 + 2D TP2" \
     --image ghcr.io/...@sha256:... --warmup-s 120 --measure-s 600 \
-    --cache-hit-band 0.90,0.97 --output-share-band 0.02,0.04 --out scorecard.json
+    --cache-hit-band 0.93,0.96 --output-share-band 0.030,0.035 --out scorecard.json
 ```
 
 How Oracle decoding works here: the tokenizer manager encodes `forced_text`
@@ -109,26 +109,58 @@ with the bonus token forced as well. The router forwards
 In PD, input counters come from prefill and output counters from decode. Both
 roles count every prompt, so adding them together would double the input rate.
 
-## Scorecard gates (draft; calibrate on the 8x B200)
+## Scorecard gates
 
 - Zero failed requests, KV-transfer failures and 5xx in the window. 429s are
   reported, not failed.
 - Prefix-cache hit and output share within each dataset's band. With Oracle
   decoding these are fixed by the dataset, so a miss means the cache is too
-  small, not that the traffic changed.
+  small, not that the traffic changed. Realmix (`oracle-realmix-256-r36-m3-
+  modeled-long25-38k-v3`, sha256 `5b615893…`): hit 0.93-0.96, output share
+  0.030-0.035, from the runs below.
 - TTFT p50 at or below 3 s (the M3 interactive target). TTFT p99 and ITL
-  p50/p99 are recorded, with limits to be set from the first 8x baseline.
+  p50/p99 are recorded; set their limits per topology from its baseline.
 - Retractions are zero in steady state: a retraction re-runs a prefill.
 - The report includes per-physical-GPU served TPM, the image digest, the launch
   plan, and the dataset's sha256.
+- Run with `--oracle-commit-len` at the topology's production accept length
+  (5 for DSpark block 5), so decode steps are a property of the dataset too;
+  0 lets the model's own acceptance vary them.
+
+## First results (2026-11-15, 4x B200, one 1P1D pair)
+
+Prefill TP2 + decode TP2 (DSpark), HiCache off, 131K context, prefill pool
+1.5M tokens; dsv41-pd 1805cee0ec plus the Oracle slot fix (a98446b). Realmix,
+`--concurrency C`, warmup 120 s, window 600 s. Every run passed, with 0 failed
+requests, 429s and retractions.
+
+| Run | req/s | served TPM/GPU | hit | output share | TTFT p50 / p99 (s) | ITL p50 / p99 (ms) | accept |
+|---|---|---|---|---|---|---|---|
+| C=16, Oracle | 2.97 | 1.70M | 0.946 | 0.032 | 0.33 / 3.02 | 3.1 / 21 | 5.44 |
+| C=32, Oracle | 4.78 | 2.77M | 0.946 | 0.033 | 0.37 / 0.80 | 5.0 / 26 | 5.03 |
+| C=48, Oracle | 5.47 | 3.20M | 0.904 | 0.033 | 0.53 / 11.1 | 5.2 / 31 | 5.40 |
+| C=64, Oracle | 5.82 | 3.44M | 0.875 | 0.033 | 1.49 / 36.4 | 5.3 / 31 | 5.65 |
+| C=32, Oracle, commit length 5 | 4.55 | 2.66M | 0.946 | 0.033 | 0.37 / 0.79 | 5.1 / 8.4 | 4.99 |
+| C=32, not forced, server `--oracle-decode` | 4.91 | 2.83M | 0.946 | 0.033 | 0.36 / 0.79 | 5.0 / 14 | 5.47 |
+| C=32, not forced, server without it | 4.91 | 2.83M | 0.946 | 0.033 | 0.36 / 0.78 | 5.0 / 14 | 5.23 |
+
+- The hit and output share stay at the dataset's values (0.946, 0.033) up to
+  C=32. At 48 the sessions' working set outgrows the 1.5M-token prefix cache:
+  the hit falls and TTFT p99 rises, the cache-hit gate's job. The operating
+  point for this pair is C=32.
+- Oracle off costs nothing: the server with and without `--oracle-decode`
+  served the same traffic at the same rates and latencies.
+- Forcing tokens costs about 2% of throughput at C=32 (2.77M vs 2.83M), and
+  its ITL p99 is higher with commit length 0: rows with forced tokens take
+  the eager DSpark accept, not the folded in-graph one.
 
 ## Open work
 
-1. Validate on GPUs: every forced completion must come back token for token
-   (plain path, PD prefill handoff, DSpark decode, with and without CUDA
-   graphs), and the overhead with Oracle off must be nil.
-2. Calibrate the gates on the 8x B200: the cache-hit and output-share bands per
-   dataset, TTFT p99 and ITL limits, and the DSpark commit length to use.
+1. Done on a 4x B200 (2026-11-15): forced completions come back exactly
+   (Qwen3.5-0.8B plain server 8/8; DSV4.1 PD + DSpark with decode CUDA graphs
+   64/64), and Oracle off has no overhead. Not run: prefill without CUDA graphs.
+2. Baseline the 8x B200 (2P2D): TTFT p99 and ITL limits for that topology, and
+   bands for the Tracelab coding dataset.
 3. Pin the router's dependencies: `sgl-model-gateway` has no `Cargo.lock`, and
    a fresh resolve now picks `notify-types` 2.3.0, which needs Rust 1.91; the
    image builds with 1.90.
