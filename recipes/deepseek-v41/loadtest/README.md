@@ -30,6 +30,8 @@ the router's admission queue is retried with backoff and counted.
 ```sh
 # One level, inside the pd container (the image's python has aiohttp):
 python oracle_replay.py DATASET.json --sessions 32 --time-limit 720 --output s32.jsonl
+# 32 in flight drawn from every session in order, so the load stays level:
+python oracle_replay.py DATASET.json --concurrency 32 --time-limit 720 --output c32.jsonl
 
 # Sweep 16..256 sessions, 12 min each; stops at the first traceback/OOM or failed chat check:
 DATASET=DATASET.json LOGS=/data/dsv41-bringup/recipes/container-pd-<ts> ./oracle_sweep.sh
