@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.oracle_decode.forced_token_pool import OracleTokenPool, oracle_commit
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -13,9 +14,10 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def req(rid, slot, prompt_len, forced):
+    # The slot lives where the scheduler keeps it: Req.kv (ReqKvInfo).
     return SimpleNamespace(
         rid=rid,
-        req_pool_idx=slot,
+        kv=ReqKvInfo(req_pool_idx=slot),
         origin_input_ids=[0] * prompt_len,
         sampling_params=SimpleNamespace(forced_token_ids=forced),
     )
@@ -33,6 +35,12 @@ def test_sync_writes_forced_rows_and_clears_reused_slots():
     # The forced request comes back to the same slot (e.g. after a retraction).
     assert pool.sync([a])
     assert pool.valid[1] == 3
+
+
+def test_sync_skips_requests_without_a_slot_yet():
+    pool = OracleTokenPool(num_slots=4, max_tokens=8, device="cpu")
+    assert not pool.sync([req("a", None, prompt_len=5, forced=[11, 12])])
+    assert int(pool.valid.sum()) == 0
 
 
 def test_sync_rejects_forced_runs_longer_than_the_pool():
