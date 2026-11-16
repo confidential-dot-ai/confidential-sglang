@@ -47,7 +47,9 @@ class OracleTokenPool:
         reused by unforced ones. True if any request in ``reqs`` is forced."""
         active = False
         for req in reqs:
-            slot = getattr(req, "req_pool_idx", None)
+            # The slot is the request's req_to_token row (ReqKvInfo); None until
+            # it holds KV.
+            slot = req.kv.req_pool_idx
             if slot is None:
                 continue
             forced = req.sampling_params.forced_token_ids
