@@ -83,3 +83,22 @@ failed.
   query, for scrape and remote-write delay. A measured window must not include a
   worker restart: the old pod's series stay visible for 5 minutes and would be
   added to the new one's.
+
+## First run (2026-11-16, 4x B200, one 1P1D pair)
+
+High-RAM 4x B200, prefill TP2 + decode TP2 with DSpark, 131K context, image
+`dsv41-pd@sha256:d3a97f8c...` with `--oracle-decode --oracle-commit-len 5`,
+through the router with a placeholder Bearer key (`--known-failures t_n2
+--unsupported-params min_p`). Every phase passed:
+
+| Phase | Numbers |
+|---|---|
+| func | 159/160 (the `n=2` case, known on PD) |
+| needles | 0 of 64 missed, up to 60,287 prompt tokens |
+| load | realmix at 32 sessions, bands enforced: 2.65M served TPM/GPU, hit 0.945, TTFT p50/p99 0.45/0.84 s |
+| overload | 512, 1024 and 2048 clients, then 4000 at once: 44-50 completed req/s held, the excess refused with 429 only, 0 5xx or connection errors, healthy 0.4 s later |
+| soak | 15 min at 32: 5,485 requests, 0 failed, flat latency per minute |
+
+The fault phase ran only against the fake gateway in `test_cluster_stress.py`.
+At 64-256 clients the router queued everything (no 429): its admission cap is
+192 in flight plus a queue of 256, so shedding needs more clients than that.
