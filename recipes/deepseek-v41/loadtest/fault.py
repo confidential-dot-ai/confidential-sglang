@@ -140,6 +140,7 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    endpoint.raise_nofile(args.concurrency)
     endpoint.resolve_model(args)
     rows, base_ok_s, base_bad, fault_at, recovered_at, cmd, check = asyncio.run(fault(args))
     lost = outage(rows, fault_at, recovered_at)

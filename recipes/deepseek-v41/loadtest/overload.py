@@ -30,7 +30,7 @@ import time
 import endpoint
 import traffic
 
-HARD = ("5xx", "conn", "bad", "4xx")
+HARD = ("5xx", "conn", "bad", "4xx", "client")
 
 
 async def level(session, url, model, clients, seconds, seed, timeout, t0):
@@ -88,6 +88,8 @@ def _line(s):
 
 def gates(steps, recovered, args):
     out = []
+    if any(s["classes"]["client"] for s in steps):
+        out.append(traffic.CLIENT_LIMIT)
     for s in steps:
         hard = {k: s["classes"][k] for k in HARD if s["classes"][k]}
         if args.fail_on_timeout and s["classes"]["timeout"]:
@@ -121,6 +123,7 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    endpoint.raise_nofile(max(args.levels + [args.burst]))
     endpoint.resolve_model(args)
     steps, recovered = asyncio.run(overload(args))
     failures = gates(steps, recovered, args)

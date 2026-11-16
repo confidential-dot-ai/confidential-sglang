@@ -147,14 +147,19 @@ def start(fake):
     return fake
 
 
-def tool(script, *argv, env_key=True, timeout=120):
+def tool(script, *argv, env_key=True, timeout=120, nofile=None):
     env = dict(os.environ)
     if env_key:
         env["STRESS_API_KEY"] = KEY
     else:
         env.pop("STRESS_API_KEY", None)
+    def limit():
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_NOFILE, (nofile, nofile))
+
     return subprocess.run([sys.executable, os.path.join(HERE, script), *argv], capture_output=True, text=True,
-                          env=env, timeout=timeout, cwd=HERE)
+                          env=env, timeout=timeout, cwd=HERE, preexec_fn=limit if nofile else None)
 
 
 @unittest.skipIf(web is None, "needs aiohttp")
@@ -212,6 +217,17 @@ class ClusterStressTest(unittest.TestCase):
                  "--recover-s", "10", "--require-shed", "--out", self.out("o.json"))
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertFalse(self.load("o.json")["shed"])
+
+    def test_a_client_out_of_file_descriptors_is_not_blamed_on_the_server(self):
+        r = tool("overload.py", "--url", self.url, "--levels", "200", "--step-s", "2", "--burst", "0",
+                 "--recover-s", "10", "--out", self.out("o.json"), nofile=100)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("raise `ulimit -n`", r.stdout)
+        res = self.load("o.json")
+        self.assertGreater(res["steps"][0]["classes"]["client"], 0)
+        self.assertEqual(res["steps"][0]["classes"]["conn"], 0)
+        # About 110 clients without a socket, backing off 0.5 s for 2 s: hundreds of attempts, not a spin.
+        self.assertLess(res["steps"][0]["classes"]["client"], 2000)
 
     def test_overload_fails_on_5xx(self):
         self.fake.capacity, self.fake.over_capacity_status = 4, 500

@@ -11,11 +11,14 @@ sampling. Every request ends in exactly one class:
   5xx       server error
   conn      connection refused, reset or closed early
   timeout   no complete answer within --request-timeout
+  client    this machine ran out of file descriptors (EMFILE): the run is
+            invalid, the server never saw the request
 """
 
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import random
 import time
@@ -41,8 +44,9 @@ SAMPLERS = [
     {"temperature": 0.6, "top_p": 0.9, "frequency_penalty": 0.3},
 ]
 CITIES = ["Paris", "Lagos", "Lima", "Seoul", "Denver", "Perth", "Oslo", "Delhi"]
-CLASSES = ("ok", "bad", "429", "4xx", "5xx", "conn", "timeout")
-FAILURES = ("bad", "4xx", "5xx", "conn", "timeout")
+CLASSES = ("ok", "bad", "429", "4xx", "5xx", "conn", "timeout", "client")
+FAILURES = ("bad", "4xx", "5xx", "conn", "timeout", "client")
+CLIENT_LIMIT = "client out of file descriptors: raise `ulimit -n` and rerun (the server never saw these requests)"
 
 
 def _text(n_words, rnd):
@@ -159,7 +163,8 @@ async def send(session, url, model, kind, stream, body, rnd, t0, timeout):
     except asyncio.TimeoutError:
         row["cls"], row["err"] = "timeout", f"no answer in {timeout} s"
     except aiohttp.ClientError as e:
-        row["cls"], row["err"] = "conn", f"{type(e).__name__}: {e}"[:200]
+        emfile = isinstance(e, aiohttp.ClientConnectorError) and e.os_error.errno == errno.EMFILE
+        row["cls"], row["err"] = ("client", CLIENT_LIMIT) if emfile else ("conn", f"{type(e).__name__}: {e}"[:200])
     except (ValueError, KeyError, IndexError, TypeError) as e:
         row["cls"], row["err"] = "bad", f"malformed answer: {type(e).__name__}: {e}"[:200]
     row["end"] = time.time() - t0
@@ -219,9 +224,10 @@ class Load:
     async def _client(self):
         while not self.stopped and time.time() < self.end:
             kind, stream, body = self.make(self.rnd)
-            self.rows.append(
-                await send(self.session, self.url, self.model, kind, stream, body, self.rnd, self.t0, self.timeout)
-            )
+            row = await send(self.session, self.url, self.model, kind, stream, body, self.rnd, self.t0, self.timeout)
+            self.rows.append(row)
+            if row["cls"] in ("conn", "client"):
+                await asyncio.sleep(0.5)  # a refused connection returns at once; don't spin
 
     async def run(self):
         await asyncio.gather(*(self._client() for _ in range(self.concurrency)))

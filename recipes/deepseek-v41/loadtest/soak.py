@@ -74,6 +74,7 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    endpoint.raise_nofile(args.concurrency)
     endpoint.resolve_model(args)
     rows, after = asyncio.run(soak(args))
     total = traffic.tally(rows)

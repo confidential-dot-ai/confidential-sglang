@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import resource
 import ssl
 import urllib.request
 
@@ -71,6 +72,25 @@ def resolve_model(args) -> str:
     if not args.model:
         args.model = get_json(args, "/v1/models")["data"][0]["id"]
     return args.model
+
+
+def raise_nofile(needed: int) -> int:
+    """Raise this process's open-file soft limit to the hard limit and return it.
+
+    Each in-flight request holds a socket. Containers often start with a soft
+    limit of 1024, and past it new connections fail in the client with EMFILE,
+    which would look like the server refusing them."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    want = hard if hard != resource.RLIM_INFINITY else max(soft, needed + 256)
+    if want > soft:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+            soft = want
+        except (ValueError, OSError):
+            pass
+    if soft < needed + 64:
+        print(f"warning: open-file limit {soft} < {needed} concurrent requests; raise `ulimit -n`", flush=True)
+    return soft
 
 
 def describe(args) -> dict:
