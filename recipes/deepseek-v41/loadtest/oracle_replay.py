@@ -225,6 +225,8 @@ def parser():
     p.add_argument("--url", default="http://127.0.0.1:8040")
     p.add_argument("--model", default="dsv41")
     p.add_argument("--sessions", type=int, default=0, help="first N sessions (0 = all)")
+    p.add_argument("--concurrency", type=int, default=0,
+                   help="sessions in flight at once; the next session starts when one ends (0 = all at once)")
     p.add_argument("--max-steps", type=int, default=0, help="steps per session (0 = all)")
     p.add_argument("--time-limit", type=float, default=0, help="stop starting steps after S seconds")
     p.add_argument("--context-limit", type=int, default=0, help="skip steps whose est. prompt+output exceeds this")
@@ -289,9 +291,22 @@ async def replay(args, convs, stats):
         async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
             rep = asyncio.create_task(reporter(stats, stop, args.report_every))
             try:
-                await asyncio.gather(
-                    *(run_session(session, args, i, c, stats, out, deadline, 4.997) for i, c in enumerate(convs))
-                )
+                if args.concurrency:
+                    # A fixed number of sessions in flight: a finished session's slot
+                    # goes to the next one in dataset order, so the offered load stays
+                    # level instead of tailing off as sessions end.
+                    slots = asyncio.Semaphore(args.concurrency)
+
+                    async def bounded(i, c):
+                        async with slots:
+                            if time.time() <= deadline:
+                                await run_session(session, args, i, c, stats, out, deadline, 4.997)
+
+                    await asyncio.gather(*(bounded(i, c) for i, c in enumerate(convs)))
+                else:
+                    await asyncio.gather(
+                        *(run_session(session, args, i, c, stats, out, deadline, 4.997) for i, c in enumerate(convs))
+                    )
             finally:
                 stop.set()
                 await rep

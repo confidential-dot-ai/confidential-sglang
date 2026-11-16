@@ -40,6 +40,42 @@ class ForcedTextTest(unittest.TestCase):
 
 
 @unittest.skipIf(oracle_replay is None, "needs aiohttp")
+class ConcurrencyTest(unittest.TestCase):
+    def run_replay(self, concurrency, sessions=7):
+        import asyncio
+
+        active, peak, started = [0], [0], []
+
+        async def fake_session(session, args, sid, steps, stats, out, deadline, est_ratio):
+            started.append(sid)
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+            await asyncio.sleep(0.01 * (1 + sid % 3))
+            active[0] -= 1
+
+        real = oracle_replay.run_session
+        oracle_replay.run_session = fake_session
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                args = SimpleNamespace(time_limit=0, request_timeout=5, output=os.path.join(d, "o.jsonl"),
+                                       report_every=60, concurrency=concurrency)
+                asyncio.run(oracle_replay.replay(args, [[]] * sessions, oracle_replay.Stats()))
+        finally:
+            oracle_replay.run_session = real
+        return peak[0], started
+
+    def test_concurrency_caps_sessions_in_flight_and_runs_them_all_in_order(self):
+        peak, started = self.run_replay(3)
+        self.assertEqual(peak, 3)
+        self.assertEqual(sorted(started), list(range(7)))
+        self.assertEqual(started[:3], [0, 1, 2])
+
+    def test_zero_concurrency_starts_every_session_at_once(self):
+        peak, started = self.run_replay(0)
+        self.assertEqual(peak, 7)
+
+
+@unittest.skipIf(oracle_replay is None, "needs aiohttp")
 class ScorecardTest(unittest.TestCase):
     def summary(self, **over):
         s = {

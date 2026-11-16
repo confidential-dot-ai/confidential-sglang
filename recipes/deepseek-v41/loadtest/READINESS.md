@@ -80,7 +80,7 @@ production accept length:
 
 ```sh
 python oracle_scorecard.py DATASET.json --source-tokenizer TOKENIZERS/minimax-m3 \
-    --sessions 32 --gpus 8 --gpu-model B200 --topology "1 node; 2P TP2 + 2D TP2" \
+    --concurrency 32 --gpus 8 --gpu-model B200 --topology "1 node; 2P TP2 + 2D TP2" \
     --image ghcr.io/...@sha256:... --warmup-s 120 --measure-s 600 \
     --cache-hit-band 0.90,0.97 --output-share-band 0.02,0.04 --out scorecard.json
 ```
