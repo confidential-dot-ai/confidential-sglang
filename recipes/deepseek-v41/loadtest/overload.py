@@ -11,6 +11,10 @@ Passes when, at every level and in the burst:
 Timeouts are reported and fail only with --fail-on-timeout: a queued request
 can legitimately wait past a short client timeout.
 
+`shed` in the result says whether any step was refused with 429. If not, the
+endpoint queued everything and the refusal path was never exercised: raise
+--levels and --burst until it is, or pass --require-shed to fail such a run.
+
   python overload.py --url https://GATEWAY --levels 64,128,256,512 --burst 2000
 """
 
@@ -92,6 +96,8 @@ def gates(steps, recovered, args):
             out.append(f"{s['step']}: {hard}")
     if recovered is None:
         out.append(f"no successful request within {args.recover_s} s after the overload")
+    if args.require_shed and not any(s["classes"]["429"] for s in steps):
+        out.append("no 429 at any step: the endpoint was not overloaded (raise --levels / --burst)")
     return out
 
 
@@ -108,6 +114,7 @@ def parser():
     p.add_argument("--request-timeout", type=float, default=120)
     p.add_argument("--recover-s", type=float, default=120)
     p.add_argument("--fail-on-timeout", action="store_true")
+    p.add_argument("--require-shed", action="store_true", help="fail unless some step got 429s")
     p.add_argument("--out", default="overload.json")
     return p
 
@@ -117,11 +124,13 @@ def main(argv=None):
     endpoint.resolve_model(args)
     steps, recovered = asyncio.run(overload(args))
     failures = gates(steps, recovered, args)
-    result = {"endpoint": endpoint.describe(args), "steps": steps, "recovered_after_s": recovered,
+    shed = any(s["classes"]["429"] for s in steps)
+    result = {"endpoint": endpoint.describe(args), "steps": steps, "recovered_after_s": recovered, "shed": shed,
               "gate_failures": failures, "passed": not failures}
     with open(args.out, "w") as f:
         json.dump(result, f, indent=1)
-    print(f"{'PASS' if result['passed'] else 'FAIL'}  overload: recovered after {recovered} s -> {args.out}")
+    print(f"{'PASS' if result['passed'] else 'FAIL'}  overload: recovered after {recovered} s, "
+          f"{'shed with 429' if shed else 'NOT saturated (no 429 at any step)'} -> {args.out}")
     for g in failures:
         print("  gate: " + g)
     return 0 if result["passed"] else 1

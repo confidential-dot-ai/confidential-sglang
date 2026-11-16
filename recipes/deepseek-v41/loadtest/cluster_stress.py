@@ -92,14 +92,15 @@ def phase_argv(name, args, out):
                 "--output", out.replace(".json", ".jsonl"), "--out", out, *extra]
     if name == "overload":
         return ["overload.py", *ep, "--out", out, *extra]
+    unsupported = ["--unsupported-params", args.unsupported_params] if args.unsupported_params else []
     if name == "soak":
-        return ["soak.py", *ep, "--minutes", str(args.soak_minutes), "--concurrency", str(args.sessions),
+        return ["soak.py", *ep, *unsupported, "--minutes", str(args.soak_minutes), "--concurrency", str(args.sessions),
                 "--max-prompt-tokens", str(min(80000, args.context_length - 8192)), "--out", out, *extra]
     if name == "fault":
         if not args.fault_cmd:
             return "no --fault-cmd"
         check = ["--check-cmd", args.check_cmd] if args.check_cmd else []
-        return ["fault.py", *ep, "--fault-cmd", args.fault_cmd, *check, "--out", out, *extra]
+        return ["fault.py", *ep, *unsupported, "--fault-cmd", args.fault_cmd, *check, "--out", out, *extra]
     raise ValueError(name)
 
 
@@ -145,8 +146,9 @@ def headline(r):
                 f"TTFT p50/p99 {c['ttft_s']['50']}/{c['ttft_s']['99']} s, {c['steps_per_s']} steps/s")
     if name == "overload":
         top = x["steps"][-1] if x["steps"] else {}
-        return (f"recovered after {x['recovered_after_s']} s; last step {top.get('step')}: "
-                f"{top.get('classes')}")
+        shed = "shed with 429" if x.get("shed") else "NOT saturated: no 429, raise --levels/--burst"
+        return (f"{shed}; recovered after {x['recovered_after_s']} s; last step {top.get('step')}: "
+                f"{top.get('ok_per_s')} ok/s, p50 {top.get('latency_s', {}).get('50')} s")
     if name == "soak":
         t = x["total"]
         return (f"{t['requests']} requests, {t['failures']} failed, {t['classes']['429']} x 429, "
@@ -183,6 +185,7 @@ def parser():
     p.add_argument("--context-length", type=int, default=131072)
     p.add_argument("--sessions", type=int, default=32, help="load and soak concurrency (the operating point)")
     p.add_argument("--known-failures", default="", help="func cases allowed to fail, e.g. t_n2 on PD")
+    p.add_argument("--unsupported-params", default="", help="sampling parameters the deployment rejects (min_p with DSpark)")
     p.add_argument("--dataset", default="", help="Oracle dataset for the load phase")
     p.add_argument("--oracle", action="store_true", help="force completions (workers must run --oracle-decode)")
     p.add_argument("--source-tokenizer", default="", help="the dataset's tokenizer, with --oracle")

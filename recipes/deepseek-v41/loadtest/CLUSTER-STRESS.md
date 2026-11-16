@@ -28,7 +28,7 @@ and faults go through the control plane.
 | func | `func_tests.py` | Tool calls (11 cases x 10), API features (JSON schema, stop, max tokens, thinking, unicode, history), needles up to the context length, over-context prompt gets a 4xx, a storm of client disconnects leaves the server healthy. Only `--known-failures` may fail. |
 | needles | `needles.py` | Every one of the fixed long-prompt recall cases (default: the 64 cases that caught the CED tail-graph bug, 14K-60K tokens) returns its code. |
 | load | `oracle_scorecard.py` | Realmix agent traces at `--sessions` in flight; in the measured window: 0 failed requests and KV-transfer failures, prefix hit and output share inside the dataset's bands, TTFT p50 at most 3 s, 0 retractions. Reports served TPM per GPU. |
-| overload | `overload.py` | 64 to 512 clients of short requests, then a burst: only 429s refuse the excess (no 5xx, connection errors or wrong answers), and a request succeeds within 2 minutes afterwards. |
+| overload | `overload.py` | 64 to 512 clients of short requests, then a burst: only 429s refuse the excess (no 5xx, connection errors or wrong answers), and a request succeeds within 2 minutes afterwards. The report says whether any step was refused at all (`shed`); if none was, the levels never reached capacity and the refusal path is untested (`--require-shed` makes that a failure). |
 | soak | `soak.py` | Mixed traffic (short chat, 6K-80K prompts, tool calls, thinking, full and dropped streams) at `--sessions` for `--soak-minutes`: 0 failed requests and healthy at the end. Per-minute latency and 429s show drift. |
 | fault | `fault.py` | Load at 16 clients, then `--fault-cmd` (for example deleting a worker pod): the endpoint recovers (60 s with no failures at 90% of baseline throughput) within an hour, and `--check-cmd` exits 0. Reports the requests lost and the time to recover. |
 
@@ -44,6 +44,7 @@ python cluster_stress.py --url https://GATEWAY --context-length 131072 --session
     --prom-prefill 'environment="candidate",role="prefill"' --prom-decode 'environment="candidate",role="decode"' \
     --fault-cmd 'kubectl -n inference delete pod inference-pair-0 --wait=false' \
     --check-cmd './check-node-gpus.sh' \
+    --known-failures t_n2 --unsupported-params min_p \
     --soak-minutes 240 --out-dir stress-candidate
 ```
 
@@ -66,9 +67,14 @@ failed.
   `--oracle-decode` and with the realmix bands (hit 0.93-0.96, output share
   0.030-0.035). `--oracle-decode` lets a request dictate the output, so it must
   never be in a production allowlist.
-- **Known failures.** PD deployments do not support `n > 1`
-  (`--known-failures t_n2`); speculative decoding returns no logprobs, which
-  `t_logprobs_rejected` expects as a clean 4xx.
+- **Known failures and rejected parameters.** PD deployments do not support
+  `n > 1` (`--known-failures t_n2`); speculative decoding returns no logprobs,
+  which `t_logprobs_rejected` expects as a clean 4xx. DSpark also rejects
+  `min_p`: pass `--unsupported-params min_p` so the soak and fault mixes leave
+  it out instead of failing on it.
+- **Errors inside a stream.** A streamed request refused after the 200 header
+  arrives as an error event in the stream. Every tool here counts that, and a
+  stream that ends without `[DONE]`, as a failed request.
 - **Fault expectations.** With one replica every request during the reload
   fails, so leave `--max-failed-requests` unset and judge the recovery time.
   With two pairs the router should carry the traffic on the other pair: set

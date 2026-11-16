@@ -50,6 +50,13 @@ def pct(xs, q):
     return xs[min(len(xs) - 1, int(q / 100 * len(xs)))]
 
 
+def stream_error(err):
+    """An in-stream error event as an error key, e.g. '400: min_p is not supported ...'."""
+    if not isinstance(err, dict):
+        return f"stream: {str(err)[:150]}"
+    return f"{err.get('code', 'stream')}: {str(err.get('message', ''))[:150]}"
+
+
 def tool_call(cid):
     return {"id": cid, "type": "function", "function": {"name": "exec", "arguments": "{}"}}
 
@@ -101,14 +108,20 @@ async def run_step(session, args, sid, idx, history, max_tokens, stats, out, for
                     msg = (await resp.text())[:200]
                     stats.error(f"{resp.status}: {msg}")
                     return None
+                done, failed = False, None
                 async for raw in resp.content:
                     line = raw.decode().strip()
                     if not line.startswith("data:"):
                         continue
                     data = line[5:].strip()
                     if data == "[DONE]":
+                        done = True
                         break
                     chunk = json.loads(data)
+                    # A request refused after the 200 header arrives as an error event in the stream.
+                    if chunk.get("error"):
+                        failed = stream_error(chunk["error"])
+                        break
                     if chunk.get("usage"):
                         usage = chunk["usage"]
                     for ch in chunk.get("choices", []):
@@ -120,6 +133,9 @@ async def run_step(session, args, sid, idx, history, max_tokens, stats, out, for
                             text.append(piece)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             stats.error(f"conn: {type(e).__name__}")
+            return None
+        if failed or not done:
+            stats.error(failed or "stream closed before [DONE]")
             return None
         end = time.time()
         usage = usage or {}

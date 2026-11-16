@@ -37,7 +37,7 @@ async def soak(args):
     async with endpoint.client_session(args, limit=0) as session:
         load = traffic.Load(
             session, url, args.model, args.concurrency,
-            make=lambda rnd: traffic.mixed(rnd, args.max_prompt_tokens),
+            make=lambda rnd: traffic.mixed(rnd, args.max_prompt_tokens, traffic.samplers_without(args.unsupported_params)),
             seed=args.seed, timeout=args.request_timeout, t0=t0, end=t0 + args.minutes * 60,
         )
 
@@ -61,6 +61,12 @@ def parser():
     p.add_argument("--max-prompt-tokens", type=int, default=80000, help="largest long prompt in the mix")
     p.add_argument("--request-timeout", type=float, default=900)
     p.add_argument("--max-failures", type=int, default=0)
+    p.add_argument(
+        "--unsupported-params",
+        type=lambda t: [x for x in t.split(",") if x],
+        default=[],
+        help="sampling parameters the deployment rejects, left out of the mix (min_p with DSpark)",
+    )
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--out", default="soak.json")
     return p

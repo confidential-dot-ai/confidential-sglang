@@ -78,6 +78,14 @@ class FakeGateway:
             self.inflight -= 1
 
     async def _answer(self, request, body):
+        if "min_p" in body:  # as DSpark does: a 400, or for a stream a 200 with an error event
+            err = {"object": "error", "message": "min_p is not supported with DSPARK", "code": 400}
+            if not body.get("stream"):
+                return web.json_response({"error": err}, status=400)
+            resp = web.StreamResponse(headers={"content-type": "text/event-stream"})
+            await resp.prepare(request)
+            await resp.write(f"data: {json.dumps({'error': err})}\n\ndata: [DONE]\n\n".encode())
+            return resp
         content = body["messages"][-1]["content"]
         m = re.search(r"access code is (\d{6})", content)
         text = ("000000" if self.wrong_needles else m.group(1)) if m else "fine, thanks"
@@ -197,6 +205,13 @@ class ClusterStressTest(unittest.TestCase):
         self.assertGreater(sum(s["classes"]["429"] for s in res["steps"]), 0)
         self.assertEqual(sum(s["classes"]["5xx"] for s in res["steps"]), 0)
         self.assertIsNotNone(res["recovered_after_s"])
+        self.assertTrue(res["shed"])
+
+    def test_overload_can_require_that_the_endpoint_was_saturated(self):
+        r = tool("overload.py", "--url", self.url, "--levels", "4", "--step-s", "1", "--burst", "0",
+                 "--recover-s", "10", "--require-shed", "--out", self.out("o.json"))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertFalse(self.load("o.json")["shed"])
 
     def test_overload_fails_on_5xx(self):
         self.fake.capacity, self.fake.over_capacity_status = 4, 500
@@ -207,18 +222,79 @@ class ClusterStressTest(unittest.TestCase):
 
     def test_soak_reports_per_minute_and_passes_clean_traffic(self):
         r = tool("soak.py", "--url", self.url, "--minutes", "0.05", "--concurrency", "4",
-                 "--max-prompt-tokens", "6000", "--out", self.out("s.json"))
+                 "--max-prompt-tokens", "6000", "--unsupported-params", "min_p", "--out", self.out("s.json"))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         res = self.load("s.json")
         self.assertGreater(res["total"]["requests"], 10)
         self.assertEqual(res["total"]["failures"], 0)
         self.assertTrue(res["by_minute"])
 
+    def test_soak_counts_errors_inside_a_200_stream(self):
+        sys.path.insert(0, HERE)
+        import traffic
+
+        os.environ["STRESS_API_KEY"] = KEY
+        from types import SimpleNamespace
+
+        import endpoint
+
+        async def go():
+            args = SimpleNamespace(url=self.url, api_key_env="STRESS_API_KEY", ca_cert="")
+            async with endpoint.client_session(args) as session:
+                body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8, "min_p": 0.05}
+                return await traffic.send(session, self.url + "/v1/chat/completions", "fake-model", "stream_full",
+                                          True, body, __import__("random").Random(0), time.time(), 30)
+
+        row = asyncio.run(go())
+        self.assertEqual(row["cls"], "4xx", row)
+        self.assertIn("in-stream 400", row["err"])
+
+    def test_soak_leaves_out_parameters_the_deployment_rejects(self):
+        r = tool("soak.py", "--url", self.url, "--minutes", "0.05", "--concurrency", "4",
+                 "--max-prompt-tokens", "6000", "--out", self.out("s.json"))
+        self.assertEqual(r.returncode, 1, r.stdout)  # the default mix sends min_p
+        self.assertGreater(self.load("s.json")["total"]["classes"]["4xx"], 0)
+        r = tool("soak.py", "--url", self.url, "--minutes", "0.05", "--concurrency", "4", "--max-prompt-tokens",
+                 "6000", "--unsupported-params", "min_p", "--out", self.out("s.json"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_replay_counts_an_in_stream_error_as_a_failed_step(self):
+        sys.path.insert(0, HERE)
+        import oracle_replay
+        from types import SimpleNamespace
+
+        os.environ["STRESS_API_KEY"] = KEY
+        import endpoint
+
+        args = SimpleNamespace(url=self.url, api_key_env="STRESS_API_KEY", ca_cert="", model="fake-model")
+        stats = oracle_replay.Stats()
+        stats.active_sessions, stats.skipped_context = 0, 0
+
+        async def go():
+            async with endpoint.client_session(args) as session:
+                with open(self.out("r.jsonl"), "w") as out:
+                    hist = [{"role": "user", "content": "hi"}]
+                    # min_p rides along in the body through a wrapper session.post
+                    orig = session.post
+
+                    def post(url, data=None, **kw):
+                        body = json.loads(data)
+                        body["min_p"] = 0.05
+                        return orig(url, data=json.dumps(body), **kw)
+
+                    session.post = post
+                    return await oracle_replay.run_step(session, args, 0, 0, hist, 8, stats, out)
+
+        self.assertIsNone(asyncio.run(go()))
+        self.assertEqual(list(stats.errors), ["400: min_p is not supported with DSPARK"])
+        self.assertEqual(stats.rows, [])
+
     def test_fault_measures_the_outage_and_the_recovery(self):
         cmd = f"{sys.executable} -c \"import urllib.request; urllib.request.urlopen('{self.url}/_down?s=3')\""
         r = tool("fault.py", "--url", self.url, "--fault-cmd", cmd, "--concurrency", "4", "--baseline-s", "2",
                  "--window-s", "2", "--settle-s", "4", "--recover-timeout-s", "40", "--after-s", "1",
-                 "--max-prompt-tokens", "6000", "--check-cmd", "true", "--out", self.out("f.json"))
+                 "--max-prompt-tokens", "6000", "--unsupported-params", "min_p", "--check-cmd", "true",
+                 "--out", self.out("f.json"))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         res = self.load("f.json")
         self.assertGreater(res["outage"]["failed_requests"], 0)
@@ -230,7 +306,8 @@ class ClusterStressTest(unittest.TestCase):
         cmd = f"{sys.executable} -c \"import urllib.request; urllib.request.urlopen('{self.url}/_down?s=2')\""
         r = tool("fault.py", "--url", self.url, "--fault-cmd", cmd, "--concurrency", "4", "--baseline-s", "1",
                  "--window-s", "1", "--settle-s", "3", "--recover-timeout-s", "30", "--after-s", "0",
-                 "--max-prompt-tokens", "6000", "--max-failed-requests", "0", "--out", self.out("f.json"))
+                 "--max-prompt-tokens", "6000", "--unsupported-params", "min_p", "--max-failed-requests", "0",
+                 "--out", self.out("f.json"))
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn("requests failed (max 0)", " ".join(self.load("f.json")["gate_failures"]))
 
@@ -258,7 +335,7 @@ class ClusterStressTest(unittest.TestCase):
     def test_suite_writes_one_report_and_passes(self):
         out = self.out("suite")
         r = tool("cluster_stress.py", "--url", self.url, "--phases", "needles,overload,soak,fault",
-                 "--out-dir", out, "--soak-minutes", "0.05", "--sessions", "4",
+                 "--out-dir", out, "--soak-minutes", "0.05", "--sessions", "4", "--unsupported-params", "min_p",
                  "--needles-args", "--sizes 2000 --seeds 1", "--overload-args", "--levels 8 --step-s 1 --burst 10",
                  timeout=300)
         self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr)

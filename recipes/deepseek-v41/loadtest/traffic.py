@@ -49,10 +49,15 @@ def _text(n_words, rnd):
     return " ".join(rnd.choice(WORDS) for _ in range(n_words))
 
 
-def mixed(rnd, max_prompt_tokens=80000):
+def samplers_without(params):
+    """SAMPLERS minus those using a parameter the deployment rejects (min_p under DSpark)."""
+    return [sp for sp in SAMPLERS if not set(sp) & set(params)] or [{"temperature": 0.0}]
+
+
+def mixed(rnd, max_prompt_tokens=80000, samplers=SAMPLERS):
     """(kind, stream, body) of one request from the soak mix."""
     k = rnd.random()
-    sp = rnd.choice(SAMPLERS)
+    sp = rnd.choice(samplers)
     if k < 0.40:
         return "short_chat", False, {
             "messages": [{"role": "user", "content": "Summarize: " + _text(rnd.randint(50, 1500), rnd)}],
@@ -88,6 +93,36 @@ def short(rnd):
         "max_tokens": rnd.randint(16, 128), "temperature": 0.0}
 
 
+async def _read_stream(r, row, start, cancel_at):
+    """Read SSE events into row. A refusal after the 200 header is an error event in
+    the stream; a stream that ends without [DONE] (and was not dropped) failed."""
+    n, done = 0, False
+    async for raw in r.content:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            done = True
+            break
+        ev = json.loads(data)
+        if ev.get("error"):
+            err = ev["error"] if isinstance(ev["error"], dict) else {"message": ev["error"]}
+            code = err.get("code")
+            row["cls"] = _status_class(code) if isinstance(code, int) else "5xx"
+            row["err"] = f"in-stream {code}: {str(err.get('message'))[:180]}"
+            break
+        n += 1
+        if row["ttft"] is None:
+            row["ttft"] = round(time.time() - start, 3)
+        if cancel_at is not None and n >= cancel_at:
+            done = True  # the client drops the stream on purpose
+            break
+    if row["cls"] == "ok" and not done:
+        row["cls"], row["err"] = "conn", "stream closed before [DONE]"
+    row["ctoks"] = n
+
+
 def _status_class(status):
     if status == 429:
         return "429"
@@ -111,15 +146,7 @@ async def send(session, url, model, kind, stream, body, rnd, t0, timeout):
             if r.status != 200:
                 row["cls"], row["err"] = _status_class(r.status), (await r.text())[:200]
             elif stream:
-                n, cancel_at = 0, rnd.randint(3, 60)
-                async for raw in r.content:
-                    if raw.startswith(b"data:"):
-                        n += 1
-                        if row["ttft"] is None:
-                            row["ttft"] = round(time.time() - start, 3)
-                        if kind == "stream_cancel" and n >= cancel_at:
-                            break
-                row["ctoks"] = n
+                await _read_stream(r, row, start, cancel_at=rnd.randint(3, 60) if kind == "stream_cancel" else None)
             else:
                 j = await r.json()
                 row["ctoks"] = j["usage"]["completion_tokens"]

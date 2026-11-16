@@ -83,7 +83,7 @@ async def fault(args):
     url = args.url.rstrip("/") + "/v1/chat/completions"
     async with endpoint.client_session(args, limit=0) as session:
         load = traffic.Load(session, url, args.model, args.concurrency,
-                            make=lambda rnd: traffic.mixed(rnd, args.max_prompt_tokens),
+                            make=lambda rnd: traffic.mixed(rnd, args.max_prompt_tokens, traffic.samplers_without(args.unsupported_params)),
                             seed=args.seed, timeout=args.request_timeout, t0=t0)
         task = asyncio.create_task(load.run())
         await asyncio.sleep(args.baseline_s)
@@ -127,6 +127,12 @@ def parser():
     p.add_argument("--max-failed-requests", type=int, default=-1, help="-1 = no cap")
     p.add_argument("--request-timeout", type=float, default=600)
     p.add_argument("--cmd-timeout-s", type=float, default=600)
+    p.add_argument(
+        "--unsupported-params",
+        type=lambda t: [x for x in t.split(",") if x],
+        default=[],
+        help="sampling parameters the deployment rejects, left out of the mix (min_p with DSpark)",
+    )
     p.add_argument("--seed", type=int, default=11)
     p.add_argument("--out", default="fault.json")
     return p
