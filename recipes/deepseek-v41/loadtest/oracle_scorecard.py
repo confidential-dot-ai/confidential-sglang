@@ -39,6 +39,7 @@ import urllib.request
 
 import live_metrics as lm
 import oracle_replay as replay
+import prom_metrics
 
 
 def sha256(path):
@@ -102,7 +103,10 @@ async def run(args):
     if args.oracle_off:
         args.oracle = False
     convs = replay.load(args)
-    scraper = lm.Scraper(args.prefill, args.decode, args.worker, args.router, 10.0)
+    if args.prom_url:
+        scraper = prom_metrics.from_args(args)
+    else:
+        scraper = lm.Scraper(args.prefill, args.decode, args.worker, args.router, 10.0)
     first = scraper.snapshot()
     missing = lm.check_enabled(first)
     if missing:
@@ -172,10 +176,11 @@ def main(argv=None):
     p.add_argument("--output-share-band", type=band, default=None, help="lo,hi; required unless --allow-failure")
     p.add_argument("--ttft-p50-max", type=float, default=3.0)
     p.add_argument("--allow-failure", action="store_true")
+    prom_metrics.add_args(p)
     p.add_argument("--out", required=True, help="result JSON")
     p.set_defaults(oracle=True)
     args = p.parse_args(argv)
-    if not args.prefill and not args.decode and not args.worker:
+    if not args.prom_url and not args.prefill and not args.decode and not args.worker:
         args.prefill, args.decode = ["http://127.0.0.1:8041"], ["http://127.0.0.1:8042"]
         args.router = args.router or "http://127.0.0.1:29001"
     if not args.allow_failure and not (args.cache_hit_band and args.output_share_band):
@@ -197,6 +202,11 @@ def main(argv=None):
             "topology": args.topology,
             "image": args.image,
             "workers": workers,
+            "metrics_source": (
+                {"prometheus": args.prom_url, "prefill": args.prom_prefill, "decode": args.prom_decode,
+                 "worker": args.prom_worker, "router": args.prom_router}
+                if args.prom_url else "direct"
+            ),
             "host": platform.node(),
             "git": subprocess.run(
                 ["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=sys.path[0] or "."

@@ -40,6 +40,8 @@ from pathlib import Path
 
 import aiohttp
 
+import endpoint
+
 
 def pct(xs, q):
     if not xs:
@@ -224,6 +226,12 @@ def parser():
     p.add_argument("dataset")
     p.add_argument("--url", default="http://127.0.0.1:8040")
     p.add_argument("--model", default="dsv41")
+    p.add_argument(
+        "--api-key-env",
+        default=endpoint.DEFAULT_KEY_ENV,
+        help="environment variable holding the gateway API key (unset = no key)",
+    )
+    p.add_argument("--ca-cert", default="", help="PEM bundle to trust for an https --url")
     p.add_argument("--sessions", type=int, default=0, help="first N sessions (0 = all)")
     p.add_argument("--concurrency", type=int, default=0,
                    help="sessions in flight at once; the next session starts when one ends (0 = all at once)")
@@ -284,11 +292,13 @@ def load(args):
 async def replay(args, convs, stats):
     """Run every session to completion (or the time limit); fills `stats`."""
     deadline = stats.t0 + (args.time_limit or 1e12)
-    conn = aiohttp.TCPConnector(limit=0)
+    conn = aiohttp.TCPConnector(limit=0, ssl=endpoint.ssl_context(args) or True)
     timeout = aiohttp.ClientTimeout(total=args.request_timeout)
     stop = asyncio.Event()
     with open(args.output, "w") as out:
-        async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
+        async with aiohttp.ClientSession(
+            connector=conn, timeout=timeout, headers=endpoint.headers(args)
+        ) as session:
             rep = asyncio.create_task(reporter(stats, stop, args.report_every))
             try:
                 if args.concurrency:
