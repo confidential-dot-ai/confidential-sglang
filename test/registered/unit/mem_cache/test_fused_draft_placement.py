@@ -1036,7 +1036,7 @@ class TestFusedDraftDecision(CustomTestCase):
                     quant_config=kept,
                     model_dtype=_DTYPE,
                     is_draft_worker=True,
-                    is_dflash=False,
+                    is_dflash_family=False,
                     speculative_draft_attention_backend=None,
                     speculative_draft_kv_cache_dtype=draft_flag,
                 )
