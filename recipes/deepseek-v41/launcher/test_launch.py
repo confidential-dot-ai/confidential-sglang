@@ -766,15 +766,24 @@ class TestLaunch(unittest.TestCase):
     def test_silent_nccl_fallback_in_a_worker_log_fails_the_launch(self):
         # The launcher reads server log lines, so a reworded line must fail here.
         distributed = launch.ROOT / "python/sglang/srt/distributed"
+        communicators = distributed / "device_communicators"
         self.assertIn(
-            launch.CUSTOM_AR_READY_LINE,
-            (distributed / "device_communicators/custom_all_reduce_v2.py").read_text(),
+            f'owner="{launch.CUSTOM_AR_OWNER}"',
+            (communicators / "custom_all_reduce_v2.py").read_text(),
+        )
+        self.assertIn(
+            'f"\\n  {r.owner}: slot = ',
+            (communicators / "symm_workspace.py").read_text(),
         )
         self.assertIn(
             launch.CUSTOM_AR_FAILED_LINE,
             (distributed / "parallel_state.py").read_text(),
         )
-        ready = "INFO All Reduce config: symmetric_memory = 80.02 MB\n"
+        ready = (
+            "INFO Symmetric workspace #0 (tp, world_size=2): 80.02 MB, slot = 8 B, "
+            "pull = 0 B, semaphores = 0, multicast = True, requests:\n"
+            "  custom_all_reduce_v2: slot = 8388608 B, pull = 0 B, semaphores = 0\n"
+        )
         failed = "WARNING Setup Custom allreduce failed with boom\n"
         with tempfile.TemporaryDirectory() as d:
             log = Path(d) / "decode.log"

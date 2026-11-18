@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     KVAndScore,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,

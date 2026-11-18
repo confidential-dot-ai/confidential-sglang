@@ -1620,7 +1620,10 @@ def preflight(args, plan):
 # the launcher reads two log lines: GroupCoordinator warns with the first when
 # setup raises, and CustomAllReduceV2 logs the second on rank 0 once it is up.
 CUSTOM_AR_FAILED_LINE = "Setup Custom allreduce failed"
-CUSTOM_AR_READY_LINE = "All Reduce config:"
+# Rank 0 lists each owner of its group's symmetric workspace once the workspace
+# is allocated; CustomAllReduceV2 appears there only when its lease succeeded.
+CUSTOM_AR_OWNER = "custom_all_reduce_v2"
+CUSTOM_AR_READY_LINE = f"{CUSTOM_AR_OWNER}: slot = "
 
 
 def require_custom_all_reduce(log_path):
