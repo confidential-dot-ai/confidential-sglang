@@ -57,6 +57,24 @@ The result directory holds each phase's JSON and log, `report.json`, and
 `report.md`, a table for a PR or a release note. The exit code is 1 if any phase
 failed.
 
+## Running from the image
+
+`container/build.sh DATASET TOKENIZER_DIR` builds `cluster-stress:<revision>`:
+the tools, hash-pinned aiohttp and tokenizers, kubectl, and the realmix
+dataset with its MiniMax-M3 tokenizer (`--dataset` and `--source-tokenizer`
+default to them). The unit tests run during the build. It runs as uid 1000
+and writes results to `/work`:
+
+```sh
+mkdir -p out && chmod 777 out
+docker run --rm -e STRESS_API_KEY -e PROM_TOKEN -v "$PWD/out:/work" \
+    -v "$HOME/.kube/config:/home/stress/.kube/config:ro" \
+    cluster-stress:REVISION --url https://GATEWAY ...   # same options as above
+```
+
+Mount a CA bundle and pass `--ca-cert` for a private CA, and use
+`--network host` when the endpoint is on the machine running the container.
+
 ## Choices to make per deployment
 
 - **Load bands.** Without Oracle decoding (production workers do not run

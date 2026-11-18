@@ -31,6 +31,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -157,6 +158,19 @@ async def run(args):
     return summary
 
 
+
+def tools_revision() -> str:
+    """The suite's own revision: STRESS_REVISION in the image (which has no git), else git."""
+    if os.environ.get("STRESS_REVISION"):
+        return os.environ["STRESS_REVISION"]
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=sys.path[0] or "."
+        )
+    except FileNotFoundError:
+        return "unknown"
+    return out.stdout.strip() or "unknown"
+
 def main(argv=None):
     p = replay.parser()
     p.description = __doc__.split("\n\n")[0]
@@ -208,9 +222,7 @@ def main(argv=None):
                 if args.prom_url else "direct"
             ),
             "host": platform.node(),
-            "git": subprocess.run(
-                ["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=sys.path[0] or "."
-            ).stdout.strip(),
+            "git": tools_revision(),
         },
         **summary,
     }

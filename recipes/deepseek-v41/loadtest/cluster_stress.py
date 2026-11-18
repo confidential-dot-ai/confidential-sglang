@@ -186,9 +186,11 @@ def parser():
     p.add_argument("--sessions", type=int, default=32, help="load and soak concurrency (the operating point)")
     p.add_argument("--known-failures", default="", help="func cases allowed to fail, e.g. t_n2 on PD")
     p.add_argument("--unsupported-params", default="", help="sampling parameters the deployment rejects (min_p with DSpark)")
-    p.add_argument("--dataset", default="", help="Oracle dataset for the load phase")
+    p.add_argument("--dataset", default=os.environ.get("STRESS_DATASET", ""),
+                   help="Oracle dataset for the load phase (default $STRESS_DATASET)")
     p.add_argument("--oracle", action="store_true", help="force completions (workers must run --oracle-decode)")
-    p.add_argument("--source-tokenizer", default="", help="the dataset's tokenizer, with --oracle")
+    p.add_argument("--source-tokenizer", default=os.environ.get("STRESS_SOURCE_TOKENIZER", ""),
+                   help="the dataset's tokenizer, with --oracle (default $STRESS_SOURCE_TOKENIZER)")
     p.add_argument("--cache-hit-band", default="")
     p.add_argument("--output-share-band", default="")
     p.add_argument("--gpus", type=int, default=0)
