@@ -122,8 +122,11 @@ async def run(args):
         await asyncio.sleep(max(0.0, stats.t0 + offset - time.time()))
         if task.done():
             return None, 0
+        # Read before the snapshot: a Prometheus snapshot waits --prom-lag-s,
+        # and the replay stops at the window's end.
+        active = stats.active_sessions
         snap = await loop.run_in_executor(None, scraper.snapshot)
-        return snap, stats.active_sessions
+        return snap, active
 
     snap_a, _ = await snapshot_at(args.warmup_s)
     snap_b, active_at_b = await snapshot_at(args.warmup_s + args.measure_s)
