@@ -57,7 +57,100 @@ The result directory holds each phase's JSON and log, `report.json`, and
 `report.md`, a table for a PR or a release note. The exit code is 1 if any phase
 failed.
 
-## Running from the image
+## Profiles
+
+`--profile` sets the defaults for one kind of deployment. Any option on the
+command line still wins over the profile.
+
+| Profile | For | Phases | Settings | Run time |
+|---|---|---|---|---|
+| (none) | the tools' own defaults | all | 131072 context, 32 sessions, 60-minute soak | hours |
+| `qwen-short` | a 1-GPU Qwen3.5-0.8B staging deployment (`recipes/qwen35-0.8b`) | func, needles, overload, soak | 262144 context; func with 4 trials, needles up to 253952 tokens (context - 8192); needles phase at 16K-240K tokens, calibrated on the served tokenizer; overload at 16-128 clients (30 s steps), burst 500; 8 sessions, 5-minute soak, prompts up to 48K; `t_logprobs_rejected` is a known failure | about 15-20 minutes (estimate; not yet run on staging) |
+| `dsv41-full` | DeepSeek-V4.1 PD with DSpark | all (load needs `--dataset`, fault needs `--fault-cmd`) | 131072 context, 32 sessions, `--known-failures t_n2 --unsupported-params min_p`, 240-minute soak | about 5 hours |
+
+`qwen-short` leaves out the load phase: its realmix dataset and bands are
+DeepSeek-V4.1 traces. Qwen3.5-0.8B has no speculative decoding, so it serves
+logprobs, and `t_logprobs_rejected` (a clean 4xx expected under DSpark) fails
+by design. The 0.8B model's tool-call and reasoning accuracy was not measured
+before this profile was written: add `--known-failures` for any case the first
+staging run shows to be a model limit, not a serving fault.
+
+## Running from the engine image
+
+The engine image (`ghcr.io/confidential-dot-ai/confidential-sglang/engine`)
+carries this directory at `/opt/sglang/recipes/deepseek-v41/loadtest`, and its
+Python environment (`python3`) has every dependency of the tools (aiohttp; and
+tokenizers for `--oracle`). It does not carry the realmix dataset or kubectl:
+mount a dataset for the load phase, and give the fault phase a command that
+exists in the container. The image runs as uid 1001 with a read-only `/opt`, so
+write results to a mounted directory.
+
+```sh
+mkdir -p out && chmod 777 out
+IMAGE=ghcr.io/confidential-dot-ai/confidential-sglang/engine@sha256:...
+
+# Qwen3.5-0.8B staging, ~15-20 minutes
+docker run --rm -e STRESS_API_KEY -v "$PWD/out:/out" --entrypoint python3 "$IMAGE" \
+    /opt/sglang/recipes/deepseek-v41/loadtest/cluster_stress.py --profile qwen-short \
+    --url https://GATEWAY --api-key-env STRESS_API_KEY --out-dir /out/qwen-short
+
+# DeepSeek-V4.1, full profile (load phase with a mounted dataset)
+docker run --rm -e STRESS_API_KEY -e PROM_TOKEN -v "$PWD/out:/out" -v "$PWD/data:/data-in:ro" \
+    --entrypoint python3 "$IMAGE" \
+    /opt/sglang/recipes/deepseek-v41/loadtest/cluster_stress.py --profile dsv41-full \
+    --url https://GATEWAY --dataset /data-in/oracle-realmix-256-r36-m3-modeled-long25-38k-v3.json \
+    --gpus 8 --gpu-model B200 --topology "2 pairs, 1P TP2 + 1D TP2 each" --image "$IMAGE" \
+    --prom-url https://PROMETHEUS --prom-token-env PROM_TOKEN \
+    --prom-prefill 'environment="candidate",role="prefill"' --prom-decode 'environment="candidate",role="decode"' \
+    --out-dir /out/dsv41-full
+```
+
+As a Kubernetes Job beside the cluster under test (any cluster that can reach
+the gateway; the key comes from a Secret, results go to the pod's log and an
+emptyDir — copy `report.md` out of the log, or mount a volume you can read):
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cluster-stress-qwen-short
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1001
+        runAsGroup: 1001
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: stress
+          image: ghcr.io/confidential-dot-ai/confidential-sglang/engine@sha256:...
+          command: ["python3", "/opt/sglang/recipes/deepseek-v41/loadtest/cluster_stress.py"]
+          args: ["--profile", "qwen-short", "--url", "https://GATEWAY",
+                 "--api-key-env", "STRESS_API_KEY", "--out-dir", "/out/qwen-short"]
+          env:
+            - name: STRESS_API_KEY
+              valueFrom: {secretKeyRef: {name: stress-api-key, key: key}}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: "2", memory: 2Gi}
+          volumeMounts:
+            - {name: out, mountPath: /out}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: out, emptyDir: {}}
+        - {name: tmp, emptyDir: {}}
+```
+
+The Job needs no GPU. Run it outside the cluster under test (or from any pod
+that is allowed to reach the gateway), never on a production cluster.
+
+## Running from the cluster-stress image
 
 `container/build.sh DATASET TOKENIZER_DIR` builds `cluster-stress:<revision>`:
 the tools, hash-pinned aiohttp and tokenizers, kubectl, and the realmix
