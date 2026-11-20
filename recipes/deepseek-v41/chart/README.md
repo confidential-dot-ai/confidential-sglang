@@ -1,37 +1,34 @@
-# DeepSeek-V4.1-Flash worker image for confidential-inference
+# DeepSeek-V4.1-Flash on the confidential-inference chart
 
 `../container` is the docker recipe: one root image that `compose.yaml` and
-`deploy-dsv41.sh` run on a GPU VM. This directory builds the same engine as the
-worker image of the confidential-inference Helm chart, which runs every
-container as uid 1001 with its own command line.
+`deploy-dsv41.sh` run on a GPU VM. Under the confidential-inference Helm chart
+the same engine runs from the one engine image,
+`ghcr.io/confidential-dot-ai/confidential-sglang/engine`, which CI builds per
+`main` commit from `confidential/engine/` (pin it by digest from the release
+record `images-<commit>`). The chart runs every container as uid 1001 with its
+own command line; the image has no entrypoint.
 
 ```
-IMAGE=ghcr.io/confidential-dot-ai/sglang-dsv41-flash recipes/deepseek-v41/chart/build.sh
-recipes/deepseek-v41/chart/check-image.sh ghcr.io/confidential-dot-ai/sglang-dsv41-flash:<commit>
+confidential/engine/check-image.sh ghcr.io/confidential-dot-ai/confidential-sglang/engine@sha256:<digest>
 ```
 
-## What is in it
+## What the engine image holds for this recipe
 
-- The base is the PD recipe image (`BASE_IMAGE`, default
-  `dsv41-pd@sha256:8e1b54fb…`): Ubuntu 24.04, CUDA 13.0.3, the
-  `requirements.lock` environment in `/opt/dsv41` (torch, FlashInfer 0.7.3 with
-  sm100a/sm103a kernels, deep-gemm, Mooncake). This image changes none of it.
-- `/opt/sglang/python` and `/opt/sglang/recipes/deepseek-v41` come from this
-  checkout. `SOURCE_RECORD.json` records the commit.
-- The chart's helpers, copied from confidential-inference
-  (`vendor/SOURCE`): `wait-for-model`, `fetch-model`, `sglang-pair` with
-  `pair_diagnostics.py` and `private_log_sink.py`, and `dcgm-exporter` with its
-  counters.
-- The HTTP server is hardened with confidential-inference's
-  `harden_http.py --variant pd`, as its own images are. Only the serving routes
-  remain (health, OpenAI, generate and the other inference endpoints). The
-  admin, profiling, weight-update, cache-flush and docs routes are removed, and
-  `launch_server` refuses every frontend except the Python HTTP one. The script
-  checks the SHA-256 of `http_server.py` and `launch_server.py` first, so a
-  change to either fails the build until someone reviews the policy against
-  it. The vendored copy pins this branch's files (the upstream 314bce7 sync).
-  confidential-inference pins upstream a7fd2e1, which its own image builds
-  from. `vendor/SOURCE` records the review.
+- The `/opt/dsv41` environment (torch, FlashInfer with the sm100a/sm103a
+  prebuilt kernels and cubins, deep-gemm, Mooncake), this repository's SGLang
+  at `/opt/sglang/python`, and `/opt/sglang/recipes/deepseek-v41`.
+  `/opt/sglang/SOURCE_RECORD.json` records the commit.
+- The chart's helpers from `confidential/helpers/`: `wait-for-model`,
+  `fetch-model`, `sglang-pair` with `pair_diagnostics.py` and
+  `private_log_sink.py`, and `dcgm-exporter` with its counters.
+- The hardening of `confidential/helpers/`: `harden_http.py --variant pd`
+  (serving routes only, no docs, only the Python HTTP frontend, and startup
+  settings that log or dump request data refused), `harden_media.py` (inline
+  request media only) and `harden_dist.py` (internal listeners on loopback,
+  single node). Each script checks the SHA-256 of the files it patches, so a
+  change to any of them fails the build until the policy is reviewed again
+  (`confidential/helpers/CHANGES.md` records the reviews).
+- The baked launch plans of `../container/*.env` in `/opt/sglang/layouts/`.
 - uid 1001, `HOME=/tmp`, `/opt` read-only to the runtime user, no entrypoint.
 
 ## Chart contracts
@@ -47,18 +44,19 @@ one `sglang-pair` container, KV over NVLink (CUDA IPC) inside the pod. CUDA
 IPC needs the importing process to share the exporter's PID namespace and see
 its GPU, which separate containers or pods do not have under C8s. `sglang-pair`
 marks a worker ready only after its scheduler ranks write progress records, so
-the image's SGLang must carry `pair_progress` (this branch's base, #5); without
-it prefill comes up healthy and decode is never started.
+the image's SGLang must carry `pair_progress`; without it prefill comes up
+healthy and decode is never started. Because prefill and decode share one pod,
+`harden_dist.py` keeps the KV bootstrap server and the distributed stores on
+loopback.
 
 `check-image.sh` checks all of them without a GPU. It runs as uid 1001, with a
 read-only root filesystem and no network. It also checks the hardened route
-table and the source record.
+table, the media and listener policies, the FlashInfer kernels, the baked
+layouts and the source record.
 
 ## Tested and not tested
 
-- Engine: this branch's SGLang ran on the 4x B200 in the docker recipe
+- Engine: this repository's SGLang ran on the 4x B200 in the docker recipe
   (functional suite and realmix load).
-- The image itself has not booted on a GPU under the chart. The first staging
-  deploy is that test. confidential-inference#300 selects it in the 8-GPU B200
-  PD layer. Every worker argv of that layer parses with this branch's
-  `ServerArgs`.
+- The hardened engine image has not booted on a GPU under the chart yet; the
+  first staging deploy is that test.

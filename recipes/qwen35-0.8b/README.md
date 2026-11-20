@@ -9,50 +9,39 @@ whole confidential-inference path here before they reach a production model.
 
 | File | What it is |
 | --- | --- |
-| `container/Dockerfile` | The image: the DeepSeek-V4.1 image's Python environment, this checkout's SGLang (HTTP server hardened to the serving routes, as confidential-inference's images are), and the chart's helpers |
-| `container/build.sh` | Builds it from a clean checkout, tagged by commit |
-| `container/serve.sh` | Entrypoint for `docker run`: fetch the model, or verify it and serve |
+| `container/serve.sh` | `docker run` helper: fetch the model, or verify it and serve (the chart's argv) |
 | `container/model-manifest.json` | Byte manifest of the pinned revision (`fetch-model manifest` output) |
-| `container/vendor/` | `wait-for-model`, `fetch-model` and the DCGM counters, copied from confidential-inference (`vendor/SOURCE`) |
 | `chart-values.yaml` | confidential-inference values layer for this model on one GPU |
 
 ## Image
 
-Published as `ghcr.io/confidential-dot-ai/sglang-qwen35-0.8b`, tagged with the
-first 12 characters of the source commit. `/opt/sglang/SOURCE_RECORD.json` in
-the image records the commit.
-
-The base is `ghcr.io/confidential-dot-ai/dsv41-pd` by digest, the environment
-(`recipes/deepseek-v41/container/requirements.lock`) tested on upstream
-314bce7. Its layers are shared, so this image adds only a few hundred MB on
-GHCR. The image replaces the base's SGLang source with this checkout and
-drops the V4.1 recipe.
-
-The image meets the chart's aggregated-worker contract: `wait-for-model`,
-`fetch-model` and `dcgm-exporter` in `/usr/local/bin`, `python3` with SGLang on
-`PATH`, user 1001 and `HOME=/tmp`.
-
-```sh
-recipes/qwen35-0.8b/container/build.sh                # sglang-qwen35-0.8b:<commit>
-IMAGE=ghcr.io/confidential-dot-ai/sglang-qwen35-0.8b \
-  recipes/qwen35-0.8b/container/build.sh
-```
+This recipe runs on the one engine image,
+`ghcr.io/confidential-dot-ai/confidential-sglang/engine`, built per `main`
+commit by CI from `confidential/engine/` (see its README and
+`docs/confidential-changes.md`). Pin it by digest from the release record
+`images-<commit>`. The image holds this repository's SGLang (HTTP, media and
+listener hardening applied), both recipes under `/opt/sglang/recipes`, and the
+chart's helpers (`confidential/helpers/`): `wait-for-model`, `fetch-model` and
+`dcgm-exporter` in `/usr/local/bin`, `python3` with SGLang on `PATH`, user 1001
+and `HOME=/tmp`. It has no entrypoint; the chart sets every command.
+`confidential/engine/check-image.sh IMAGE` checks those contracts without a GPU.
 
 ## Run with Docker
 
 ```sh
-img=ghcr.io/confidential-dot-ai/sglang-qwen35-0.8b:<tag>
+img=ghcr.io/confidential-dot-ai/confidential-sglang/engine@sha256:<digest>
+serve=/opt/sglang/recipes/qwen35-0.8b/container/serve.sh
 mkdir -p /data/models/qwen35-0.8b
 # Download the pinned revision; every file is checked against the manifest.
-docker run --rm --user 0 -v /data/models/qwen35-0.8b:/models/qwen35-0.8b "$img" fetch
+docker run --rm --user 0 -v /data/models/qwen35-0.8b:/models/qwen35-0.8b "$img" "$serve" fetch
 # Verify every byte again, then serve on one GPU.
 docker run -d --name qwen35 --gpus device=0 --shm-size 8g -p 30000:30000 \
-  -v /data/models/qwen35-0.8b:/models/qwen35-0.8b:ro "$img"
+  -v /data/models/qwen35-0.8b:/models/qwen35-0.8b:ro "$img" "$serve" serve
 curl -s localhost:30000/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model":"Qwen/Qwen3.5-0.8B","messages":[{"role":"user","content":"Say hi"}],"max_tokens":64}'
 ```
 
-`docker run "$img" args` prints the `sglang.launch_server` argv. Extra
+`docker run "$img" "$serve" args` prints the `sglang.launch_server` argv. Extra
 arguments after `serve` are appended to it. `GPU_METRICS_PORT=29000` also
 starts the DCGM exporter, as the chart does.
 
@@ -67,7 +56,7 @@ helm template confidential-inference helm/confidential-inference \
   --values deployment-values.yaml
 ```
 
-The deployment values add `images.sglangWorker` (this image, by digest) and
+The deployment values add `images.sglangWorker` (the engine image, by digest) and
 the model source. That is either a C8s model volume with this revision
 (`inference.model.c8sVolumeSource`, `volumeNames`) or the plain cache
 (`inference.model.cache.enabled`, with `container/model-manifest.json` as
@@ -86,7 +75,7 @@ Change the revision and the hashes in `serve.sh` and `chart-values.yaml`, and
 regenerate the manifest:
 
 ```sh
-python3 recipes/qwen35-0.8b/container/vendor/fetch_model.py manifest \
+python3 confidential/helpers/fetch_model.py manifest \
   --repository Qwen/Qwen3.5-0.8B --revision <sha> > recipes/qwen35-0.8b/container/model-manifest.json
 sha256sum recipes/qwen35-0.8b/container/model-manifest.json
 ```
