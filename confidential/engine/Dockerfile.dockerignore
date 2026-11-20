@@ -1,0 +1,13 @@
+# Allowlist: only what confidential/engine/Dockerfile reads.
+*
+!python
+!recipes/deepseek-v41
+!recipes/qwen35-0.8b
+!sgl-model-gateway
+!confidential
+sgl-model-gateway/target
+sgl-model-gateway/bindings/python/dist
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+python/sglang/_version.py

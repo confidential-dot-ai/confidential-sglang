@@ -162,6 +162,62 @@ def tool(script, *argv, env_key=True, timeout=120, nofile=None):
                           env=env, timeout=timeout, cwd=HERE, preexec_fn=limit if nofile else None)
 
 
+class ProfileTest(unittest.TestCase):
+    """--profile picks per-deployment defaults; explicit options still win (no server)."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, HERE)
+        import cluster_stress
+
+        cls.cs = cluster_stress
+
+    def argv(self, *extra):
+        return ["--url", "http://127.0.0.1:1", "--model", "m", *extra]
+
+    def test_no_profile_keeps_the_tools_defaults(self):
+        args = self.cs.parse_args(self.argv())
+        self.assertIsNone(args.profile)
+        self.assertEqual(args.phases, ",".join(self.cs.PHASES))
+        self.assertEqual((args.context_length, args.sessions, args.soak_minutes), (131072, 32, 60))
+        self.assertEqual((args.known_failures, args.needles_args), ("", ""))
+
+    def test_qwen_short_fits_the_qwen_context_and_is_short(self):
+        args = self.cs.parse_args(self.argv("--profile", "qwen-short"))
+        self.assertEqual(args.phases.split(","), ["func", "needles", "overload", "soak"])
+        self.assertEqual(args.context_length, 262144)
+        self.assertLessEqual(args.soak_minutes, 10)
+        needles = self.cs.phase_argv("needles", args, "/tmp/n.json")
+        sizes = [int(x) for x in needles[needles.index("--sizes") + 1].split(",")]
+        self.assertLessEqual(max(sizes), args.context_length - 16384)
+        self.assertEqual(needles[needles.index("--tokens-per-sentence") + 1], "0")
+        func = self.cs.phase_argv("func", args, "/tmp/f.json")
+        self.assertEqual(func[func.index("--context-length") + 1], "262144")
+        self.assertIn("t_logprobs_rejected", func[func.index("--known-failures") + 1])
+        overload = self.cs.phase_argv("overload", args, "/tmp/o.json")
+        levels = overload[overload.index("--levels") + 1]
+        self.assertEqual(max(int(x) for x in levels.split(",")), 128)
+        soak = self.cs.phase_argv("soak", args, "/tmp/s.json")
+        self.assertEqual(soak[soak.index("--minutes") + 1], "5")
+
+    def test_dsv41_full_is_the_pd_operating_point(self):
+        args = self.cs.parse_args(self.argv("--profile", "dsv41-full"))
+        self.assertEqual(args.phases, ",".join(self.cs.PHASES))
+        self.assertEqual((args.context_length, args.sessions), (131072, 32))
+        self.assertEqual((args.known_failures, args.unsupported_params), ("t_n2", "min_p"))
+        self.assertEqual(args.soak_minutes, 240)
+
+    def test_explicit_options_override_the_profile(self):
+        args = self.cs.parse_args(self.argv("--profile", "qwen-short", "--soak-minutes", "1",
+                                            "--phases", "func", "--needles-args", "--sizes 2000"))
+        self.assertEqual((args.soak_minutes, args.phases, args.needles_args), (1.0, "func", "--sizes 2000"))
+        self.assertEqual(args.context_length, 262144)
+
+    def test_unknown_profile_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self.cs.parse_args(self.argv("--profile", "nope"))
+
+
 @unittest.skipIf(web is None, "needs aiohttp")
 class ClusterStressTest(unittest.TestCase):
     @classmethod
@@ -364,6 +420,19 @@ class ClusterStressTest(unittest.TestCase):
         for name in os.listdir(out):
             with open(os.path.join(out, name)) as f:
                 self.assertNotIn(KEY, f.read(), name)
+
+    def test_qwen_short_profile_runs_against_the_gateway(self):
+        out = self.out("qwen")
+        r = tool("cluster_stress.py", "--profile", "qwen-short", "--url", self.url, "--out-dir", out,
+                 "--phases", "needles,overload,soak", "--soak-minutes", "0.05", "--sessions", "4",
+                 "--unsupported-params", "min_p",  # the fake gateway refuses min_p
+                 "--needles-args", "--sizes 2000 --seeds 1 --tokens-per-sentence 0",
+                 "--overload-args", "--levels 8 --step-s 1 --burst 10", timeout=300)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr)
+        with open(os.path.join(out, "report.json")) as f:
+            rep = json.load(f)
+        self.assertEqual(rep["profile"], "qwen-short")
+        self.assertEqual([x["status"] for x in rep["results"]], ["pass", "pass", "pass"])
 
 
 if __name__ == "__main__":

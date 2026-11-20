@@ -19,6 +19,23 @@ pub fn is_retryable_status(status: StatusCode) -> bool {
     )
 }
 
+/// Whether a worker's answer counts against the worker's circuit breaker.
+///
+/// A 4xx is the worker correctly refusing a bad request (a prompt longer than
+/// the context, invalid parameters): the worker is healthy. Counting it as a
+/// failure let a few bad requests from one client open the circuit of every
+/// worker, and the router then answered 503 to all clients. 408 and 429 still
+/// count: they mean the worker is slow or full.
+pub fn is_worker_fault(status: StatusCode) -> bool {
+    if status.is_success() {
+        return false;
+    }
+    if status.is_client_error() {
+        return matches!(status, StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS);
+    }
+    true
+}
+
 /// Computes exponential backoff with optional jitter.
 #[derive(Debug, Clone)]
 pub struct BackoffCalculator;
@@ -138,6 +155,19 @@ mod tests {
     use axum::{http::StatusCode, response::IntoResponse};
 
     use super::*;
+
+    #[test]
+    fn a_client_error_is_not_a_worker_fault() {
+        for code in [400, 401, 403, 404, 413, 422] {
+            assert!(!is_worker_fault(StatusCode::from_u16(code).unwrap()), "{code}");
+        }
+        for code in [200, 201, 204] {
+            assert!(!is_worker_fault(StatusCode::from_u16(code).unwrap()), "{code}");
+        }
+        for code in [408, 429, 500, 502, 503, 504] {
+            assert!(is_worker_fault(StatusCode::from_u16(code).unwrap()), "{code}");
+        }
+    }
 
     fn base_retry_config() -> RetryConfig {
         RetryConfig {

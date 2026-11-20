@@ -1,0 +1,15 @@
+# FlashInfer's prebuilt kernels for flashinfer-python 0.7.3 (CUDA 13.0). They
+# are not on PyPI: the URLs are the GitHub release assets that
+# https://flashinfer.ai/whl/cu130 and https://flashinfer.ai/whl index, and the
+# hashes are the ones those indexes publish. flashinfer-jit-cache is only an
+# index package; the .so files are in the per-architecture providers
+# (sm100a = B200, sm103a = B300). flashinfer-cubin ships the trtllm-gen cubins
+# FlashInfer otherwise downloads from NVIDIA on first use.
+flashinfer-cubin @ https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.3/flashinfer_cubin-0.7.3-py3-none-any.whl \
+    --hash=sha256:115b96065fa2dcc1674c74fcb0544ec2890a6fa4a8519b2251d1f6ab3d780093
+flashinfer-jit-cache @ https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.3/flashinfer_jit_cache-0.7.3+cu130-cp39-abi3-manylinux_2_28_x86_64.whl \
+    --hash=sha256:567dc9a3fa1bc0f9856fbd7e2550ce3e4b169a69ca2accb6c6e0a45648c61c6c
+flashinfer-jit-cache-sm100a @ https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.3/flashinfer_jit_cache_sm100a-0.7.3+cu130-cp39-abi3-manylinux_2_28_x86_64.whl \
+    --hash=sha256:1d73108ed8b84856ffb9f6e1b0740178d54d606900a196f291cae2bf670d60cd
+flashinfer-jit-cache-sm103a @ https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.3/flashinfer_jit_cache_sm103a-0.7.3+cu130-cp39-abi3-manylinux_2_28_x86_64.whl \
+    --hash=sha256:78eb17c7c7bd379f69e8e811ccf9464c96b11b9f2956fa17d91ca7cda593bb9c

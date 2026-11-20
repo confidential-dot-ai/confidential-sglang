@@ -22,6 +22,17 @@ STRESS_API_KEY) and is never written anywhere.
 
 Extra options for one phase go in --func-args, --needles-args, --load-args,
 --overload-args, --soak-args and --fault-args (one shell-quoted string each).
+
+--profile sets the defaults for one kind of deployment (PROFILES); any option
+given on the command line still wins:
+
+  qwen-short   1-GPU Qwen3.5-0.8B staging worker, ~15 minutes: func (needles up
+               to 262144 - 8192 tokens), needles to 240K, overload at 16-128
+               clients, a 5-minute soak. No load or fault phase.
+  dsv41-full   DeepSeek-V4.1 PD: every phase, 131072 context, n=2 and min_p
+               known to fail on PD with DSpark, a 4-hour soak.
+
+Without --profile the defaults are the tools' own (the 2026-11-16 4x B200 run).
 """
 
 from __future__ import annotations
@@ -39,6 +50,37 @@ import prom_metrics
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PHASES = ("func", "needles", "load", "overload", "soak", "fault")
+
+# Per-deployment defaults (argparse dests). Explicit options override them.
+PROFILES = {
+    # Qwen3.5-0.8B on one GPU (recipes/qwen35-0.8b): aggregated, no speculative
+    # decoding, so logprobs are served (t_logprobs_rejected expects a 4xx only
+    # under DSpark) and n=2 works. Needles stay inside the 262144-token context
+    # with room for the answer and the chat template: func's largest needle is
+    # context - 8192, the needles phase stops at 240000 and calibrates on the
+    # served tokenizer. The realmix load phase is a DeepSeek-V4.1 dataset, so it
+    # is left out.
+    "qwen-short": {
+        "phases": "func,needles,overload,soak",
+        "context_length": 262144,
+        "sessions": 8,
+        "known_failures": "t_logprobs_rejected",
+        "soak_minutes": 5,
+        "func_args": "--trials 4 --concurrency 8",
+        "needles_args": "--sizes 16000,64000,128000,192000,240000 --tokens-per-sentence 0",
+        "overload_args": "--levels 16,32,64,128 --step-s 30 --burst 500 --recover-s 120",
+        "soak_args": "--max-prompt-tokens 48000",
+    },
+    # DeepSeek-V4.1 PD with DSpark (CLUSTER-STRESS.md "Choices to make").
+    "dsv41-full": {
+        "phases": ",".join(PHASES),
+        "context_length": 131072,
+        "sessions": 32,
+        "known_failures": "t_n2",
+        "unsupported_params": "min_p",
+        "soak_minutes": 240,
+    },
+}
 
 
 def endpoint_argv(args):
@@ -162,7 +204,8 @@ def report_md(args, results):
     lines = [
         f"# Cluster stress: {args.url}",
         "",
-        f"Model `{args.model}`, context {args.context_length}, {args.sessions} sessions; "
+        f"Model `{args.model}`, context {args.context_length}, {args.sessions} sessions, "
+        f"profile {getattr(args, 'profile', None) or 'none'}; "
         f"started {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(args.started))}.",
         "",
         "| Phase | Result | Key numbers |",
@@ -176,8 +219,10 @@ def report_md(args, results):
     return "\n".join(lines) + "\n"
 
 
-def parser():
+def parser(profile=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("--profile", choices=sorted(PROFILES), default=None,
+                   help="defaults for one kind of deployment (see the module docstring)")
     endpoint.add_endpoint_args(p)
     p.add_argument("--phases", default=",".join(PHASES))
     p.add_argument("--out-dir", default="")
@@ -206,11 +251,21 @@ def parser():
     p.add_argument("--metrics-router", default="", help="router metrics base URL (direct)")
     for name in PHASES:
         p.add_argument(f"--{name}-args", default="", help=f"extra options for the {name} phase")
+    if profile:
+        p.set_defaults(**PROFILES[profile])
     return p
 
 
+def parse_args(argv=None):
+    """Parse twice: --profile first, then everything with that profile's defaults."""
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--profile", choices=sorted(PROFILES), default=None)
+    known, _ = pre.parse_known_args(argv)
+    return parser(known.profile).parse_args(argv)
+
+
 def main(argv=None):
-    args = parser().parse_args(argv)
+    args = parse_args(argv)
     args.started = time.time()
     phases = [x for x in args.phases.split(",") if x]
     bad = [x for x in phases if x not in PHASES]
@@ -231,7 +286,8 @@ def main(argv=None):
         if args.stop_on_fail and results[-1]["status"] in ("fail", "error"):
             break
     passed = all(r["status"] in ("pass", "skipped") for r in results)
-    meta = {"endpoint": endpoint.describe(args), "started": args.started, "phases": phases, "passed": passed}
+    meta = {"endpoint": endpoint.describe(args), "profile": args.profile, "started": args.started,
+            "phases": phases, "passed": passed}
     with open(os.path.join(args.out_dir, "report.json"), "w") as f:
         json.dump({**meta, "results": results}, f, indent=1)
     md = report_md(args, results)

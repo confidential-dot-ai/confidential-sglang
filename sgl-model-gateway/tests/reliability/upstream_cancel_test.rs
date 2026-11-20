@@ -2787,4 +2787,136 @@ mod upstream_cancel_tests {
 
         ctx.shutdown().await;
     }
+
+    /// Regular (non-PD) router: a worker's 4xx is the worker correctly
+    /// refusing a bad request, not a worker fault, for non-streaming and
+    /// streaming requests. Counted as a failure, a few refused requests
+    /// could open the breaker of every worker, and the router then refused
+    /// all requests until the breakers closed.
+    #[tokio::test]
+    async fn test_http_chat_4xx_does_not_penalise_breaker() {
+        for (worker_port, router_port, stream) in [(20340, 4340, false), (20341, 4341, true)] {
+            set_fail_status_code(worker_port, 400);
+            let mut worker_config = TestWorkerConfig::healthy(worker_port);
+            worker_config.fail_rate = 1.0;
+            let ctx = AppTestContext::new_with_config(
+                TestRouterConfig::round_robin(router_port),
+                vec![worker_config],
+            )
+            .await;
+            let app = ctx.create_app().await;
+            let worker = pin_worker(&ctx, &format!("http://127.0.0.1:{}", worker_port));
+            let (_s_pre, f_pre) = breaker_counts(&worker);
+
+            for _ in 0..5 {
+                let payload = json!({
+                    "model": "mock-model",
+                    "messages": [{"role": "user", "content": "x"}],
+                    "stream": stream
+                });
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                    .unwrap();
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "stream={stream}");
+                let _ = resp.into_body().collect().await;
+            }
+
+            let (_s_post, f_post) = breaker_counts(&worker);
+            assert_eq!(
+                f_post - f_pre,
+                0,
+                "stream={stream}: a 4xx is a client fault; the breaker must not record a failure"
+            );
+            assert!(worker.is_available(), "stream={stream}: the worker must stay available");
+            clear_fail_status_code(worker_port);
+            ctx.shutdown().await;
+        }
+    }
+
+    /// PD mode: a 4xx from the prefill or the decode worker (a bad request,
+    /// correctly refused) must not tick either breaker, for streaming and
+    /// non-streaming requests, on /generate and on /v1/chat/completions.
+    /// Production runs PD; this pins the rule the regular router got in
+    /// `test_http_chat_4xx_does_not_penalise_breaker`.
+    #[tokio::test]
+    async fn test_pd_4xx_never_penalises_breakers() {
+        let mut port = 20342u16;
+        for failing in ["prefill", "decode"] {
+            for stream in [false, true] {
+                for chat in [false, true] {
+                    let (prefill_port, decode_port, router_port) = (port, port + 1, port - 16000);
+                    port += 2;
+                    let failing_port = if failing == "prefill" { prefill_port } else { decode_port };
+                    set_fail_status_code(failing_port, 400);
+                    let config = RouterConfig::builder()
+                        .prefill_decode_mode(
+                            vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
+                            vec![format!("http://127.0.0.1:{}", decode_port)],
+                        )
+                        .round_robin_policy()
+                        .host("127.0.0.1")
+                        .port(router_port)
+                        .max_payload_size(256 * 1024 * 1024)
+                        .request_timeout_secs(600)
+                        .worker_startup_timeout_secs(5)
+                        .worker_startup_check_interval_secs(1)
+                        .max_concurrent_requests(64)
+                        .queue_timeout_secs(60)
+                        .build_unchecked();
+                    let mut prefill_config = TestWorkerConfig::prefill(prefill_port);
+                    let mut decode_config = TestWorkerConfig::decode(decode_port);
+                    if failing == "prefill" {
+                        prefill_config.fail_rate = 1.0;
+                    } else {
+                        decode_config.fail_rate = 1.0;
+                    }
+                    let ctx =
+                        AppTestContext::new_with_config(config, vec![prefill_config, decode_config])
+                            .await;
+                    let app = ctx.create_app().await;
+                    let prefill = pin_worker(&ctx, &format!("http://127.0.0.1:{}", prefill_port));
+                    let decode = pin_worker(&ctx, &format!("http://127.0.0.1:{}", decode_port));
+                    let (_sp, f_pre_p) = breaker_counts(&prefill);
+                    let (_sd, f_pre_d) = breaker_counts(&decode);
+
+                    let label = format!("failing={failing} stream={stream} chat={chat}");
+                    for _ in 0..5 {
+                        let (uri, payload) = if chat {
+                            ("/v1/chat/completions", json!({
+                                "model": "mock-model",
+                                "messages": [{"role": "user", "content": "x"}],
+                                "stream": stream
+                            }))
+                        } else {
+                            ("/generate", json!({ "text": "x", "stream": stream }))
+                        };
+                        let req = Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                            .unwrap();
+                        let resp = app.clone().oneshot(req).await.unwrap();
+                        assert!(resp.status().is_client_error(), "{label}: got {}", resp.status());
+                        let _ = resp.into_body().collect().await;
+                    }
+
+                    let (_sp2, f_post_p) = breaker_counts(&prefill);
+                    let (_sd2, f_post_d) = breaker_counts(&decode);
+                    assert_eq!(
+                        (f_post_p - f_pre_p, f_post_d - f_pre_d),
+                        (0, 0),
+                        "{label}: a 4xx is a client fault; neither breaker may record a failure"
+                    );
+                    assert!(prefill.is_available() && decode.is_available(), "{label}");
+                    clear_fail_status_code(failing_port);
+                    ctx.shutdown().await;
+                }
+            }
+        }
+    }
 }

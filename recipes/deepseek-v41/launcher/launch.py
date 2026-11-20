@@ -21,7 +21,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-# A container image has no .git; recipes/deepseek-v41/container/build.sh writes this.
+# A container image has no .git; confidential/engine/Dockerfile writes this.
 SOURCE_RECORD = ROOT / "SOURCE_RECORD.json"
 GIB = 1024**3
 # The prefill graph cap the server applies when none is given (deepseek_v4_hook.py).
@@ -458,6 +458,18 @@ def parser():
     p.add_argument("--host-reserve-gib", type=float, default=32)
     p.add_argument("--startup-timeout", type=int, default=18000)
     p.add_argument("--output-dir", type=Path, default=Path("/tmp/dsv41-pd"))
+    p.add_argument(
+        "--install-root",
+        type=Path,
+        help="Checkout root the plan's workers import SGLang from (PYTHONPATH "
+        "<root>/python); default this launcher's own checkout. Set it to plan for "
+        "another filesystem, e.g. /opt/sglang inside the engine image",
+    )
+    p.add_argument(
+        "--source-revision",
+        help="Commit recorded as the plan's revision instead of SOURCE_RECORD.json "
+        "or git HEAD (a build without .git)",
+    )
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--preflight-only", action="store_true")
@@ -874,6 +886,11 @@ def without_speculative_args(command):
     return out
 
 
+def install_root(args):
+    """The checkout root the workers run from: --install-root or this one."""
+    return getattr(args, "install_root", None) or ROOT
+
+
 def source_record():
     """HEAD and `git status --porcelain` of the tree this launcher runs from."""
     if SOURCE_RECORD.exists():
@@ -898,9 +915,9 @@ SERVER_KEEP_ALIVE_S = 300
 
 def build_plan(args):
     gpus, _ = validate(args)
-    revision = source_record()["revision"]
+    revision = getattr(args, "source_revision", None) or source_record()["revision"]
     common_env = {
-        "PYTHONPATH": str(ROOT / "python"),
+        "PYTHONPATH": str(install_root(args) / "python"),
         "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1",
         "SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN": "1",
         "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": args.host_layout,
@@ -1249,7 +1266,7 @@ def build_router(args, workers):
         decode_args += ["--decode", worker["url"]]
     return dict(
         name="router",
-        env={"PYTHONPATH": str(ROOT / "python")},
+        env={"PYTHONPATH": str(install_root(args) / "python")},
         url=f"http://127.0.0.1:{args.port}",
         command=[
             args.python,
