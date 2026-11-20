@@ -196,9 +196,9 @@ RUN --mount=type=bind,source=confidential/simulator,target=/run-src/simulator,re
 # The launch plan of every DeepSeek-V4.1 layout, with container paths
 # (confidential/layouts/README.md). The planner is the launcher's --dry-run:
 # standard library only, no GPU.
-RUN --mount=type=bind,source=confidential/layouts,target=/run-src/layouts,readonly \
+RUN --mount=type=bind,source=confidential/layouts,target=/run-src/confidential/layouts,readonly \
     --mount=type=bind,source=recipes/deepseek-v41,target=/run-src/recipes/deepseek-v41,readonly \
-    python -I -B /run-src/layouts/build_layouts.py --out /opt/sglang/layouts \
+    python -I -B /run-src/confidential/layouts/build_layouts.py --out /opt/sglang/layouts \
     && python -I -B -c 'import json, pathlib; ps = sorted(pathlib.Path("/opt/sglang/layouts").glob("*.json")); assert ps; [json.loads(p.read_text()) for p in ps]; print(*[p.name for p in ps])'
 
 # The source record launch.py reads (it has no .git), and the build's labels.

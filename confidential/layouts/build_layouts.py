@@ -225,6 +225,8 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     revision = revision_of(args.revision)
     names = args.layout or layouts()
+    if not names:
+        raise SystemExit(f"no layouts: no *.env under {ENV_DIR}")
     args.out.mkdir(parents=True, exist_ok=True)
     for name in names:
         text = render(build_one(name, revision))
