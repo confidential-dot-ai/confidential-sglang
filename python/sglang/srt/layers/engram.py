@@ -759,7 +759,12 @@ class _HostTable:
             group.barrier()
         err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
         if int(err) != 0:
-            raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+            raise RuntimeError(
+                f"Engram cudaHostRegister({nbytes} bytes) failed: "
+                f"CUDA error {int(err)} ({err}). The host table requires "
+                "GPU-accessible CPU memory. Check host-registration support "
+                "on this GPU and in the active confidential-computing mode."
+            )
         self.device_ptr = _registered_device_ptr(self.bytes.data_ptr())
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
@@ -1120,10 +1125,19 @@ class EngramEmbedding(nn.Module):
         self._sort_host_reads = False
         self.staged_by_scheduler = False
         self.peer: Optional[_PeerShards] = None
+        self.staged_table = None
         config = resolve_engram_config(len(column_bounds) - 1)
         self.lookup = config.lookup
         self._cols_per_rank = cols_per_rank(len(column_bounds) - 1, self.tp_size)
-        if config.lookup == EngramLookup.PEER_READ and self.tp_size > 1:
+        if envs.SGLANG_DSV41_ENGRAM_CPU_STAGING.get():
+            from sglang.srt.layers.engram_cpu_staging import StagedEngramTable
+
+            self.staged_table = StagedEngramTable(
+                get_model().model_path, layer_id, num_embeddings, dim, fp4=mxfp4
+            )
+            self.weight = nn.Parameter(self.staged_table.weight, requires_grad=False)
+            self.scale = nn.Parameter(self.staged_table.scale, requires_grad=False)
+        elif config.lookup == EngramLookup.PEER_READ and self.tp_size > 1:
             self.peer = _PeerShards(
                 self.rows, dim, get_parallel().tp_group, mxfp4=mxfp4
             )
@@ -1190,6 +1204,11 @@ class EngramEmbedding(nn.Module):
         return self._host_table_ptrs
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        if self.staged_table is not None:
+            if param.shape != loaded_weight.shape or param.dtype != loaded_weight.dtype:
+                raise ValueError("Staged Engram checkpoint shape/dtype mismatch")
+            # Already mapped directly from the configured immutable checkpoint.
+            return
         rows = slice(self.row_start, self.row_start + self.rows)
         dst = param.data[rows] if self._shared else param.data
         src = loaded_weight[rows]
@@ -1219,6 +1238,8 @@ class EngramEmbedding(nn.Module):
         *,
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
+        if self.staged_table is not None:
+            return self.staged_table.lookup(indices)
         if self.peer is not None:
             assert self.peer.ready, "engram peer shards are mapped in finish_load"
             # Every shard is mapped here: read this rank's own tokens only, which

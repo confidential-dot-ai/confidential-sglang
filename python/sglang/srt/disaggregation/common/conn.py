@@ -46,6 +46,7 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    ced_target_state_wire,
     check_stage_state_wires,
     check_state_wire,
     filter_kv_indices_for_cp_rank,
@@ -1397,6 +1398,10 @@ class CommonKVManager(BaseKVManager):
         """Refuse a prefill whose state entries cannot pair with this server's:
         its own stage when the stage counts match, else every prefill stage."""
         decode_wire = state_wire(self.kv_args)
+        if (getattr(self, "dsv41_spec_layout", None) or {}).get("ced_split"):
+            # The encoder-only prefill sends no DSpark draft state; decode
+            # seeds its own in the tail replay.
+            decode_wire = ced_target_state_wire(decode_wire)
         if info.state_wire is not None or not info.state_wires:
             check_state_wire(info.state_wire, decode_wire)
             return
@@ -1501,7 +1506,10 @@ class CommonKVManager(BaseKVManager):
                     "enable DSpark with the same block size and target/draft KV "
                     "layout. Upgrade both servers together."
                 )
-
+            # A CED-split prefill runs no DSpark; its latent KV fans out to any
+            # decode TP size like other MLA KV.
+            ced_split = (local_layout or {}).get("ced_split", False)
+            prefill_tail = (local_layout or {}).get("prefill_tail", False)
             decode_tp_size_aligns_prefill_world_size = (
                 info.attn_cp_size > 1
                 and (self.is_mla_backend or self.is_hybrid_mla_backend)
@@ -1509,7 +1517,8 @@ class CommonKVManager(BaseKVManager):
                 and info.attn_tp_size * info.attn_cp_size == self.attn_tp_size
             )
             if (
-                info.attn_tp_size != self.attn_tp_size
+                not (ced_split or prefill_tail)
+                and info.attn_tp_size != self.attn_tp_size
                 and not decode_tp_size_aligns_prefill_world_size
             ):
                 raise RuntimeError(
@@ -3295,6 +3304,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         spec_kv_layout = data.get("spec_kv_layout")
 
         if self._registered_count and self.dsv41_spec_layout != dsv41_spec_layout:
+            logger.error(
+                "DSV41 PP layout mismatch: registered=%s incoming=%s",
+                self.dsv41_spec_layout,
+                dsv41_spec_layout,
+            )
             return web.Response(
                 text="DeepSeek-V4.1 DSpark PD layout differs across prefill ranks",
                 status=400,

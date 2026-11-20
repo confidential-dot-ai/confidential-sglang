@@ -345,14 +345,20 @@ def validate_decode_radix_cache(
             "device-resident cache and is incompatible with "
             "--enable-hierarchical-cache."
         )
-    # DeepSeek-V4 qualifies only on the unified KV layout (bf16 or fp8 rows): its
-    # SWA ring and c128 state are request-scoped and always transferred whole, so
-    # the tree shares only the compressed full-attention pages.
-    if getattr(model_config, "is_compressed_kv_arch", False) and not getattr(
-        token_to_kv_pool, "_unified_kv", False
+    # DeepSeek-V4: the tree shares the compressed full-attention pages (c4/c128
+    # KV and the indexer rows, all addressed by full page id, so a page-aligned
+    # prefix holds whole compression groups); the c128 state is request-scoped
+    # and always transferred whole. The unified layout keeps SWA in a request
+    # ring; the paged layout's SWA is a component pool the tree retains like any
+    # SWA model's, with the window transferred fresh. ROCm runs only the
+    # unified layout.
+    if (
+        getattr(model_config, "is_compressed_kv_arch", False)
+        and not getattr(token_to_kv_pool, "_unified_kv", False)
+        and is_hip()
     ):
         raise ValueError(
-            "--disaggregation-decode-enable-radix-cache with DeepSeek-V4 "
+            "--disaggregation-decode-enable-radix-cache with DeepSeek-V4 on ROCm "
             "requires the unified KV layout "
             "(SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton)."
         )
@@ -403,10 +409,20 @@ def build_kv_cache(
         )
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
+    retained_window = sliding_window_size
+    if retained_window is not None:
+        from sglang.srt.disaggregation.utils import disagg_swa_transfer_window
+
+        # Ours: under the CED split, decode replays the prompt from its tail start
+        # and those rows' encoder layers read one more window, so both PD sides keep
+        # and hand over 2 * window + page (unchanged without the split).
+        retained_window = disagg_swa_transfer_window(
+            retained_window, token_to_kv_pool_allocator.page_size
+        )
     # The tail a running request keeps of each window, which the prefix tree,
     # PD peers and admission read from the storage alone.
     kv_storage_of(req_to_token_pool, token_to_kv_pool_allocator).bind_window_retention(
-        sliding_window_size, draft_window_reaches
+        retained_window, draft_window_reaches
     )
     mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
     # SWA the tree does not own must not gate prefix matching: a per-request ring,

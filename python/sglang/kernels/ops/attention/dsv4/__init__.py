@@ -8,6 +8,7 @@ from .attn import (
 from .compress import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
+    compress_c4_norm_rope_store_fp4,
     compress_forward,
     compress_norm_rope_store,
 )
@@ -21,6 +22,8 @@ from .norm_rope import (
 )
 from .topk import (
     plan_topk_v2,
+    selection_page_indices,
+    sort_selection_,
     topk_transform_kpool_ragged_v2,
     topk_transform_kpool_v2,
     topk_transform_paged,
@@ -32,6 +35,7 @@ from .utils import make_name
 __all__ = [
     "CompressorDecodePlan",
     "CompressorPrefillPlan",
+    "compress_c4_norm_rope_store_fp4",
     "compress_forward",
     "compress_norm_rope_store",
     "fused_norm_rope_inplace",
@@ -49,4 +53,6 @@ __all__ = [
     "topk_transform_paged_v2",
     "topk_transform_ragged_v2",
     "plan_topk_v2",
+    "selection_page_indices",
+    "sort_selection_",
 ]

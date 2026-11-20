@@ -1979,7 +1979,12 @@ class ModelConfig:
                         )
                     with open(quant_config_file) as f:
                         quant_config_dict = json.load(f)
-                    quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+                    parsed_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+                    quant_cfg = (
+                        {**quant_config_dict.get("quantization", {}), **parsed_cfg}
+                        if parsed_cfg
+                        else parsed_cfg
+                    )
                 except huggingface_hub.errors.LocalEntryNotFoundError:
                     # Offline mode and file not in cache - this is normal for non-quantized models
                     logger.debug(
@@ -2003,7 +2008,12 @@ class ModelConfig:
                 )
                 with open(quant_config_file) as f:
                     quant_config_dict = json.load(f)
-                quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+                parsed_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+                quant_cfg = (
+                    {**quant_config_dict.get("quantization", {}), **parsed_cfg}
+                    if parsed_cfg
+                    else parsed_cfg
+                )
         return quant_cfg
 
     def _find_quant_modelslim_config(self):

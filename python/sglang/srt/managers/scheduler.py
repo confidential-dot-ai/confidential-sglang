@@ -92,6 +92,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation import role_switch
+from sglang.srt.disaggregation.ced_boundary import maybe_ced_boundary_layout
 from sglang.srt.disaggregation.checksum import KvChecksumComputer
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -1097,7 +1098,12 @@ class Scheduler(
             self.tp_worker = TpModelWorker(**worker_kwargs)
 
     def maybe_init_draft_worker(self):
-        if self.spec_algorithm.is_none():
+        # A DeepSeek-V4.1 prefill-side tail runs DSpark on the last PP stage only.
+        if self.spec_algorithm.is_none() or (
+            envs.SGLANG_OPT_DSV41_PREFILL_TAIL.get()
+            and self.server_args.disaggregation_mode == "prefill"
+            and get_parallel().pp_rank != get_parallel().pp_size - 1
+        ):
             self.draft_worker = None
             self.external_corpus_manager = None
             return
@@ -1313,6 +1319,15 @@ class Scheduler(
 
         self.tp_group = get_parallel().tp_group
         self.tp_cpu_group = self.tp_group.cpu_group
+        # Dedicated NCCL communicator for TP control-plane metadata broadcast
+        # (recv_reqs — checkpoint 098/gloo-vs-nccl-broadcast-bench.py), kept
+        # separate from tp_group.device_group so a control-plane ordering
+        # mismatch can never wedge the model's own forward-pass all_reduce.
+        self.tp_metadata_nccl_group = (
+            torch.distributed.new_group(ranks=self.tp_group.ranks, backend="nccl")
+            if self.tp_group.world_size > 1
+            else None
+        )
         self.attn_tp_group = get_parallel().attn_tp_group
         self.attn_tp_cpu_group = self.attn_tp_group.cpu_group
         self.attn_cp_group = get_parallel().attn_cp_group
@@ -1652,6 +1667,18 @@ class Scheduler(
             disagg_hidden_size = 16  # minimal padding size for RDMA
             disagg_hidden_states_dtype = torch.float32
 
+        # CED boundary handoff: decode, and the prefill stage that runs the last
+        # kv_source layer (the last pipeline stage), carry the window state.
+        ced_boundary_layout = maybe_ced_boundary_layout(
+            self.model_config.hf_text_config,
+            self.sliding_window_size,
+            holds_boundary=(
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                or self.pp_group is None
+                or self.pp_group.is_last_rank
+            ),
+        )
+
         # The PD metadata wire schema must match on P and D even when only D
         # enables spec decoding; a seedless prefill writes the invalid sentinel.
         output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
@@ -1676,6 +1703,7 @@ class Scheduler(
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
                 kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
+                ced_boundary_layout=ced_boundary_layout,
             )
 
             # The decode requests polling kv cache
@@ -1717,6 +1745,7 @@ class Scheduler(
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
                 kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
+                ced_boundary_layout=ced_boundary_layout,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
@@ -1747,6 +1776,11 @@ class Scheduler(
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
+        # Confidential-compute async D2H readback (set below once streams
+        # exist, only when overlap scheduling is actually enabled -- with no
+        # overlap there is no scheduler-thread stall to fix).
+        self.enable_cc_async_copy = False
+        self.d2h_worker = None
 
         # FutureMap is always-on: input_ids relay used in both modes.
         # Workers without the spec_v2_attn_backends override fall back to
@@ -1779,8 +1813,23 @@ class Scheduler(
                 self.draft_worker.get_confidence_budget_prepare()
             )
 
-        # If enable async D2H copy when overlap is enabled
-        # Currently used by NVIDIA Confidential Computing (CC) only
+        # Defer the blocking exact seq-lens mirror pull to the tick's first
+        # exact consumer (DSPARK draft plan / verify prep) so host prep
+        # overlaps the previous verify's GPU tail. DSPARK-only: those two
+        # consumers are the audited re-materialization points; the
+        # confidence-budget prepare reads the mirror right below the resolve
+        # call, so it keeps the eager pull.
+        self.future_map.defer_spec_cpu_seq_lens = (
+            needs_cpu_seq_lens
+            and self.enable_overlap
+            and self.spec_algorithm.is_dspark()
+            and self._confidence_budget_prepare is None
+            and not envs.SGLANG_OPT_DISABLE_SPEC_SEQ_LENS_DEFER.get()
+        )
+
+        # Upstream's async D2H copy (_copy_result_to_cpu) stays off: under
+        # confidential computing the readback goes through d2h_worker below
+        # (_issue_result_copy_to_cpu), which also offloads DSpark results.
         self.enable_async_d2h_copy = False
         self.async_d2h_worker = None
 
@@ -1806,21 +1855,51 @@ class Scheduler(
         if not self.enable_overlap:
             return
 
-        # Under NVIDIA Confidential Computing (CC) the per-step D2H result readback is
-        # forced synchronous and blocks the scheduler thread at issue, serializing the
-        # overlap pipeline. Offload it to a worker thread (AsyncD2HCopyWorker).
-        self.enable_async_d2h_copy = is_confidential_compute()
-        if self.enable_async_d2h_copy:
-            from sglang.srt.managers.async_d2h_copy_worker import AsyncD2HCopyWorker
-
-            self.async_d2h_worker = AsyncD2HCopyWorker(self.device_module)
-            logger.info(
-                "NVIDIA Confidential Computing (CC) detected: "
-                "using async D2H copy worker to preserve overlap scheduling."
-            )
-
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
+
+        # Under confidential computing the per-step D2H result readback is
+        # forced synchronous and blocks the scheduler thread at issue,
+        # serializing the overlap pipeline. Offload it to a worker thread
+        # (TRT-LLM #8463 pattern).
+        self.enable_cc_async_copy = is_confidential_compute()
+        if self.enable_cc_async_copy:
+            from sglang.srt.managers.overlap_copy_worker import AsyncD2HCopyWorker
+
+            self.d2h_worker = AsyncD2HCopyWorker(self.device_module, self.copy_stream)
+            logger.info(
+                "Confidential computing detected: offloading the per-step D2H "
+                "result readback to a worker thread to preserve overlap scheduling."
+            )
+
+    def _issue_result_copy_to_cpu(
+        self, result, copy_fn, non_cc_fallback=None, *, producer_stream=None
+    ):
+        """Issue the result's D2H readback.
+
+        Default path: run ``copy_fn`` (or ``non_cc_fallback`` if given, for
+        call sites with their own non-CC stream-overlap logic) inline. Under
+        confidential computing the copy blocks at issue, so instead record a
+        ``src_ready`` event on the producer (default: current) stream and hand the
+        still-blocking copy to the worker thread; the scheduler thread returns
+        immediately and keeps launching work. The deferred consume waits on
+        ``result.copy_ready_cpu`` instead of ``copy_done`` (see
+        ``SchedulerBatchResultProcessor._wait_result_copy``).
+        """
+        if self.enable_cc_async_copy:
+            src_ready = self.device_module.Event()
+            src_ready.record(stream=producer_stream)
+            result.copy_ready_cpu = self.d2h_worker.submit(src_ready, copy_fn)
+        elif non_cc_fallback is not None:
+            non_cc_fallback()
+        else:
+            copy_fn()
+
+    def _shutdown_d2h_worker(self):
+        """Stop the confidential-compute async D2H copy worker thread, if any."""
+        if getattr(self, "d2h_worker", None) is not None:
+            self.d2h_worker.shutdown()
+            self.d2h_worker = None
 
     def maybe_init_ngram_embedding(self):
         self.ngram_embedding_manager = (
@@ -2064,6 +2143,9 @@ class Scheduler(
             self.uocr_runtime.close()
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
+        from sglang.srt.utils.host_staging import clear_host_staging_pools
+
+        clear_host_staging_pools()
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
@@ -2661,6 +2743,7 @@ class Scheduler(
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,
             mm_receiver=self.mm_receiver,
+            tp_metadata_nccl_group=self.tp_metadata_nccl_group,
             server_args=self.server_args,
             model_config=self.model_config,
             max_recv_per_poll=self.max_recv_per_poll,
@@ -3442,7 +3525,13 @@ class Scheduler(
             return
 
         if self.spec_algorithm.is_dflash_family():
-            error_msg = validate_dflash_request(req, self.enable_overlap)
+            error_msg = validate_dflash_request(
+                req,
+                self.enable_overlap,
+                self.server_args.grammar_backend,
+                # DSpark masks the target verify logits with the request's grammar.
+                masks_grammar_in_verify=self.spec_algorithm.is_dspark(),
+            )
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
@@ -3855,13 +3944,19 @@ class Scheduler(
             return False
         return True
 
-    def _abort_unavailable(self, req: Req, *, message: str) -> None:
+    def _abort_unavailable(
+        self,
+        req: Req,
+        *,
+        message: str,
+        status_code: HTTPStatus = HTTPStatus.SERVICE_UNAVAILABLE,
+    ) -> None:
         self.request_retirer.abort(
             req,
-            reason=FINISH_ABORT(message, HTTPStatus.SERVICE_UNAVAILABLE),
+            reason=FINISH_ABORT(message, status_code),
             finished_reason={
                 "type": "abort",
-                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                "status_code": status_code,
                 "message": message,
             },
         )
@@ -3909,8 +4004,16 @@ class Scheduler(
                 if candidate_req.rid != recv_req.rid:
                     return False
 
-        # Reject the incoming request by default.
-        self._abort_unavailable(recv_req, message="The request queue is full.")
+        # Reject the incoming request by default. Queue-full is load shedding,
+        # so it answers 429: the provider API contract requires failed requests
+        # under overload to tell the client it is being rate limited, and a 503
+        # reads as "this server is broken" instead of "retry later". A request
+        # that lost a priority comparison above stays 503.
+        self._abort_unavailable(
+            recv_req,
+            message="The request queue is full.",
+            status_code=HTTPStatus.TOO_MANY_REQUESTS,
+        )
         return True
 
     def _poll_timeout_aborts(self) -> List[AbortReq]:
@@ -3931,7 +4034,7 @@ class Scheduler(
                             abort_message="Request waiting timeout reached.",
                             finished_reason={
                                 "type": "abort",
-                                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                                "status_code": HTTPStatus.TOO_MANY_REQUESTS,
                                 "message": "Request waiting timeout reached.",
                             },
                         )
@@ -4173,7 +4276,9 @@ class Scheduler(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
         self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
+            batch.req_pool_indices,
+            RelayPayload(bonus_tokens=last_tokens),
+            future_indices_cpu=batch.req_pool_indices_cpu,
         )
         batch.input_ids = None
 
@@ -5277,15 +5382,23 @@ class Scheduler(
 
                     with self._forward_isolation(batch, overlap=True):
                         future_indices = batch.req_pool_indices
+                        future_indices_cpu = batch.req_pool_indices_cpu
 
                         # Spec_v2 fires on_publish mid-worker (between verify and
                         # draft_extend) so schedule prep can overlap with draft_extend.
                         # Non-spec has no later work — scheduler publishes after return.
-                        fwd_kwargs = {}
+                        fwd_kwargs = (
+                            {
+                                "on_publish": partial(
+                                    self.future_map.publish,
+                                    future_indices,
+                                        future_indices_cpu=future_indices_cpu,
+                                )
+                            }
+                            if not batch.spec_algorithm.is_none()
+                            else {}
+                        )
                         if not batch.spec_algorithm.is_none():
-                            fwd_kwargs["on_publish"] = partial(
-                                self.future_map.publish, future_indices
-                            )
                             # Grammar-overlap-capable workers advance the grammar FSM
                             # inside verify() before building the bitmask; hand them the
                             # barrier that resolves the previous batch's committed
@@ -5304,7 +5417,11 @@ class Scheduler(
                         )
                         # Deferred decode graph I/O owns this step's relay.
                         if batch.spec_algorithm.is_none() and not input_ids_from_graph:
-                            self.future_map.publish(future_indices, batch.seq_lens + 1)
+                            self.future_map.publish(
+                                future_indices,
+                                batch.seq_lens + 1,
+                                future_indices_cpu=future_indices_cpu,
+                            )
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
                         # ring slot as the SB attr snapshot).
@@ -5325,17 +5442,43 @@ class Scheduler(
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(
-                                batch, future_indices, batch_result
+                                batch,
+                                future_indices,
+                                batch_result,
+                                future_indices_cpu=future_indices_cpu,
+                            )
+                            copy_fn = partial(
+                                batch_result.copy_to_cpu,
+                                return_logprob=batch.return_logprob,
+                                return_hidden_states=batch.return_hidden_states,
                             )
                             if _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
-                                # overlaps.
-                                batch_result.copy_to_cpu(
-                                    return_logprob=batch.return_logprob,
-                                    return_hidden_states=batch.return_hidden_states,
-                                )
+                                # overlaps. (Confidential compute is an NVIDIA-only
+                                # feature, so enable_cc_async_copy is always False
+                                # here -- this call is always the inline copy_fn.)
+                                self._issue_result_copy_to_cpu(batch_result, copy_fn)
                             else:
-                                self._copy_result_to_cpu(batch_result, batch)
+
+                                def _copy_on_stream():
+                                    # Result D2H on copy_stream overlaps the next
+                                    # forward instead of serializing on
+                                    # forward_stream; it's a leaf gated by
+                                    # copy_done, so nothing on forward_stream waits.
+                                    # Not used under confidential computing: the
+                                    # copy blocks the issuing thread at issue there
+                                    # regardless of which stream it's issued on, so
+                                    # the worker thread (below) issues copy_fn
+                                    # directly instead.
+                                    self.copy_stream.wait_stream(self.forward_stream)
+                                    with self.copy_stream_ctx:
+                                        copy_fn()
+
+                                self._issue_result_copy_to_cpu(
+                                    batch_result,
+                                    copy_fn,
+                                    non_cc_fallback=_copy_on_stream,
+                                )
                         else:
                             batch_result.future_indices = future_indices
 
@@ -5465,7 +5608,10 @@ class Scheduler(
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(
-                        batch, batch.req_pool_indices, batch_result
+                        batch,
+                        batch.req_pool_indices,
+                        batch_result,
+                        future_indices_cpu=batch.req_pool_indices_cpu,
                     )
                     batch.input_ids = None
                 self.update_cache_from_scheduler(batch, batch_result)
@@ -5529,7 +5675,7 @@ class Scheduler(
                             stream=self.forward_stream,
                             written_tokens=batch.out_cache_loc,
                         )
-                    ret.copy_to_cpu()
+                    self._issue_result_copy_to_cpu(ret, ret.copy_to_cpu)
             else:
                 self.resolve_forward_inputs(batch, self.future_map)
                 pooler_output, can_run_cuda_graph = (
@@ -5586,12 +5732,18 @@ class Scheduler(
         batch: ScheduleBatch,
         future_indices: torch.Tensor,
         batch_result: GenerationBatchResult,
+        *,
+        future_indices_cpu: Optional[torch.Tensor] = None,
     ) -> None:
         """Stash this iter's relay payload for next iter's resolve_forward_inputs."""
         if self.spec_algorithm.is_ngram():
             if batch_result.next_draft_input is not None:
                 payload = RelayPayload.from_ngram(batch_result.next_draft_input)
-                self.future_map.stash(future_indices, payload)
+                self.future_map.stash(
+                    future_indices,
+                    payload,
+                    future_indices_cpu=future_indices_cpu,
+                )
             return
         if batch_result.next_draft_input is not None:
             payload = RelayPayload.from_draft_input(batch_result.next_draft_input)
@@ -5673,7 +5825,9 @@ class Scheduler(
                 batch_result.copy_done = self.async_d2h_worker.submit(copy_fn)
 
     def launch_batch_sample_if_needed(
-        self, batch_result: GenerationBatchResult, cur_batch: ScheduleBatch
+        self,
+        batch_result: GenerationBatchResult,
+        cur_batch: ScheduleBatch,
     ) -> Union[GenerationBatchResult]:
         # TODO(lsyin): make the delayed sample a default behavior after
         # unifying the forward_batch_generation interface (related to spec V2).
@@ -5686,10 +5840,34 @@ class Scheduler(
             assert _batch_result is batch_result
             # Delay-sample is non-spec only; relays the sampled bonus tokens.
             self._relay_forward_payload(
-                cur_batch, batch_result.future_indices, batch_result
+                cur_batch,
+                batch_result.future_indices,
+                batch_result,
+                future_indices_cpu=cur_batch.req_pool_indices_cpu,
             )
+        copy_fn = partial(
+            batch_result.copy_to_cpu,
+            return_logprob=cur_batch.return_logprob,
+            return_hidden_states=cur_batch.return_hidden_states,
+        )
 
-        self._copy_result_to_cpu(batch_result, cur_batch)
+        def _copy_on_stream():
+            # Result D2H on copy_stream overlaps the next forward instead of
+            # serializing on forward_stream; it's a leaf gated by copy_done,
+            # so nothing on forward_stream waits. Not used under confidential
+            # computing: the copy blocks the issuing thread at issue there
+            # regardless of which stream it's issued on, so the worker thread
+            # (elsewhere) issues copy_fn directly instead.
+            self.copy_stream.wait_stream(self.forward_stream)
+            with self.copy_stream_ctx:
+                copy_fn()
+
+        self._issue_result_copy_to_cpu(
+            batch_result,
+            copy_fn,
+            non_cc_fallback=_copy_on_stream,
+            producer_stream=self.forward_stream,
+        )
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds
@@ -6967,7 +7145,9 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
-            # Stop the async D2H copy worker thread if any.
+            # Stop the confidential-compute async D2H copy worker thread.
+            scheduler._shutdown_d2h_worker()
+            # Stop upstream's async D2H copy worker thread if any.
             if scheduler.async_d2h_worker is not None:
                 scheduler.async_d2h_worker.shutdown()
                 scheduler.async_d2h_worker = None
