@@ -1,0 +1,8 @@
+# Allowlist: only what the Dockerfile copies.
+*
+!python
+!recipes/deepseek-v41
+recipes/deepseek-v41/loadtest
+**/__pycache__
+**/*.pyc
+python/sglang/_version.py
