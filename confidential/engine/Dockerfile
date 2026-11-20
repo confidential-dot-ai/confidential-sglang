@@ -31,7 +31,38 @@
 FROM ghcr.io/astral-sh/uv@sha256:265d074d08ed8080bc578087ca68a8e94611f9c7be671d40e18b3d3b1ad0dad4 AS uv
 FROM nvcr.io/nvidia/k8s/dcgm-exporter@sha256:148b0c025e5f2850256816fa33754fbf4733b7a086697a95613fc0ba3db5b003 AS dcgm-exporter
 
-#@ROUTER_WHEEL_STAGE@
+# The router wheel of this checkout's sgl-model-gateway: the same stage as
+# confidential/router/Dockerfile (keep the two identical).
+FROM docker.io/library/rust@sha256:3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f2db16d1d8a7e58f AS router-wheel
+ARG DEBIAN_SNAPSHOT=20261104T000000Z
+ARG SOURCE_DATE_EPOCH
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    CARGO_NET_RETRY=10
+# Rust 1.90.0 on Debian 12, as sgl-model-gateway/rust-toolchain.toml asks.
+RUN test -n "${SOURCE_DATE_EPOCH}" \
+    && printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s bookworm main\ndeb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/%s bookworm-security main\n' \
+        "${DEBIAN_SNAPSHOT}" "${DEBIAN_SNAPSHOT}" > /etc/apt/sources.list \
+    && rm -f /etc/apt/sources.list.d/* \
+    && apt-get -o Acquire::Retries=5 update \
+    && apt-get install -y --no-install-recommends \
+        python3 python3-venv clang protobuf-compiler libprotobuf-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv /opt/build \
+    && printf 'maturin==1.9.6 --hash=sha256:%s\n' \
+        0246202377c49449315305209f45c8ecef6e2d6bd27a04b5b6f1ab3e4ea47238 > /tmp/maturin.lock \
+    && /opt/build/bin/pip install --require-hashes --only-binary=:all: -r /tmp/maturin.lock
+WORKDIR /src
+COPY sgl-model-gateway /src/sgl-model-gateway
+COPY confidential/router/canonicalize_wheel.py /inputs/canonicalize_wheel.py
+ENV RUSTFLAGS="--remap-path-prefix=/src=/usr/src/sglang --remap-path-prefix=/usr/local/cargo/registry=/usr/src/cargo-registry"
+RUN test -f sgl-model-gateway/Cargo.lock \
+    && /opt/build/bin/maturin build --locked --release --features vendored-openssl \
+        --manifest-path sgl-model-gateway/bindings/python/Cargo.toml --out /out \
+    && /opt/build/bin/python3 /inputs/canonicalize_wheel.py /out/*.whl \
+    && ls /out/sglang_router-*.whl
+
 
 # CUDA 13.0.3 devel (nvidia/cuda:13.0.3-devel-ubuntu24.04, linux/amd64): the
 # toolkit Daniyal's dsv41-pd image was tested with. FlashInfer, Triton and the
