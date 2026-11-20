@@ -121,7 +121,18 @@ RUN --mount=type=bind,from=dcgm-exporter,source=/,target=/run-dcgm,readonly \
 # RECORD line.
 WORKDIR /opt/sglang
 COPY python /opt/sglang/python
-#@HARDEN_STEP@
+RUN --mount=type=bind,source=confidential/helpers,target=/run-src/helpers,readonly \
+    SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0.dev0 SGLANG_BUILD_RUST_EXTS=none \
+        uv pip install --no-deps --no-build-isolation -e /opt/sglang/python \
+    && dist=/opt/dsv41/lib/python3.12/site-packages/sglang-0.0.0.dev0.dist-info \
+    && rm -f "$dist/uv_cache.json" \
+    && sed -i '/^sglang-0\.0\.0\.dev0\.dist-info\/uv_cache\.json,/d' "$dist/RECORD" \
+    && python -I -B /run-src/helpers/harden_http.py --root /opt/sglang/python/sglang --variant pd \
+    && python -I -B /run-src/helpers/harden_media.py --root /opt/sglang/python/sglang \
+    && python -I -B /run-src/helpers/harden_dist.py --root /opt/sglang/python/sglang \
+    && python -B -c "import sglang.launch_server, sglang.srt.entrypoints.http_server, sglang.srt.models.deepseek_v4, sglang.srt.models.qwen3_5, mooncake" \
+    && find /opt/sglang/python -name __pycache__ -prune -exec rm -rf {} + \
+    && chmod -R go-w /opt/sglang/python
 
 # Both recipes, whole: the DeepSeek-V4.1 launcher, probes, docker recipe and
 # load tests (the stress suite runs from this image), and the Qwen3.5-0.8B
@@ -129,7 +140,27 @@ COPY python /opt/sglang/python
 COPY recipes/deepseek-v41 /opt/sglang/recipes/deepseek-v41
 COPY recipes/qwen35-0.8b /opt/sglang/recipes/qwen35-0.8b
 
-#@HELPERS_STEP@
+# The chart's helpers, at the paths the chart runs them by
+# (confidential/helpers/CHANGES.md records where each came from).
+RUN --mount=type=bind,source=confidential/helpers,target=/run-src,readonly \
+    install -D -m 0555 /run-src/wait_for_model.py /usr/local/bin/wait-for-model \
+    && install -D -m 0555 /run-src/fetch_model.py /usr/local/bin/fetch-model \
+    && install -D -m 0555 /run-src/pair_supervisor.py /usr/local/bin/sglang-pair \
+    && install -D -m 0444 /run-src/pair_diagnostics.py /usr/local/bin/pair_diagnostics.py \
+    && install -D -m 0444 /run-src/private_log_sink.py /usr/local/bin/private_log_sink.py \
+    && python -I -B /usr/local/bin/pair_diagnostics.py
+
+# CPU staging (inference.mode: simulator) uses the same image. The simulator is
+# outside the production import path; only the staging PYTHONPATH enables it.
+RUN --mount=type=bind,source=confidential/simulator,target=/run-src/simulator,readonly \
+    install -d -m 0755 /opt/confidential-inference/sglang-simulator \
+    && cp -a /run-src/simulator/upstream/. /opt/confidential-inference/sglang-simulator/ \
+    && cd /opt/confidential-inference/sglang-simulator \
+    && for p in replay-only parser-flags-noop prefix-length fork-imports; do \
+         git apply --check "/run-src/simulator/patches/sglang-simulator-$p.patch" \
+         && git apply "/run-src/simulator/patches/sglang-simulator-$p.patch" || exit 1; \
+       done \
+    && chmod -R go-w /opt/confidential-inference
 
 # The launch plan of every DeepSeek-V4.1 layout, with container paths
 # (confidential/layouts/README.md). The planner is the launcher's --dry-run:
