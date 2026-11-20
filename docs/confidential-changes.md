@@ -150,6 +150,12 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
   the release record `images-<12 hex>.json` to the GitHub release
   `images-<12 hex>` (`confidential/ci/release_record.py`, schema in its
   docstring). Modeled on confidential-inference's `release-images.yml`.
+- Each build also uploads a per-file listing of its image
+  (`confidential/ci/oci_listing.py`: path, mode, owner, mtime, SHA-256), so a
+  digest mismatch can be diffed. The first engine builds differed only in
+  uv's `uv_cache.json` (an install-time ctime) in the router wheel's
+  dist-info; it is removed like the SGLang one. With that, the two clean
+  engine builds match (run 44708494033 of confidential-sglang-ci).
 - Triggers: `workflow_dispatch`, push to `main`, and `workflow_call`.
 - GitHub Actions are disabled on this repository (it is an upstream fork, and
   enabling them needs a repository admin). Until an admin enables them, the
