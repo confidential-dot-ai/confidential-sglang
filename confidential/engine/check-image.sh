@@ -56,6 +56,8 @@ python3 /opt/sglang/recipes/deepseek-v41/launcher/launch.py --help >/dev/null
 python3 -I -B /usr/local/bin/pair_diagnostics.py
 # sglang-pair marks a worker ready only from these per-rank progress records.
 python3 -B -c "from sglang.srt.utils import pair_progress; pair_progress.initialize; pair_progress.scheduler_ready; pair_progress.stage"
+# The cold-path warmup that recipes pass as --warmups confidential_cold_path.
+python3 -B -c "from sglang.srt.entrypoints import warmup as w; assert 'confidential_cold_path' in w._warmup_registry and 'prefill_shapes' in w._warmup_registry"
 
 python3 -B - <<PY
 import importlib.util, json, pathlib
