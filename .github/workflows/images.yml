@@ -142,7 +142,7 @@ jobs:
   # release-images.yml). Build #1 also uploads its OCI archive, which the check
   # and publish jobs use; nothing is built a third time.
   build:
-    name: build ${{ matrix.image }} #${{ matrix.pass }}
+    name: 'build ${{ matrix.image }} #${{ matrix.pass }}'
     needs: source
     runs-on: ubuntu-24.04
     timeout-minutes: 180
