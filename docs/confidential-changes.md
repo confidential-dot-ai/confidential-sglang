@@ -156,6 +156,9 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
   uv's `uv_cache.json` (an install-time ctime) in the router wheel's
   dist-info; it is removed like the SGLang one. With that, the two clean
   engine builds match (run 44708494033 of confidential-sglang-ci).
+- Build #1 of each image also runs `check-image.sh`, on its own runner, after
+  removing the builder's state to free disk. A separate check job spent ~22 of
+  its 24 min downloading and loading the ~20 GB engine image.
 - Triggers: push to `main` and `workflow_dispatch`. The workflow runs only in
   this repository. Until 2026-11-20, Actions were disabled here, and the
   workflow ran from `confidential-dot-ai/confidential-sglang-ci`, which is

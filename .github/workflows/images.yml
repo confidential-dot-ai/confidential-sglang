@@ -120,8 +120,8 @@ jobs:
 
   # Each clean build gets its own fresh runner: the engine image is ~20 GB and
   # two clean builds do not fit on one runner's disk (see confidential-inference
-  # release-images.yml). Build #1 also uploads its OCI archive, which the check
-  # and publish jobs use; nothing is built a third time.
+  # release-images.yml). Build #1 also checks its image and uploads its OCI
+  # archive, which the publish job uses; nothing is built a third time.
   build:
     name: 'build ${{ matrix.image }} #${{ matrix.pass }}'
     needs: source
@@ -159,6 +159,8 @@ jobs:
           driver: docker-container
           version: ${{ env.BUILDX_VERSION }}
           driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+          # Build #1 removes the builder itself before its check, to free disk.
+          cleanup: false
 
       - name: watch disk usage
         id: disk-watch
@@ -237,6 +239,27 @@ jobs:
           retention-days: 3
           compression-level: 0
 
+      # The check runs here, on build #1's runner, where the image already is:
+      # a separate job spent ~22 of its 24 min downloading and loading ~20 GB.
+      # The builder's state goes first (its cache holds a copy of every layer).
+      - name: free the builder's disk
+        if: matrix.pass == 1
+        run: |
+          docker buildx rm "${{ steps.builder.outputs.name }}"
+          df -h / /mnt
+      - name: load
+        if: matrix.pass == 1
+        run: |
+          set -euo pipefail
+          skopeo copy --quiet oci-archive:/mnt/oci/${{ matrix.image }}.tar \
+            docker-daemon:confidential-sglang-${{ matrix.image }}:check
+          rm -f /mnt/oci/${{ matrix.image }}.tar
+          docker image inspect confidential-sglang-${{ matrix.image }}:check \
+            --format 'user={{.Config.User}} entrypoint={{json .Config.Entrypoint}} cmd={{json .Config.Cmd}}'
+      - name: check
+        if: matrix.pass == 1
+        run: confidential/${{ matrix.image }}/check-image.sh confidential-sglang-${{ matrix.image }}:check
+
   compare:
     name: compare ${{ matrix.image }}
     needs: [source, build]
@@ -266,45 +289,9 @@ jobs:
           fi
           printf '### %s reproducible\n\n`%s`\n' "${{ matrix.image }}" "$(cat "$one")" >> "$GITHUB_STEP_SUMMARY"
 
-  check:
-    name: check ${{ matrix.image }}
-    needs: [source, build]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        image: [engine, router]
-    env:
-      TMPDIR: /mnt/tmp
-    steps:
-      - name: checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ needs.source.outputs.commit }}
-          persist-credentials: false
-      - name: free disk space
-        run: confidential/ci/free-disk.sh
-      - name: download oci archive
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: oci-${{ matrix.image }}
-          path: /mnt/oci
-      - name: load
-        run: |
-          set -euo pipefail
-          skopeo copy --quiet oci-archive:/mnt/oci/${{ matrix.image }}.tar \
-            docker-daemon:confidential-sglang-${{ matrix.image }}:check
-          rm -f /mnt/oci/${{ matrix.image }}.tar
-          docker image inspect confidential-sglang-${{ matrix.image }}:check \
-            --format 'user={{.Config.User}} entrypoint={{json .Config.Entrypoint}} cmd={{json .Config.Cmd}}'
-      - name: check
-        run: confidential/${{ matrix.image }}/check-image.sh confidential-sglang-${{ matrix.image }}:check
-
   publish:
     name: publish ${{ matrix.image }}
-    needs: [source, tests, router-tests, compare, check]
+    needs: [source, tests, router-tests, compare, build]
     if: needs.source.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
