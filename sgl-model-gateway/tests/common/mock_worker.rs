@@ -488,7 +488,7 @@ async fn chat_completions_handler(
 
     if should_fail(&config).await {
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            fail_status_code(config.port),
             Json(json!({
                 "error": {
                     "message": "Random failure for testing",

@@ -15,7 +15,7 @@ use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     core::{
-        is_retryable_status, AttachedBody, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
+        is_retryable_status, is_worker_fault, AttachedBody, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
         WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
@@ -365,7 +365,8 @@ impl Router {
         // mask "200-then-broken" workers — every request would tick a
         // success before the stream had a chance to error out.
         if !is_stream {
-            worker.record_outcome(status.is_success());
+            // A 4xx (a bad request, correctly refused) is not a worker fault.
+            worker.record_outcome(!is_worker_fault(status));
         }
 
         // Record worker errors for server errors (5xx)
@@ -703,7 +704,8 @@ impl Router {
                 worker.clone(),
                 worker_url.to_string(),
             );
-            if !status.is_success() {
+            // A 4xx (a bad request, correctly refused) is not a worker fault.
+            if is_worker_fault(status) {
                 tracked.mark_errored();
             }
             let body = Body::from_stream(tracked);
