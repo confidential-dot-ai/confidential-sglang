@@ -172,3 +172,19 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
   outside contributors. The upstream workflows that remain on other branches
   (for example `upstream-nightly`) use actions by tag, so they fail at
   startup and run no step.
+
+## Cold-path warmup (2026-11-20)
+
+- `python/sglang/srt/entrypoints/warmup.py`: a custom warmup,
+  `confidential_cold_path`, for `--warmups`. It runs upstream's
+  `prefill_shapes` (prefill lengths up to 32K), then every sampling path
+  (greedy, defaults, top-k, top-p/min-p, penalties, stop strings, JSON
+  schema; with and without logprobs), alone and mixed in one batch, then
+  decode batch sizes 1 to 64. Custom warmups run in the server lifespan,
+  before it listens, so the probes and the router see the worker only
+  afterwards.
+- Why: staging `staging-39086210fdc6` (Qwen3.5-0.8B, B200) logged 20
+  `jit_compile` events after the worker was ready (Triton, SGLang JIT,
+  inductor). Each burst stalled the worker; the router's `/health_generate`
+  check failed, and clients got 503.
+- `confidential/engine/check-image.sh` checks that the warmup is registered.

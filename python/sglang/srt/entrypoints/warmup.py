@@ -159,3 +159,57 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+# confidential-sglang: run every kernel path a request can take before the
+# server listens, so no compiler (Triton, SGLang JIT, inductor) writes a
+# kernel after the worker is ready. Staging staging-39086210fdc6 (Qwen3.5-0.8B,
+# B200) compiled 20 times after ready, in bursts of up to 77 files; each burst
+# stalled the worker, the router's /health_generate check timed out, and
+# clients got 503. Custom warmups run in the server lifespan, before it
+# listens, so the probes and the router see the worker only afterwards. The
+# shapes follow confidential-inference-internal acceptance.cold_path_shapes.
+COLD_PATH_SAMPLING = (
+    {"temperature": 0.0},                                    # greedy
+    {},                                                      # the model's defaults
+    {"temperature": 0.7, "top_k": 40},
+    {"temperature": 0.7, "top_p": 0.9, "min_p": 0.05},
+    {"temperature": 0.7, "repetition_penalty": 1.1, "frequency_penalty": 0.5, "presence_penalty": 0.5},
+    {"temperature": 0.7, "stop": ["\n\n", "END"]},
+    {"temperature": 0.0, "json_schema": '{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}'},
+)
+COLD_PATH_BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64)
+
+
+@warmup("confidential_cold_path")
+async def confidential_cold_path(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
+    """Prefill lengths up to 32K, every sampling path (alone and mixed in one
+    batch, with and without logprobs), and decode batch sizes up to 64."""
+    import asyncio
+
+    def request(size: int, sampling: dict, max_new_tokens: int, logprobs: bool = False) -> GenerateReqInput:
+        req = GenerateReqInput(
+            input_ids=np.random.randint(2**16, size=[size]).tolist(),
+            sampling_params={"max_new_tokens": max_new_tokens, **sampling},
+            return_logprob=logprobs,
+            top_logprobs_num=2 if logprobs else 0,
+        )
+        if disaggregation_mode != "null":
+            req.bootstrap_room = 0
+            req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+        return req
+
+    async def run(req: GenerateReqInput) -> None:
+        async for _ in tokenizer_manager.generate_request(req, None):
+            pass
+
+    await prefill_shapes(disaggregation_mode, tokenizer_manager)
+    for sampling in COLD_PATH_SAMPLING:
+        for logprobs in (False, True):
+            await run(request(64, sampling, 16, logprobs))
+    # One batch that mixes every sampling path, like the gateway's real traffic.
+    await asyncio.gather(*(run(request(64, s, 16, lp)) for s in COLD_PATH_SAMPLING for lp in (False, True)))
+    for batch in COLD_PATH_BATCH_SIZES:
+        await asyncio.gather(*(run(request(64 + i, COLD_PATH_SAMPLING[i % len(COLD_PATH_SAMPLING)], 16))
+                               for i in range(batch)))
+    logger.info("confidential_cold_path warmup ended")
