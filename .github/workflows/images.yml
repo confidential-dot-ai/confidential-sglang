@@ -1,0 +1,462 @@
+name: images
+
+# One engine image and one router image per main commit
+# (ghcr.io/confidential-dot-ai/confidential-sglang/{engine,router}).
+#
+# Each image is built twice, clean, on two fresh runners. The two digests must
+# match, and the image must pass its check, before the bytes of build #1 are
+# pushed, by digest, tagged sha-<commit>. The release record
+# (confidential/ci/release_record.py) goes to the GitHub release
+# images-<12 hex of the commit> as images-<12 hex>.json.
+#
+# Reproducible inputs: base images by digest, Ubuntu/Debian packages by
+# snapshot timestamp, Python wheels by SHA-256, Rust crates by Cargo.lock
+# (--locked), a pinned BuildKit, SOURCE_DATE_EPOCH = the commit time,
+# rewrite-timestamp=true, no provenance or SBOM attestations.
+#
+# Called from another repository (workflow_call), it builds source_commit of
+# confidential-dot-ai/confidential-sglang and writes the release to
+# release_repository (default: confidential-sglang, which needs
+# secrets.RELEASE_TOKEN with contents:write on it when the caller is not
+# confidential-sglang itself).
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Push both images and write the release after two matching builds
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+  workflow_call:
+    inputs:
+      source_commit:
+        description: The confidential-sglang commit to build (40 hex)
+        type: string
+        required: true
+      publish:
+        type: boolean
+        default: true
+      release_repository:
+        description: owner/name that receives the images-<12 hex> release
+        type: string
+        default: confidential-dot-ai/confidential-sglang
+    secrets:
+      RELEASE_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: images-${{ inputs.source_commit || github.sha }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: confidential-dot-ai/confidential-sglang
+  REGISTRY_PREFIX: ghcr.io/confidential-dot-ai/confidential-sglang
+  BUILDX_VERSION: v0.36.1
+  BUILDKIT_IMAGE: moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+  CRANE_URL: https://github.com/google/go-containerregistry/releases/download/v0.21.6/go-containerregistry_Linux_x86_64.tar.gz
+  CRANE_SHA256: 7ebbdcd05b652345c1f5105f8475e518534b90d66f3bdb50017be63f426ea435
+
+jobs:
+  source:
+    name: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      short: ${{ steps.source.outputs.short }}
+      epoch: ${{ steps.source.outputs.epoch }}
+      publish: ${{ steps.source.outputs.publish }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ inputs.source_commit || github.sha }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: resolve the source commit
+        id: source
+        env:
+          WANT: ${{ inputs.source_commit || github.sha }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+        run: |
+          set -euo pipefail
+          [[ "$WANT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::source commit must be 40 hex: $WANT"; exit 1; }
+          commit="$(git rev-parse HEAD)"
+          test "$commit" = "$WANT"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          # Only commits on main are published: one image per main commit.
+          if [[ "$PUBLISH" == true ]]; then
+            git merge-base --is-ancestor "$commit" origin/main \
+              || { echo "::error::$commit is not on main; refusing to publish"; exit 1; }
+          fi
+          {
+            echo "commit=$commit"
+            echo "short=${commit:0:12}"
+            echo "epoch=$(git show -s --format=%ct "$commit")"
+            echo "publish=$PUBLISH"
+          } >> "$GITHUB_OUTPUT"
+          printf '### Source %s\n\npublish: %s\n' "$commit" "$PUBLISH" >> "$GITHUB_STEP_SUMMARY"
+
+  tests:
+    name: python tests
+    needs: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - name: run
+        run: confidential/ci/python-tests.sh
+
+  router-tests:
+    name: router tests
+    needs: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - name: cargo test --lib and --test reliability_tests
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.source.outputs.epoch }}
+        run: confidential/router/run_router_tests.sh
+
+  # Each clean build gets its own fresh runner: the engine image is ~20 GB and
+  # two clean builds do not fit on one runner's disk (see confidential-inference
+  # release-images.yml). Build #1 also uploads its OCI archive, which the check
+  # and publish jobs use; nothing is built a third time.
+  build:
+    name: build ${{ matrix.image }} #${{ matrix.pass }}
+    needs: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [engine, router]
+        pass: [1, 2]
+    env:
+      TMPDIR: /mnt/tmp
+    steps:
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+
+      - name: check clean source
+        run: |
+          test -z "$(git status --porcelain --untracked-files=all)"
+          test "$(git rev-parse HEAD)" = "${{ needs.source.outputs.commit }}"
+          test -f confidential/${{ matrix.image }}/Dockerfile
+
+      - name: free disk space
+        run: confidential/ci/free-disk.sh
+
+      - name: setup buildx
+        id: builder
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+        with:
+          name: images-${{ github.run_id }}-${{ matrix.image }}-${{ matrix.pass }}
+          driver: docker-container
+          version: ${{ env.BUILDX_VERSION }}
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+
+      - name: watch disk usage
+        id: disk-watch
+        run: |
+          (while true; do printf '\n--- %s ---\n' "$(date -u +%FT%TZ)"; df -h / /mnt; sleep 30; done) \
+            > /mnt/disk-usage.log 2>&1 &
+          echo "pid=$!" >> "$GITHUB_OUTPUT"
+
+      - name: build
+        id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          builder: ${{ steps.builder.outputs.name }}
+          context: .
+          file: confidential/${{ matrix.image }}/Dockerfile
+          build-args: |
+            SOURCE_REVISION=${{ needs.source.outputs.commit }}
+            SOURCE_DATE_EPOCH=${{ needs.source.outputs.epoch }}
+          platforms: linux/amd64
+          no-cache: true
+          pull: true
+          push: false
+          outputs: type=oci,dest=/mnt/oci/${{ matrix.image }}.tar,rewrite-timestamp=true
+          provenance: false
+          sbom: false
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.source.outputs.epoch }}
+
+      - name: stop disk watcher
+        if: always()
+        run: |
+          kill "${{ steps.disk-watch.outputs.pid }}" 2>/dev/null || true
+          tail -n 4 /mnt/disk-usage.log || true
+
+      # Equal digests mean equal manifest and config bytes (labels included),
+      # and so equal layers.
+      - name: record digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          archived="$(tar -xOf /mnt/oci/${{ matrix.image }}.tar index.json | jq -r '.manifests[0].digest')"
+          test "$archived" = "$DIGEST"
+          mkdir -p /mnt/record
+          printf '%s\n' "$DIGEST" > /mnt/record/${{ matrix.image }}-${{ matrix.pass }}.digest
+          printf '### %s build #%s\n\n`%s`\n' "${{ matrix.image }}" "${{ matrix.pass }}" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upload digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digest-${{ matrix.image }}-${{ matrix.pass }}
+          path: /mnt/record/${{ matrix.image }}-${{ matrix.pass }}.digest
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: upload oci archive
+        if: matrix.pass == 1
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: oci-${{ matrix.image }}
+          path: /mnt/oci/${{ matrix.image }}.tar
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+  compare:
+    name: compare ${{ matrix.image }}
+    needs: [source, build]
+    if: always() && needs.source.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [engine, router]
+    steps:
+      - name: download digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: digest-${{ matrix.image }}-*
+          path: /tmp/digests
+          merge-multiple: true
+      - name: compare
+        run: |
+          set -euo pipefail
+          one=/tmp/digests/${{ matrix.image }}-1.digest
+          two=/tmp/digests/${{ matrix.image }}-2.digest
+          test -s "$one" && test -s "$two"
+          if ! cmp "$one" "$two"; then
+            echo "::error::the two clean ${{ matrix.image }} builds differ: $(cat "$one") vs $(cat "$two")"
+            exit 1
+          fi
+          printf '### %s reproducible\n\n`%s`\n' "${{ matrix.image }}" "$(cat "$one")" >> "$GITHUB_STEP_SUMMARY"
+
+  check:
+    name: check ${{ matrix.image }}
+    needs: [source, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [engine, router]
+    env:
+      TMPDIR: /mnt/tmp
+    steps:
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - name: free disk space
+        run: confidential/ci/free-disk.sh
+      - name: download oci archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: oci-${{ matrix.image }}
+          path: /mnt/oci
+      - name: load
+        run: |
+          set -euo pipefail
+          skopeo copy --quiet oci-archive:/mnt/oci/${{ matrix.image }}.tar \
+            docker-daemon:confidential-sglang-${{ matrix.image }}:check
+          rm -f /mnt/oci/${{ matrix.image }}.tar
+          docker image inspect confidential-sglang-${{ matrix.image }}:check \
+            --format 'user={{.Config.User}} entrypoint={{json .Config.Entrypoint}} cmd={{json .Config.Cmd}}'
+      - name: check
+        run: confidential/${{ matrix.image }}/check-image.sh confidential-sglang-${{ matrix.image }}:check
+
+  publish:
+    name: publish ${{ matrix.image }}
+    needs: [source, tests, router-tests, compare, check]
+    if: needs.source.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        image: [engine, router]
+    env:
+      TMPDIR: /mnt/tmp
+    steps:
+      - name: prepare disk
+        run: |
+          sudo mkdir -p /mnt/tmp /mnt/oci /mnt/layout /mnt/record
+          sudo chown "$(id -u):$(id -g)" /mnt/tmp /mnt/oci /mnt/layout /mnt/record
+      - name: download digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: digest-${{ matrix.image }}-*
+          path: /mnt/record
+          merge-multiple: true
+      - name: download oci archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: oci-${{ matrix.image }}
+          path: /mnt/oci
+      - name: unpack and verify the archive
+        run: |
+          set -euo pipefail
+          tar -xf /mnt/oci/${{ matrix.image }}.tar -C /mnt/layout
+          rm -f /mnt/oci/${{ matrix.image }}.tar
+          one="$(tr -d '\n' < /mnt/record/${{ matrix.image }}-1.digest)"
+          two="$(tr -d '\n' < /mnt/record/${{ matrix.image }}-2.digest)"
+          test "$one" = "$two"
+          test "$(jq '.manifests | length' /mnt/layout/index.json)" = 1
+          test "$(jq -r '.manifests[0].digest' /mnt/layout/index.json)" = "$one"
+      - name: install crane
+        run: |
+          curl -fsSL -o /tmp/crane.tar.gz "$CRANE_URL"
+          echo "$CRANE_SHA256  /tmp/crane.tar.gz" | sha256sum --check --strict
+          tar -xzf /tmp/crane.tar.gz -C /tmp crane
+          sudo install -m 0755 /tmp/crane /usr/local/bin/crane
+      - name: login ghcr
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: push by digest, tagged sha-<commit>
+        id: push
+        env:
+          IMAGE_NAME: ${{ env.REGISTRY_PREFIX }}/${{ matrix.image }}
+          COMMIT: ${{ needs.source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          crane push /mnt/layout "$IMAGE_NAME:sha-$COMMIT" --image-refs /tmp/refs.txt
+          reference="$(tr -d '\n' < /tmp/refs.txt)"
+          test "${reference%@*}" = "$IMAGE_NAME"
+          digest="${reference#*@}"
+          test "$digest" = "$(tr -d '\n' < /mnt/record/${{ matrix.image }}-1.digest)"
+          test "$(crane digest "$IMAGE_NAME@$digest")" = "$digest"
+          printf '%s=%s@%s,%s,%s\n' "${{ matrix.image }}" "$IMAGE_NAME" "$digest" \
+            "$(tr -d '\n' < /mnt/record/${{ matrix.image }}-1.digest)" \
+            "$(tr -d '\n' < /mnt/record/${{ matrix.image }}-2.digest)" > /mnt/record/${{ matrix.image }}.published
+          printf '### %s\n\n`%s`\n' "${{ matrix.image }}" "$reference" >> "$GITHUB_STEP_SUMMARY"
+      - name: upload publication
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: published-${{ matrix.image }}
+          path: /mnt/record/${{ matrix.image }}.published
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: release record
+    needs: [source, publish]
+    if: needs.source.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - name: download publications
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: published-*
+          path: /tmp/published
+          merge-multiple: true
+      - name: write the record
+        env:
+          COMMIT: ${{ needs.source.outputs.commit }}
+          SHORT: ${{ needs.source.outputs.short }}
+          EPOCH: ${{ needs.source.outputs.epoch }}
+          WORKFLOW: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          python3 -I confidential/ci/release_record.py write \
+            --commit "$COMMIT" --epoch "$EPOCH" \
+            --run-repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --workflow "$WORKFLOW" \
+            --image "$(cat /tmp/published/engine.published)" \
+            --image "$(cat /tmp/published/router.published)" \
+            --output "dist/images-$SHORT.json"
+          python3 -I confidential/ci/release_record.py check "dist/images-$SHORT.json" --commit "$COMMIT"
+      - name: upload the record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: images-${{ needs.source.outputs.short }}
+          path: dist/images-${{ needs.source.outputs.short }}.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          RELEASE_REPOSITORY: ${{ inputs.release_repository || github.repository }}
+          COMMIT: ${{ needs.source.outputs.commit }}
+          SHORT: ${{ needs.source.outputs.short }}
+        run: |
+          set -euo pipefail
+          tag="images-$SHORT"
+          # A caller other than confidential-sglang has no commit of it: its
+          # release targets the caller's default branch and names the commit.
+          target="$COMMIT"
+          if [[ "$RELEASE_REPOSITORY" != "$SOURCE_REPOSITORY" ]]; then
+            target="$(gh api "repos/$RELEASE_REPOSITORY" --jq .default_branch)"
+          fi
+          if gh release view "$tag" --repo "$RELEASE_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $tag already exists in $RELEASE_REPOSITORY; records are never replaced"
+            exit 1
+          fi
+          {
+            echo "Images built from confidential-dot-ai/confidential-sglang@$COMMIT."
+            echo
+            echo "Run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT"
+            echo
+            jq -r '.images[] | "- `\(.reference)`"' "dist/images-$SHORT.json"
+          } > /tmp/notes.md
+          gh release create "$tag" --repo "$RELEASE_REPOSITORY" --target "$target" \
+            --title "$tag" --notes-file /tmp/notes.md "dist/images-$SHORT.json"
+          echo "release: https://github.com/$RELEASE_REPOSITORY/releases/tag/$tag" >> "$GITHUB_STEP_SUMMARY"
