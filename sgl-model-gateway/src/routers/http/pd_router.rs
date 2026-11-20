@@ -81,6 +81,51 @@ struct PrefillStreamFailure {
     worker_ok: bool,
 }
 
+/// Worker label that ties a prefill worker to its decode worker. Service
+/// discovery sets it to the pod name for a pod that serves both roles
+/// (`sglang.ai/prefill-port` and `sglang.ai/decode-port` annotations); a
+/// worker added through the API may set it too. Workers without it are
+/// unpaired and select as before.
+pub const PD_PAIR_LABEL: &str = "pd_pair";
+
+fn pd_pair_of(worker: &dyn Worker) -> Option<&str> {
+    worker
+        .metadata()
+        .labels
+        .get(PD_PAIR_LABEL)
+        .map(String::as_str)
+}
+
+/// Prefill workers a request may use: unpaired ones, and paired ones whose
+/// own decode worker is available.
+fn pair_prefill_candidates(
+    prefills: Vec<Arc<dyn Worker>>,
+    decodes: &[Arc<dyn Worker>],
+) -> Vec<Arc<dyn Worker>> {
+    prefills
+        .into_iter()
+        .filter(|p| match pd_pair_of(p.as_ref()) {
+            None => true,
+            Some(pair) => decodes
+                .iter()
+                .any(|d| d.is_available() && pd_pair_of(d.as_ref()) == Some(pair)),
+        })
+        .collect()
+}
+
+/// Decode workers for a selected prefill: its peer when it is paired, and
+/// only unpaired decode workers when it is not.
+fn pair_decode_candidates(
+    decodes: Vec<Arc<dyn Worker>>,
+    prefill: &dyn Worker,
+) -> Vec<Arc<dyn Worker>> {
+    let pair = pd_pair_of(prefill);
+    decodes
+        .into_iter()
+        .filter(|d| pd_pair_of(d.as_ref()) == pair)
+        .collect()
+}
+
 #[derive(Debug)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
@@ -165,7 +210,10 @@ impl PDRouter {
                         response
                     }
                     Err(e) => {
-                        error!("Failed to read response body: {}", e);
+                        error!(
+                            ci_event = "worker_response_read_failed",
+                            "Worker response read failed"
+                        );
                         error::internal_error(
                             "read_response_body_failed",
                             format!("Failed to read response body: {}", e),
@@ -205,7 +253,7 @@ impl PDRouter {
                 }
             }
             Err(e) => {
-                error!("Failed to proxy request server: {}", e);
+                error!(ci_event = "worker_proxy_failed", "Worker proxy failed");
                 error::internal_error(
                     "proxy_request_failed",
                     format!("Failed to proxy request: {}", e),
@@ -231,15 +279,21 @@ impl PDRouter {
     }
 
     fn handle_server_selection_error(error: String) -> Response {
-        error!("Failed to select PD pair error={}", error);
+        error!(
+            ci_event = "pair_selection_failed",
+            "PD pair selection failed"
+        );
         error::service_unavailable(
             "server_selection_failed",
             format!("No available servers: {}", error),
         )
     }
 
-    fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
-        error!("Failed to serialize request error={}", error);
+    fn handle_serialization_error(_error: impl std::fmt::Display) -> Response {
+        error!(
+            ci_event = "request_serialization_failed",
+            "Request serialization failed"
+        );
         error::internal_error("serialization_failed", "Failed to serialize request")
     }
 
@@ -444,6 +498,7 @@ impl PDRouter {
                                 context.model_id,
                                 context.headers.as_ref(),
                                 false,
+                                None,
                             )
                             .await
                             .map(|prefill| (prefill, None))
@@ -596,16 +651,13 @@ impl PDRouter {
                     Ok(error_json) => {
                         json!({ "message": error_json, "status": status.as_u16() })
                     }
-                    Err(parse_err) => {
+                    Err(_) => {
                         let body_text = String::from_utf8_lossy(&error_body).to_string();
-                        let preview: String = body_text.chars().take(256).collect();
                         tracing::warn!(
-                            "Failed to parse decode error body as JSON from {}: {} \
-                             (status={}, body preview: {:?})",
-                            decode.url(),
-                            parse_err,
-                            status.as_u16(),
-                            preview
+                            ci_event = "worker_error_body_invalid_json",
+                            role = "decode",
+                            status = status.as_u16(),
+                            "Worker error body is not JSON"
                         );
                         json!({ "message": body_text, "status": status.as_u16() })
                     }
@@ -728,7 +780,10 @@ impl PDRouter {
         {
             Ok(request) => request,
             Err(e) => {
-                error!("Failed to prepare PD worker requests: {}", e);
+                error!(
+                    ci_event = "worker_request_prepare_failed",
+                    "PD worker request preparation failed"
+                );
                 return (
                     error::internal_error("pd_request_preparation_failed", e),
                     None,
@@ -766,6 +821,7 @@ impl PDRouter {
                         context.model_id,
                         context.headers.as_ref(),
                         true,
+                        Some(&prefill),
                     )
                     .await
                     .map_err(Self::handle_server_selection_error)?,
@@ -780,7 +836,11 @@ impl PDRouter {
             }
             .await
             .map_err(|e| {
-                error!("Failed to prepare PD worker requests: {}", e);
+                error!(
+                    ci_event = "worker_request_prepare_failed",
+                    role = "decode",
+                    "PD worker request preparation failed"
+                );
                 error::internal_error("pd_request_preparation_failed", e)
             })?;
             let decode_request = self.build_post_with_headers(
@@ -929,8 +989,9 @@ impl PDRouter {
 
         if prefill_failed {
             warn!(
-                "Prefill failed, aborting paired decode request prefill_url={}",
-                prefill.url()
+                ci_event = "paired_decode_cancelled",
+                role = "prefill",
+                "Prefill failed; paired decode cancelled"
             );
 
             // Tick prefill by its real status (4xx = client fault). Don't record
@@ -1079,8 +1140,12 @@ impl PDRouter {
                                 *response.headers_mut() = response_headers;
                                 response
                             }
-                            Err(e) => {
-                                error!("Failed to read decode response: {}", e);
+                            Err(_) => {
+                                error!(
+                                    ci_event = "worker_response_read_failed",
+                                    role = "decode",
+                                    "Worker response read failed"
+                                );
                                 error::internal_error(
                                     "read_response_failed",
                                     "Failed to read response",
@@ -1129,9 +1194,10 @@ impl PDRouter {
             Ok(res) => {
                 let status = res.status();
                 error!(
-                    "Decode server returned error status decode_url={} status={}",
-                    decode.url(),
-                    status
+                    ci_event = "worker_http_error",
+                    role = "decode",
+                    status = status.as_u16(),
+                    "Worker returned an error status"
                 );
                 // Streaming errors are ticked on drop by the `BreakerTrackedStream`
                 // that `handle_decode_error_response` wraps them in.
@@ -1143,8 +1209,8 @@ impl PDRouter {
             }
             Err(e) => {
                 error!(
-                    decode_url = %decode.url(),
-                    error = %e,
+                    ci_event = "worker_request_failed",
+                    role = "decode",
                     "Decode request failed"
                 );
                 decode.record_outcome(false);
@@ -1191,10 +1257,10 @@ impl PDRouter {
         headers: Option<&HeaderMap>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
         let prefill = self
-            .select_worker(request_text, model_id, headers, false)
+            .select_worker(request_text, model_id, headers, false, None)
             .await?;
         let decode = self
-            .select_worker(request_text, model_id, headers, true)
+            .select_worker(request_text, model_id, headers, true, Some(&prefill))
             .await?;
         Ok((prefill, decode))
     }
@@ -1205,6 +1271,7 @@ impl PDRouter {
         model_id: Option<&str>,
         headers: Option<&HeaderMap>,
         decode: bool,
+        paired_prefill: Option<&Arc<dyn Worker>>,
     ) -> Result<Arc<dyn Worker>, String> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -1213,20 +1280,17 @@ impl PDRouter {
             decode, self.enable_igw, model_id, effective_model_id
         );
 
-        let workers = match effective_model_id {
-            Some(model) => self
-                .worker_registry
-                .get_by_model(model)
-                .iter()
-                .filter(|w| match w.worker_type() {
-                    WorkerType::Decode => decode,
-                    WorkerType::Prefill { .. } => !decode,
-                    _ => false,
-                })
-                .cloned()
-                .collect(),
-            None if decode => self.worker_registry.get_decode_workers(),
-            None => self.worker_registry.get_prefill_workers(),
+        let workers = self.role_workers(effective_model_id, decode);
+        // Discovered prefill/decode pairs (PD_PAIR_LABEL) never cross: a paired
+        // prefill is eligible only while its own decode is available, and the
+        // decode of a request is the selected prefill's peer.
+        let workers = if decode {
+            match paired_prefill {
+                Some(prefill) => pair_decode_candidates(workers, prefill.as_ref()),
+                None => workers,
+            }
+        } else {
+            pair_prefill_candidates(workers, &self.role_workers(effective_model_id, true))
         };
 
         let (policy, role, label) = if decode {
@@ -1267,6 +1331,24 @@ impl PDRouter {
         );
 
         Ok(worker)
+    }
+
+    fn role_workers(&self, effective_model_id: Option<&str>, decode: bool) -> Vec<Arc<dyn Worker>> {
+        match effective_model_id {
+            Some(model) => self
+                .worker_registry
+                .get_by_model(model)
+                .iter()
+                .filter(|w| match w.worker_type() {
+                    WorkerType::Decode => decode,
+                    WorkerType::Prefill { .. } => !decode,
+                    _ => false,
+                })
+                .cloned()
+                .collect(),
+            None if decode => self.worker_registry.get_decode_workers(),
+            None => self.worker_registry.get_prefill_workers(),
+        }
     }
 
     async fn pick_worker_by_policy_arc(
@@ -1355,7 +1437,6 @@ impl PDRouter {
         if !(status.is_success() || status.is_client_error()) {
             tracked.mark_errored();
         }
-        let decode_for_log = decode.clone();
         let prefill_for_outcome = prefill.clone();
         // Set only when decode is relayed before prefill finished; `pending()`
         // keeps the select arm below inert otherwise.
@@ -1430,8 +1511,8 @@ impl PDRouter {
                     }
                     _ = tx.closed() => {
                         tracing::info!(
-                            "Client disconnected, cancelling upstream PD stream from {}",
-                            decode_for_log.url()
+                            ci_event = "client_disconnected", role = "decode",
+                            "Client disconnected; upstream PD stream cancelled"
                         );
                         client_gone = true;
                         break;
@@ -1476,7 +1557,7 @@ impl PDRouter {
         pending: Pin<
             Box<impl Future<Output = Result<reqwest::Response, reqwest::Error>> + Send + 'static>,
         >,
-        prefill_url: String,
+        _prefill_url: String,
     ) -> PrefillCompletion {
         Box::pin(async move {
             let result = match resolved {
@@ -1485,8 +1566,9 @@ impl PDRouter {
             };
             let response = result.map_err(|e| {
                 error!(
-                    "Prefill server failed prefill_url={} error={} after decode started streaming",
-                    prefill_url, e
+                    ci_event = "worker_request_failed",
+                    role = "prefill",
+                    "Prefill request failed after decode started streaming"
                 );
                 PrefillStreamFailure {
                     status: StatusCode::BAD_GATEWAY,
@@ -1502,8 +1584,10 @@ impl PDRouter {
                     .await
                     .unwrap_or_else(|_| "Unknown prefill error".to_string());
                 error!(
-                    "Prefill server returned error status prefill_url={} status={} body={}",
-                    prefill_url, status, body
+                    ci_event = "worker_http_error",
+                    role = "prefill",
+                    status = status.as_u16(),
+                    "Worker returned an error status"
                 );
                 return Err(PrefillStreamFailure {
                     status,
@@ -1513,8 +1597,9 @@ impl PDRouter {
             }
             response.bytes().await.map(|_| ()).map_err(|e| {
                 warn!(
-                    "Error consuming prefill response prefill_url={} error={}",
-                    prefill_url, e
+                    ci_event = "worker_response_read_failed",
+                    role = "prefill",
+                    "Worker response read failed"
                 );
                 PrefillStreamFailure {
                     status: StatusCode::BAD_GATEWAY,
@@ -1536,8 +1621,12 @@ impl PDRouter {
         let response = res.bytes().await;
         let decode_body = match response {
             Ok(decode_body) => decode_body,
-            Err(e) => {
-                error!("Failed to read decode response: {}", e);
+            Err(_) => {
+                error!(
+                    ci_event = "worker_response_read_failed",
+                    role = "decode",
+                    "Worker response read failed"
+                );
                 return error::internal_error("read_response_failed", "Failed to read response");
             }
         };
@@ -1564,8 +1653,11 @@ impl PDRouter {
         // Return merged response
         match serde_json::to_vec(&decode_json) {
             Ok(body) => (status, body).into_response(),
-            Err(e) => {
-                error!("Failed to serialize merged response: {}", e);
+            Err(_) => {
+                error!(
+                    ci_event = "response_serialization_failed",
+                    "Response serialization failed"
+                );
                 (status, decode_body).into_response()
             }
         }
@@ -1575,7 +1667,7 @@ impl PDRouter {
     async fn process_prefill_response(
         &self,
         prefill_result: Result<reqwest::Response, reqwest::Error>,
-        prefill_url: &str,
+        _prefill_url: &str,
         return_logprob: bool,
     ) -> Result<(StatusCode, Option<bytes::Bytes>), Response> {
         // Check prefill result first - it's critical for disaggregated mode
@@ -1583,9 +1675,9 @@ impl PDRouter {
             Ok(response) => response,
             Err(e) => {
                 error!(
-                    "Prefill server failed (CRITICAL) prefill_url={} error={}. Decode will timeout without prefill KV cache.",
-                    prefill_url,
-                    e
+                    ci_event = "worker_request_failed",
+                    role = "prefill",
+                    "Prefill request failed"
                 );
 
                 // Return error immediately - don't wait for decode to timeout
@@ -1611,8 +1703,10 @@ impl PDRouter {
                 .unwrap_or_else(|_| "Unknown prefill error".to_string());
 
             error!(
-                "Prefill server returned error status prefill_url={} status={} body={}",
-                prefill_url, prefill_status, error_msg
+                ci_event = "worker_http_error",
+                role = "prefill",
+                status = prefill_status.as_u16(),
+                "Worker returned an error status"
             );
 
             // Map prefill_status to appropriate error function
@@ -1649,8 +1743,12 @@ impl PDRouter {
         let prefill_body = if return_logprob {
             match prefill_response.bytes().await {
                 Ok(body) => Some(body),
-                Err(e) => {
-                    warn!("Failed to read prefill response body for logprobs: {}", e);
+                Err(_) => {
+                    warn!(
+                        ci_event = "worker_response_read_failed",
+                        role = "prefill",
+                        "Worker response read failed"
+                    );
                     None
                 }
             }
@@ -1659,7 +1757,11 @@ impl PDRouter {
             debug!("Consuming prefill response body (non-logprob request)");
             match prefill_response.bytes().await {
                 Ok(_) => debug!("Prefill response consumed successfully"),
-                Err(e) => warn!("Error consuming prefill response: {}", e),
+                Err(_) => warn!(
+                    ci_event = "worker_response_read_failed",
+                    role = "prefill",
+                    "Worker response read failed"
+                ),
             }
             None
         };
@@ -2380,5 +2482,144 @@ mod tests {
         // Guards dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
+    }
+}
+
+#[cfg(test)]
+mod pair_selection_tests {
+    use super::*;
+    use crate::core::BasicWorkerBuilder;
+
+    fn worker(
+        url: &str,
+        worker_type: WorkerType,
+        pair: Option<&str>,
+        healthy: bool,
+    ) -> Arc<dyn Worker> {
+        let mut builder = BasicWorkerBuilder::new(url).worker_type(worker_type);
+        if let Some(pair) = pair {
+            builder = builder.label(PD_PAIR_LABEL, pair);
+        }
+        let worker = builder.build();
+        worker.set_healthy(healthy);
+        Arc::new(worker)
+    }
+
+    fn prefill(url: &str, pair: Option<&str>, healthy: bool) -> Arc<dyn Worker> {
+        worker(
+            url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            pair,
+            healthy,
+        )
+    }
+
+    fn decode(url: &str, pair: Option<&str>, healthy: bool) -> Arc<dyn Worker> {
+        worker(url, WorkerType::Decode, pair, healthy)
+    }
+
+    fn urls(workers: &[Arc<dyn Worker>]) -> Vec<&str> {
+        workers.iter().map(|w| w.url()).collect()
+    }
+
+    #[test]
+    fn decode_stays_in_the_prefills_pod() {
+        let decodes = vec![
+            decode("http://10.0.0.1:8043", Some("pair-a"), true),
+            decode("http://10.0.0.2:8043", Some("pair-b"), true),
+            decode("http://10.0.0.9:8043", None, true),
+        ];
+        let p = prefill("http://10.0.0.2:8041", Some("pair-b"), true);
+        assert_eq!(
+            urls(&pair_decode_candidates(decodes.clone(), p.as_ref())),
+            vec!["http://10.0.0.2:8043"]
+        );
+        // An unpaired prefill never takes a paired decode.
+        let p = prefill("http://10.0.0.9:8041", None, true);
+        assert_eq!(
+            urls(&pair_decode_candidates(decodes, p.as_ref())),
+            vec!["http://10.0.0.9:8043"]
+        );
+    }
+
+    #[test]
+    fn prefill_without_an_available_peer_is_not_selectable() {
+        let prefills = vec![
+            prefill("http://10.0.0.1:8041", Some("pair-a"), true),
+            prefill("http://10.0.0.2:8041", Some("pair-b"), true),
+            prefill("http://10.0.0.3:8041", Some("pair-c"), true),
+            prefill("http://10.0.0.9:8041", None, true),
+        ];
+        let decodes = vec![
+            decode("http://10.0.0.1:8043", Some("pair-a"), true),
+            // pair-b's decode is unhealthy; pair-c has no decode at all.
+            decode("http://10.0.0.2:8043", Some("pair-b"), false),
+        ];
+        assert_eq!(
+            urls(&pair_prefill_candidates(prefills, &decodes)),
+            vec!["http://10.0.0.1:8041", "http://10.0.0.9:8041"]
+        );
+    }
+
+    #[test]
+    fn unpaired_workers_select_as_before() {
+        let prefills = vec![
+            prefill("http://p1:8041", None, true),
+            prefill("http://p2:8041", None, true),
+        ];
+        let decodes = vec![
+            decode("http://d1:8043", None, true),
+            decode("http://d2:8043", None, false),
+        ];
+        assert_eq!(
+            urls(&pair_prefill_candidates(prefills.clone(), &decodes)).len(),
+            2
+        );
+        assert_eq!(
+            urls(&pair_decode_candidates(decodes, prefills[0].as_ref())).len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn select_pd_pair_never_crosses_pairs() {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for (pair, ip) in [("pair-a", "10.0.0.1"), ("pair-b", "10.0.0.2")] {
+            worker_registry.register(prefill(&format!("http://{ip}:8041"), Some(pair), true));
+            worker_registry.register(decode(&format!("http://{ip}:8043"), Some(pair), true));
+        }
+        let router = PDRouter {
+            worker_registry: worker_registry.clone(),
+            policy_registry: Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin)),
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            api_key: None,
+            enable_igw: false,
+            decode_gate: None,
+            request_timeout: Duration::from_secs(600),
+        };
+        for _ in 0..8 {
+            let (p, d) = router
+                .select_pd_pair(None, None, None)
+                .await
+                .expect("a pair");
+            assert_eq!(pd_pair_of(p.as_ref()), pd_pair_of(d.as_ref()));
+            assert!(pd_pair_of(p.as_ref()).is_some());
+        }
+        // With pair-a's decode down, only pair-b serves.
+        worker_registry
+            .get_by_url("http://10.0.0.1:8043")
+            .expect("registered")
+            .set_healthy(false);
+        for _ in 0..4 {
+            let (p, d) = router
+                .select_pd_pair(None, None, None)
+                .await
+                .expect("a pair");
+            assert_eq!(p.url(), "http://10.0.0.2:8041");
+            assert_eq!(d.url(), "http://10.0.0.2:8043");
+        }
     }
 }

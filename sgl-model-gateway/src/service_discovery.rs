@@ -27,6 +27,7 @@ use crate::{
     core::Job,
     observability::metrics::{metrics_labels, Metrics},
     protocols::worker_spec::WorkerConfigRequest,
+    routers::http::pd_router::PD_PAIR_LABEL,
 };
 
 #[derive(Debug, Clone)]
@@ -97,6 +98,24 @@ pub struct PodInfo {
     pub bootstrap_port: Option<u16>,
     pub is_router: bool,
     pub mesh_port: Option<u16>,
+    /// PD mode, a pod that serves one prefill/decode pair: (prefill port,
+    /// decode port) from its PD_PREFILL_PORT_ANNOTATION and
+    /// PD_DECODE_PORT_ANNOTATION. Both workers get PD_PAIR_LABEL = pod name.
+    pub pair_ports: Option<(u16, u16)>,
+}
+
+/// Pod annotations that make one pod a prefill/decode pair (PD mode): the
+/// prefill worker's port and the decode worker's port on the pod's IP.
+pub const PD_PREFILL_PORT_ANNOTATION: &str = "sglang.ai/prefill-port";
+pub const PD_DECODE_PORT_ANNOTATION: &str = "sglang.ai/decode-port";
+
+/// One worker that discovery registers for a pod.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredWorker {
+    pub url: String,
+    pub worker_type: Option<String>,
+    pub bootstrap_port: Option<u16>,
+    pub labels: HashMap<String, String>,
 }
 
 impl PodInfo {
@@ -181,6 +200,35 @@ impl PodInfo {
             None
         };
 
+        // A pair pod names both of its worker ports. A pod that names only
+        // one, or the same port twice, is refused rather than registered as
+        // an unpaired worker.
+        let pair_ports = match (config, &pod_type) {
+            (Some(config), Some(PodType::Prefill | PodType::Decode)) if config.pd_mode => {
+                let annotation = |key: &str| {
+                    pod.metadata
+                        .annotations
+                        .as_ref()
+                        .and_then(|annotations| annotations.get(key))
+                        .map(|value| value.parse::<u16>().ok().filter(|port| *port != 0))
+                };
+                match (
+                    annotation(PD_PREFILL_PORT_ANNOTATION),
+                    annotation(PD_DECODE_PORT_ANNOTATION),
+                ) {
+                    (None, None) => None,
+                    (Some(Some(prefill)), Some(Some(decode))) if prefill != decode => {
+                        Some((prefill, decode))
+                    }
+                    _ => {
+                        warn!("Pod refused: invalid prefill/decode pair port annotations");
+                        return None;
+                    }
+                }
+            }
+            _ => None,
+        };
+
         // Check if this is a router pod
         let is_router = if let Some(config) = config {
             !config.router_selector.is_empty()
@@ -213,6 +261,7 @@ impl PodInfo {
             bootstrap_port,
             is_router,
             mesh_port,
+            pair_ports,
         })
     }
 
@@ -223,6 +272,45 @@ impl PodInfo {
     pub fn worker_url(&self, port: u16) -> String {
         // Default to http:// prefix; workflow will detect actual protocol (HTTP vs gRPC)
         format!("http://{}:{}", self.ip, port)
+    }
+
+    /// The workers this pod serves. A pair pod (PD mode, pair_ports) serves a
+    /// prefill and a decode worker on its own ports, both labelled with the
+    /// pod name so the PD router keeps them together. Any other pod serves
+    /// one worker on the discovery port, typed by its selector match.
+    pub fn workers(&self, port: u16, pd_mode: bool) -> Vec<DiscoveredWorker> {
+        if let (true, Some((prefill_port, decode_port))) = (pd_mode, self.pair_ports) {
+            let labels = HashMap::from([(PD_PAIR_LABEL.to_string(), self.name.clone())]);
+            return vec![
+                DiscoveredWorker {
+                    url: self.worker_url(prefill_port),
+                    worker_type: Some("prefill".to_string()),
+                    bootstrap_port: self.bootstrap_port,
+                    labels: labels.clone(),
+                },
+                DiscoveredWorker {
+                    url: self.worker_url(decode_port),
+                    worker_type: Some("decode".to_string()),
+                    bootstrap_port: None,
+                    labels,
+                },
+            ];
+        }
+        let (worker_type, bootstrap_port) = if pd_mode {
+            match &self.pod_type {
+                Some(PodType::Prefill) => (Some("prefill".to_string()), self.bootstrap_port),
+                Some(PodType::Decode) => (Some("decode".to_string()), None),
+                Some(PodType::Regular) | None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+        vec![DiscoveredWorker {
+            url: self.worker_url(port),
+            worker_type,
+            bootstrap_port,
+            labels: HashMap::new(),
+        }]
     }
 }
 
@@ -375,6 +463,7 @@ pub async fn start_service_discovery(
                                     tracked_pods_inner,
                                     app_context_inner,
                                     port,
+                                    config_inner.pd_mode,
                                 )
                                 .await;
                             } else {
@@ -436,9 +525,22 @@ async fn handle_pod_event(
     port: u16,
     pd_mode: bool,
 ) {
-    let worker_url = pod_info.worker_url(port);
+    if !pod_info.is_healthy() {
+        return;
+    }
+    for worker in pod_info.workers(port, pd_mode) {
+        add_discovered_worker(pod_info, &worker, &tracked_pods, &app_context).await;
+    }
+}
 
-    if pod_info.is_healthy() {
+async fn add_discovered_worker(
+    pod_info: &PodInfo,
+    worker: &DiscoveredWorker,
+    tracked_pods: &Arc<Mutex<HashSet<PodInfo>>>,
+    app_context: &Arc<AppContext>,
+) {
+    let worker_url = worker.url.clone();
+    {
         // Track whether to add and get count in single lock acquisition
         let (should_add, tracked_count) = {
             let mut tracker = match tracked_pods.lock() {
@@ -464,24 +566,8 @@ async fn handle_pod_event(
                 pod_info.name, pod_info.pod_type, worker_url
             );
 
-            let worker_type = if pd_mode {
-                match &pod_info.pod_type {
-                    Some(PodType::Prefill) => Some("prefill".to_string()),
-                    Some(PodType::Decode) => Some("decode".to_string()),
-                    Some(PodType::Regular) | None => None,
-                }
-            } else {
-                None
-            };
-
-            let bootstrap_port = if pd_mode {
-                match &pod_info.pod_type {
-                    Some(PodType::Prefill) => pod_info.bootstrap_port,
-                    _ => None,
-                }
-            } else {
-                None
-            };
+            let worker_type = worker.worker_type.clone();
+            let bootstrap_port = worker.bootstrap_port;
 
             let config = WorkerConfigRequest {
                 url: worker_url.clone(),
@@ -490,7 +576,7 @@ async fn handle_pod_event(
                 priority: None,
                 cost: None,
                 runtime: None,
-                labels: HashMap::new(),
+                labels: worker.labels.clone(),
                 bootstrap_port,
                 tokenizer_path: None,
                 reasoning_parser: None,
@@ -569,8 +655,13 @@ async fn handle_pod_deletion(
     tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
     app_context: Arc<AppContext>,
     port: u16,
+    pd_mode: bool,
 ) {
-    let worker_url = pod_info.worker_url(port);
+    let worker_urls: Vec<String> = pod_info
+        .workers(port, pd_mode)
+        .into_iter()
+        .map(|worker| worker.url)
+        .collect();
 
     // Remove pod and get remaining count in single lock acquisition
     let (was_tracked, remaining_count) = {
@@ -587,45 +678,47 @@ async fn handle_pod_deletion(
 
     if was_tracked {
         info!(
-            "Removing pod: {} | type: {:?} | url: {}",
-            pod_info.name, pod_info.pod_type, worker_url
+            "Removing pod: {} | type: {:?} | urls: {:?}",
+            pod_info.name, pod_info.pod_type, worker_urls
         );
 
-        let job = Job::RemoveWorker {
-            url: worker_url.clone(),
-        };
+        for worker_url in &worker_urls {
+            let job = Job::RemoveWorker {
+                url: worker_url.clone(),
+            };
 
-        if let Some(job_queue) = app_context.worker_job_queue.get() {
-            if let Err(e) = job_queue.submit(job).await {
-                error!(
-                    "Failed to submit worker removal job for {}: {}",
-                    worker_url, e
-                );
+            if let Some(job_queue) = app_context.worker_job_queue.get() {
+                if let Err(e) = job_queue.submit(job).await {
+                    error!(
+                        "Failed to submit worker removal job for {}: {}",
+                        worker_url, e
+                    );
+                } else {
+                    debug!("Submitted worker removal job for {}", worker_url);
+
+                    // Layer 4: Record deregistration from K8s pod deletion
+                    Metrics::record_discovery_deregistration(
+                        metrics_labels::DISCOVERY_KUBERNETES,
+                        metrics_labels::DEREGISTRATION_POD_DELETED,
+                    );
+
+                    // Update workers discovered gauge (using count from initial lock)
+                    Metrics::set_discovery_workers_discovered(
+                        metrics_labels::DISCOVERY_KUBERNETES,
+                        remaining_count,
+                    );
+                }
             } else {
-                debug!("Submitted worker removal job for {}", worker_url);
-
-                // Layer 4: Record deregistration from K8s pod deletion
-                Metrics::record_discovery_deregistration(
-                    metrics_labels::DISCOVERY_KUBERNETES,
-                    metrics_labels::DEREGISTRATION_POD_DELETED,
-                );
-
-                // Update workers discovered gauge (using count from initial lock)
-                Metrics::set_discovery_workers_discovered(
-                    metrics_labels::DISCOVERY_KUBERNETES,
-                    remaining_count,
+                error!(
+                    "JobQueue not initialized, cannot remove worker {}",
+                    worker_url
                 );
             }
-        } else {
-            error!(
-                "JobQueue not initialized, cannot remove worker {}",
-                worker_url
-            );
         }
     } else {
         debug!(
-            "Pod deletion event for untracked/already removed pod: {} (type: {:?}). Worker URL: {}",
-            pod_info.name, pod_info.pod_type, worker_url
+            "Pod deletion event for untracked/already removed pod: {} (type: {:?}). Worker URLs: {:?}",
+            pod_info.name, pod_info.pod_type, worker_urls
         );
     }
 }
@@ -1224,6 +1317,7 @@ mod tests {
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
+            pair_ports: None,
         };
         assert!(healthy_pod.is_healthy());
 
@@ -1236,6 +1330,7 @@ mod tests {
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
+            pair_ports: None,
         };
         assert!(!not_ready_pod.is_healthy());
 
@@ -1248,6 +1343,7 @@ mod tests {
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
+            pair_ports: None,
         };
         assert!(!not_running_pod.is_healthy());
     }
@@ -1263,6 +1359,7 @@ mod tests {
             bootstrap_port: Some(8081),
             is_router: false,
             mesh_port: None,
+            pair_ports: None,
         };
 
         let pod2 = PodInfo {
@@ -1274,6 +1371,7 @@ mod tests {
             bootstrap_port: Some(8081),
             is_router: false,
             mesh_port: None,
+            pair_ports: None,
         };
 
         let pod3 = PodInfo {
@@ -1285,6 +1383,7 @@ mod tests {
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
+            pair_ports: None,
         };
 
         assert_eq!(pod1, pod2);
@@ -1304,6 +1403,7 @@ mod tests {
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
+            pair_ports: None,
         };
         let port = 8080u16;
 
@@ -1332,6 +1432,7 @@ mod tests {
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
+            pair_ports: None,
         };
         let port = 8080u16;
 
@@ -1340,9 +1441,148 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
+            false,
         )
         .await;
 
+        assert!(tracked_pods.lock().unwrap().is_empty());
+    }
+
+    fn create_pair_k8s_pod(name: &str, ip: &str, ports: &[(&str, &str)]) -> Pod {
+        // One pod matched by both selectors: the chart's paired PD layout
+        // labels the pod for prefill and for decode.
+        let mut pod = create_pd_k8s_pod(name, ip, "prefill", Some(8998));
+        let labels = pod.metadata.labels.as_mut().unwrap();
+        labels.insert("pd-pair".to_string(), "true".to_string());
+        let annotations = pod.metadata.annotations.as_mut().unwrap();
+        for (key, value) in ports {
+            annotations.insert(key.to_string(), value.to_string());
+        }
+        pod
+    }
+
+    fn create_pair_config() -> ServiceDiscoveryConfig {
+        let mut config = create_pd_config();
+        config.prefill_selector = HashMap::from([("pd-pair".to_string(), "true".to_string())]);
+        config.decode_selector = HashMap::from([("pd-pair".to_string(), "true".to_string())]);
+        config
+    }
+
+    #[test]
+    fn test_pair_pod_serves_its_prefill_and_decode_port_as_one_pair() {
+        let pod = create_pair_k8s_pod(
+            "pair-a",
+            "10.0.0.7",
+            &[
+                (PD_PREFILL_PORT_ANNOTATION, "8041"),
+                (PD_DECODE_PORT_ANNOTATION, "8043"),
+            ],
+        );
+        let info = PodInfo::from_pod(&pod, Some(&create_pair_config())).unwrap();
+        assert_eq!(info.pair_ports, Some((8041, 8043)));
+        let workers = info.workers(8080, true);
+        assert_eq!(workers.len(), 2);
+        assert_eq!(workers[0].url, "http://10.0.0.7:8041");
+        assert_eq!(workers[0].worker_type.as_deref(), Some("prefill"));
+        assert_eq!(workers[0].bootstrap_port, Some(8998));
+        assert_eq!(workers[1].url, "http://10.0.0.7:8043");
+        assert_eq!(workers[1].worker_type.as_deref(), Some("decode"));
+        assert_eq!(workers[1].bootstrap_port, None);
+        for worker in &workers {
+            assert_eq!(
+                worker.labels.get(PD_PAIR_LABEL).map(String::as_str),
+                Some("pair-a")
+            );
+        }
+    }
+
+    #[test]
+    fn test_half_or_invalid_pair_annotations_refuse_the_pod() {
+        for ports in [
+            vec![(PD_PREFILL_PORT_ANNOTATION, "8041")],
+            vec![(PD_DECODE_PORT_ANNOTATION, "8043")],
+            vec![
+                (PD_PREFILL_PORT_ANNOTATION, "8041"),
+                (PD_DECODE_PORT_ANNOTATION, "8041"),
+            ],
+            vec![
+                (PD_PREFILL_PORT_ANNOTATION, "x"),
+                (PD_DECODE_PORT_ANNOTATION, "8043"),
+            ],
+            vec![
+                (PD_PREFILL_PORT_ANNOTATION, "0"),
+                (PD_DECODE_PORT_ANNOTATION, "8043"),
+            ],
+        ] {
+            let pod = create_pair_k8s_pod("pair-a", "10.0.0.7", &ports);
+            assert!(PodInfo::from_pod(&pod, Some(&create_pair_config())).is_none());
+        }
+    }
+
+    #[test]
+    fn test_pods_without_pair_annotations_keep_upstream_discovery() {
+        // PD mode: one worker per pod on the discovery port, typed by selector.
+        let pod = create_pd_k8s_pod("decode-pod", "10.0.0.2", "decode", None);
+        let info = PodInfo::from_pod(&pod, Some(&create_pd_config())).unwrap();
+        assert_eq!(info.pair_ports, None);
+        let workers = info.workers(8080, true);
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].url, "http://10.0.0.2:8080");
+        assert_eq!(workers[0].worker_type.as_deref(), Some("decode"));
+        assert!(workers[0].labels.is_empty());
+
+        // Regular mode (--service-discovery --selector): pair annotations
+        // mean nothing, the pod is one regular worker.
+        let mut config = create_pd_config();
+        config.pd_mode = false;
+        config.selector = HashMap::from([("app".to_string(), "sglang".to_string())]);
+        let pod = create_pair_k8s_pod(
+            "pair-a",
+            "10.0.0.7",
+            &[
+                (PD_PREFILL_PORT_ANNOTATION, "8041"),
+                (PD_DECODE_PORT_ANNOTATION, "8043"),
+            ],
+        );
+        assert!(PodInfo::should_include(&pod, &config));
+        let info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+        assert_eq!(info.pair_ports, None);
+        let workers = info.workers(8080, false);
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].url, "http://10.0.0.7:8080");
+        assert_eq!(workers[0].worker_type, None);
+    }
+
+    #[tokio::test]
+    async fn test_handle_pair_pod_event_and_deletion() {
+        let app_context = create_test_app_context().await;
+        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let pod = create_pair_k8s_pod(
+            "pair-a",
+            "10.0.0.7",
+            &[
+                (PD_PREFILL_PORT_ANNOTATION, "8041"),
+                (PD_DECODE_PORT_ANNOTATION, "8043"),
+            ],
+        );
+        let info = PodInfo::from_pod(&pod, Some(&create_pair_config())).unwrap();
+        handle_pod_event(
+            &info,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&app_context),
+            8080,
+            true,
+        )
+        .await;
+        assert!(tracked_pods.lock().unwrap().contains(&info));
+        handle_pod_deletion(
+            &info,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&app_context),
+            8080,
+            true,
+        )
+        .await;
         assert!(tracked_pods.lock().unwrap().is_empty());
     }
 
@@ -1359,6 +1599,7 @@ mod tests {
             bootstrap_port: Some(8081),
             is_router: false,
             mesh_port: None,
+            pair_ports: None,
         };
         let port = 8080u16;
 
@@ -1392,6 +1633,7 @@ mod tests {
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
+            pair_ports: None,
         };
         let port = 8080u16;
 
@@ -1425,6 +1667,7 @@ mod tests {
             bootstrap_port: Some(8081),
             is_router: false,
             mesh_port: None,
+            pair_ports: None,
         };
 
         // Add pod to tracked set first
@@ -1440,6 +1683,7 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
+            false,
         )
         .await;
 
@@ -1460,6 +1704,7 @@ mod tests {
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
+            pair_ports: None,
         };
         let port = 8080u16;
 
@@ -1470,6 +1715,7 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
+            false,
         )
         .await;
 
@@ -1490,6 +1736,7 @@ mod tests {
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
+            pair_ports: None,
         };
         let port = 8080u16;
 
@@ -1524,6 +1771,7 @@ mod tests {
             bootstrap_port: Some(8081),
             is_router: false,
             mesh_port: None,
+            pair_ports: None,
         };
         let port = 8080u16;
 
@@ -1557,6 +1805,7 @@ mod tests {
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
+            pair_ports: None,
         };
 
         // Add pod to tracked set first
@@ -1572,6 +1821,7 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
+            false,
         )
         .await;
 
