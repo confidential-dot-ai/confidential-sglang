@@ -21,7 +21,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-# A container image has no .git; recipes/deepseek-v41/container/build.sh writes this.
+# A container image has no .git; confidential/engine/Dockerfile writes this.
 SOURCE_RECORD = ROOT / "SOURCE_RECORD.json"
 GIB = 1024**3
 # The prefill graph cap the server applies when none is given (deepseek_v4_hook.py).
