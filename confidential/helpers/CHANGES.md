@@ -139,7 +139,7 @@ been done here; it needs the image.
 
 `python3 -m pytest confidential/tests/helpers` (no GPU, no network, no
 SGLang import; pytest, fastapi, httpx, pillow; the two ASGI tests skip without
-fastapi/httpx): 144 passed (wait-for-model, fetch-model, server output and
+fastapi/httpx): 174 passed (wait-for-model, fetch-model, server output and
 signals, HTTP/media/listener policy against this checkout's source, simulator
 parser no-op, pair supervisor/diagnostics/log and snapshot delivery against
 this checkout's `pair_progress` and `pair_nccl_diagnostics`).
