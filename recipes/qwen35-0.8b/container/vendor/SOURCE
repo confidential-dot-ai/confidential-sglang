@@ -1,0 +1,15 @@
+Copied unchanged from confidential-dot-ai/confidential-inference at
+00b679016a4246ed16aa8065b684789d83b7b646 (images/sglang/). The chart runs them
+by these paths, so keep them in step with the chart version you deploy.
+
+wait_for_model.py  -> /usr/local/bin/wait-for-model   fafd1bf8dcffd7c6d651ea15e3efe4e800c91fc0393a19df950da11e1d59c28a
+fetch_model.py     -> /usr/local/bin/fetch-model      84d2144c4dea66a2323f2e3b6b326daffea23ed5ad78e309be69dcd3f002b23e
+dcgm-counters.csv  -> /etc/dcgm-exporter/counters.csv adf12881c7b2b63507f31924630529d0337b20a0c420a13284d66cb1b8329aef
+harden_http.py     -> build time only (--variant pd)  d6591a6993d0674235f1f62f64426a9c641d4934c1adbac5fedb0641109e08a5
+
+harden_http.py is the copy in recipes/deepseek-v41/chart/vendor (confidential-sglang
+#4). It is confidential-inference a59231a's images/sglang/harden_http.py
+(8878d6cd...) with one line changed: the "pd" variant's SOURCE_HASHES pin this
+fork's post-314bce7 http_server.py and launch_server.py (fcd651b9...,
+0d47833b...) in place of upstream a7fd2e1's. That PR's vendor/SOURCE records the
+review of the policy against these files.
