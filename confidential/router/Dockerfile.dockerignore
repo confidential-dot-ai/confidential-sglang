@@ -1,0 +1,10 @@
+# Allowlist: only what confidential/router/Dockerfile copies.
+*
+!sgl-model-gateway
+!confidential/router
+sgl-model-gateway/target
+sgl-model-gateway/bindings/python/dist
+sgl-model-gateway/bindings/golang
+sgl-model-gateway/e2e_test
+**/__pycache__
+**/*.pyc
