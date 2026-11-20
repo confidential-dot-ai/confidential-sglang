@@ -81,6 +81,51 @@ struct PrefillStreamFailure {
     worker_ok: bool,
 }
 
+/// Worker label that ties a prefill worker to its decode worker. Service
+/// discovery sets it to the pod name for a pod that serves both roles
+/// (`sglang.ai/prefill-port` and `sglang.ai/decode-port` annotations); a
+/// worker added through the API may set it too. Workers without it are
+/// unpaired and select as before.
+pub const PD_PAIR_LABEL: &str = "pd_pair";
+
+fn pd_pair_of(worker: &dyn Worker) -> Option<&str> {
+    worker
+        .metadata()
+        .labels
+        .get(PD_PAIR_LABEL)
+        .map(String::as_str)
+}
+
+/// Prefill workers a request may use: unpaired ones, and paired ones whose
+/// own decode worker is available.
+fn pair_prefill_candidates(
+    prefills: Vec<Arc<dyn Worker>>,
+    decodes: &[Arc<dyn Worker>],
+) -> Vec<Arc<dyn Worker>> {
+    prefills
+        .into_iter()
+        .filter(|p| match pd_pair_of(p.as_ref()) {
+            None => true,
+            Some(pair) => decodes
+                .iter()
+                .any(|d| d.is_available() && pd_pair_of(d.as_ref()) == Some(pair)),
+        })
+        .collect()
+}
+
+/// Decode workers for a selected prefill: its peer when it is paired, and
+/// only unpaired decode workers when it is not.
+fn pair_decode_candidates(
+    decodes: Vec<Arc<dyn Worker>>,
+    prefill: &dyn Worker,
+) -> Vec<Arc<dyn Worker>> {
+    let pair = pd_pair_of(prefill);
+    decodes
+        .into_iter()
+        .filter(|d| pd_pair_of(d.as_ref()) == pair)
+        .collect()
+}
+
 #[derive(Debug)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
@@ -453,6 +498,7 @@ impl PDRouter {
                                 context.model_id,
                                 context.headers.as_ref(),
                                 false,
+                                None,
                             )
                             .await
                             .map(|prefill| (prefill, None))
@@ -775,6 +821,7 @@ impl PDRouter {
                         context.model_id,
                         context.headers.as_ref(),
                         true,
+                        Some(&prefill),
                     )
                     .await
                     .map_err(Self::handle_server_selection_error)?,
@@ -1210,10 +1257,10 @@ impl PDRouter {
         headers: Option<&HeaderMap>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
         let prefill = self
-            .select_worker(request_text, model_id, headers, false)
+            .select_worker(request_text, model_id, headers, false, None)
             .await?;
         let decode = self
-            .select_worker(request_text, model_id, headers, true)
+            .select_worker(request_text, model_id, headers, true, Some(&prefill))
             .await?;
         Ok((prefill, decode))
     }
@@ -1224,6 +1271,7 @@ impl PDRouter {
         model_id: Option<&str>,
         headers: Option<&HeaderMap>,
         decode: bool,
+        paired_prefill: Option<&Arc<dyn Worker>>,
     ) -> Result<Arc<dyn Worker>, String> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -1232,20 +1280,17 @@ impl PDRouter {
             decode, self.enable_igw, model_id, effective_model_id
         );
 
-        let workers = match effective_model_id {
-            Some(model) => self
-                .worker_registry
-                .get_by_model(model)
-                .iter()
-                .filter(|w| match w.worker_type() {
-                    WorkerType::Decode => decode,
-                    WorkerType::Prefill { .. } => !decode,
-                    _ => false,
-                })
-                .cloned()
-                .collect(),
-            None if decode => self.worker_registry.get_decode_workers(),
-            None => self.worker_registry.get_prefill_workers(),
+        let workers = self.role_workers(effective_model_id, decode);
+        // Discovered prefill/decode pairs (PD_PAIR_LABEL) never cross: a paired
+        // prefill is eligible only while its own decode is available, and the
+        // decode of a request is the selected prefill's peer.
+        let workers = if decode {
+            match paired_prefill {
+                Some(prefill) => pair_decode_candidates(workers, prefill.as_ref()),
+                None => workers,
+            }
+        } else {
+            pair_prefill_candidates(workers, &self.role_workers(effective_model_id, true))
         };
 
         let (policy, role, label) = if decode {
@@ -1286,6 +1331,24 @@ impl PDRouter {
         );
 
         Ok(worker)
+    }
+
+    fn role_workers(&self, effective_model_id: Option<&str>, decode: bool) -> Vec<Arc<dyn Worker>> {
+        match effective_model_id {
+            Some(model) => self
+                .worker_registry
+                .get_by_model(model)
+                .iter()
+                .filter(|w| match w.worker_type() {
+                    WorkerType::Decode => decode,
+                    WorkerType::Prefill { .. } => !decode,
+                    _ => false,
+                })
+                .cloned()
+                .collect(),
+            None if decode => self.worker_registry.get_decode_workers(),
+            None => self.worker_registry.get_prefill_workers(),
+        }
     }
 
     async fn pick_worker_by_policy_arc(
@@ -2419,5 +2482,144 @@ mod tests {
         // Guards dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
+    }
+}
+
+#[cfg(test)]
+mod pair_selection_tests {
+    use super::*;
+    use crate::core::BasicWorkerBuilder;
+
+    fn worker(
+        url: &str,
+        worker_type: WorkerType,
+        pair: Option<&str>,
+        healthy: bool,
+    ) -> Arc<dyn Worker> {
+        let mut builder = BasicWorkerBuilder::new(url).worker_type(worker_type);
+        if let Some(pair) = pair {
+            builder = builder.label(PD_PAIR_LABEL, pair);
+        }
+        let worker = builder.build();
+        worker.set_healthy(healthy);
+        Arc::new(worker)
+    }
+
+    fn prefill(url: &str, pair: Option<&str>, healthy: bool) -> Arc<dyn Worker> {
+        worker(
+            url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            pair,
+            healthy,
+        )
+    }
+
+    fn decode(url: &str, pair: Option<&str>, healthy: bool) -> Arc<dyn Worker> {
+        worker(url, WorkerType::Decode, pair, healthy)
+    }
+
+    fn urls(workers: &[Arc<dyn Worker>]) -> Vec<&str> {
+        workers.iter().map(|w| w.url()).collect()
+    }
+
+    #[test]
+    fn decode_stays_in_the_prefills_pod() {
+        let decodes = vec![
+            decode("http://10.0.0.1:8043", Some("pair-a"), true),
+            decode("http://10.0.0.2:8043", Some("pair-b"), true),
+            decode("http://10.0.0.9:8043", None, true),
+        ];
+        let p = prefill("http://10.0.0.2:8041", Some("pair-b"), true);
+        assert_eq!(
+            urls(&pair_decode_candidates(decodes.clone(), p.as_ref())),
+            vec!["http://10.0.0.2:8043"]
+        );
+        // An unpaired prefill never takes a paired decode.
+        let p = prefill("http://10.0.0.9:8041", None, true);
+        assert_eq!(
+            urls(&pair_decode_candidates(decodes, p.as_ref())),
+            vec!["http://10.0.0.9:8043"]
+        );
+    }
+
+    #[test]
+    fn prefill_without_an_available_peer_is_not_selectable() {
+        let prefills = vec![
+            prefill("http://10.0.0.1:8041", Some("pair-a"), true),
+            prefill("http://10.0.0.2:8041", Some("pair-b"), true),
+            prefill("http://10.0.0.3:8041", Some("pair-c"), true),
+            prefill("http://10.0.0.9:8041", None, true),
+        ];
+        let decodes = vec![
+            decode("http://10.0.0.1:8043", Some("pair-a"), true),
+            // pair-b's decode is unhealthy; pair-c has no decode at all.
+            decode("http://10.0.0.2:8043", Some("pair-b"), false),
+        ];
+        assert_eq!(
+            urls(&pair_prefill_candidates(prefills, &decodes)),
+            vec!["http://10.0.0.1:8041", "http://10.0.0.9:8041"]
+        );
+    }
+
+    #[test]
+    fn unpaired_workers_select_as_before() {
+        let prefills = vec![
+            prefill("http://p1:8041", None, true),
+            prefill("http://p2:8041", None, true),
+        ];
+        let decodes = vec![
+            decode("http://d1:8043", None, true),
+            decode("http://d2:8043", None, false),
+        ];
+        assert_eq!(
+            urls(&pair_prefill_candidates(prefills.clone(), &decodes)).len(),
+            2
+        );
+        assert_eq!(
+            urls(&pair_decode_candidates(decodes, prefills[0].as_ref())).len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn select_pd_pair_never_crosses_pairs() {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for (pair, ip) in [("pair-a", "10.0.0.1"), ("pair-b", "10.0.0.2")] {
+            worker_registry.register(prefill(&format!("http://{ip}:8041"), Some(pair), true));
+            worker_registry.register(decode(&format!("http://{ip}:8043"), Some(pair), true));
+        }
+        let router = PDRouter {
+            worker_registry: worker_registry.clone(),
+            policy_registry: Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin)),
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            api_key: None,
+            enable_igw: false,
+            decode_gate: None,
+            request_timeout: Duration::from_secs(600),
+        };
+        for _ in 0..8 {
+            let (p, d) = router
+                .select_pd_pair(None, None, None)
+                .await
+                .expect("a pair");
+            assert_eq!(pd_pair_of(p.as_ref()), pd_pair_of(d.as_ref()));
+            assert!(pd_pair_of(p.as_ref()).is_some());
+        }
+        // With pair-a's decode down, only pair-b serves.
+        worker_registry
+            .get_by_url("http://10.0.0.1:8043")
+            .expect("registered")
+            .set_healthy(false);
+        for _ in 0..4 {
+            let (p, d) = router
+                .select_pd_pair(None, None, None)
+                .await
+                .expect("a pair");
+            assert_eq!(p.url(), "http://10.0.0.2:8041");
+            assert_eq!(d.url(), "http://10.0.0.2:8043");
+        }
     }
 }
