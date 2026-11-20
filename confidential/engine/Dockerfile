@@ -134,6 +134,10 @@ ARG SOURCE_DATE_EPOCH
 # runs it inside the pod for a PD pair, and its preflight imports it.
 RUN --mount=type=bind,from=router-wheel,source=/out,target=/run-router,readonly \
     uv pip install --no-deps /run-router/sglang_router-*.whl \
+    && dist=$(echo /opt/dsv41/lib/python3.12/site-packages/sglang_router-*.dist-info) \
+    && rm "$dist/uv_cache.json" \
+    && sed -i '/^sglang_router-[^/]*\.dist-info\/uv_cache\.json,/d' "$dist/RECORD" \
+    && ! grep -q uv_cache "$dist/RECORD" \
     && python -I -B -c 'import sglang_router.sglang_router_rs'
 
 # DCGM exporter with its embedded host engine, as confidential-inference's
@@ -157,8 +161,9 @@ RUN --mount=type=bind,source=confidential/helpers,target=/run-src/helpers,readon
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0.dev0 SGLANG_BUILD_RUST_EXTS=none \
         uv pip install --no-deps --no-build-isolation -e /opt/sglang/python \
     && dist=/opt/dsv41/lib/python3.12/site-packages/sglang-0.0.0.dev0.dist-info \
-    && rm -f "$dist/uv_cache.json" \
+    && rm "$dist/uv_cache.json" \
     && sed -i '/^sglang-0\.0\.0\.dev0\.dist-info\/uv_cache\.json,/d' "$dist/RECORD" \
+    && ! grep -q uv_cache "$dist/RECORD" \
     && python -I -B /run-src/helpers/harden_http.py --root /opt/sglang/python/sglang --variant pd \
     && python -I -B /run-src/helpers/harden_media.py --root /opt/sglang/python/sglang \
     && python -I -B /run-src/helpers/harden_dist.py --root /opt/sglang/python/sglang \
