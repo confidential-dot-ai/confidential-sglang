@@ -165,7 +165,10 @@ impl PDRouter {
                         response
                     }
                     Err(e) => {
-                        error!("Failed to read response body: {}", e);
+                        error!(
+                            ci_event = "worker_response_read_failed",
+                            "Worker response read failed"
+                        );
                         error::internal_error(
                             "read_response_body_failed",
                             format!("Failed to read response body: {}", e),
@@ -205,7 +208,7 @@ impl PDRouter {
                 }
             }
             Err(e) => {
-                error!("Failed to proxy request server: {}", e);
+                error!(ci_event = "worker_proxy_failed", "Worker proxy failed");
                 error::internal_error(
                     "proxy_request_failed",
                     format!("Failed to proxy request: {}", e),
@@ -231,15 +234,21 @@ impl PDRouter {
     }
 
     fn handle_server_selection_error(error: String) -> Response {
-        error!("Failed to select PD pair error={}", error);
+        error!(
+            ci_event = "pair_selection_failed",
+            "PD pair selection failed"
+        );
         error::service_unavailable(
             "server_selection_failed",
             format!("No available servers: {}", error),
         )
     }
 
-    fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
-        error!("Failed to serialize request error={}", error);
+    fn handle_serialization_error(_error: impl std::fmt::Display) -> Response {
+        error!(
+            ci_event = "request_serialization_failed",
+            "Request serialization failed"
+        );
         error::internal_error("serialization_failed", "Failed to serialize request")
     }
 
@@ -596,16 +605,13 @@ impl PDRouter {
                     Ok(error_json) => {
                         json!({ "message": error_json, "status": status.as_u16() })
                     }
-                    Err(parse_err) => {
+                    Err(_) => {
                         let body_text = String::from_utf8_lossy(&error_body).to_string();
-                        let preview: String = body_text.chars().take(256).collect();
                         tracing::warn!(
-                            "Failed to parse decode error body as JSON from {}: {} \
-                             (status={}, body preview: {:?})",
-                            decode.url(),
-                            parse_err,
-                            status.as_u16(),
-                            preview
+                            ci_event = "worker_error_body_invalid_json",
+                            role = "decode",
+                            status = status.as_u16(),
+                            "Worker error body is not JSON"
                         );
                         json!({ "message": body_text, "status": status.as_u16() })
                     }
@@ -728,7 +734,10 @@ impl PDRouter {
         {
             Ok(request) => request,
             Err(e) => {
-                error!("Failed to prepare PD worker requests: {}", e);
+                error!(
+                    ci_event = "worker_request_prepare_failed",
+                    "PD worker request preparation failed"
+                );
                 return (
                     error::internal_error("pd_request_preparation_failed", e),
                     None,
@@ -780,7 +789,11 @@ impl PDRouter {
             }
             .await
             .map_err(|e| {
-                error!("Failed to prepare PD worker requests: {}", e);
+                error!(
+                    ci_event = "worker_request_prepare_failed",
+                    role = "decode",
+                    "PD worker request preparation failed"
+                );
                 error::internal_error("pd_request_preparation_failed", e)
             })?;
             let decode_request = self.build_post_with_headers(
@@ -929,8 +942,9 @@ impl PDRouter {
 
         if prefill_failed {
             warn!(
-                "Prefill failed, aborting paired decode request prefill_url={}",
-                prefill.url()
+                ci_event = "paired_decode_cancelled",
+                role = "prefill",
+                "Prefill failed; paired decode cancelled"
             );
 
             // Tick prefill by its real status (4xx = client fault). Don't record
@@ -1079,8 +1093,12 @@ impl PDRouter {
                                 *response.headers_mut() = response_headers;
                                 response
                             }
-                            Err(e) => {
-                                error!("Failed to read decode response: {}", e);
+                            Err(_) => {
+                                error!(
+                                    ci_event = "worker_response_read_failed",
+                                    role = "decode",
+                                    "Worker response read failed"
+                                );
                                 error::internal_error(
                                     "read_response_failed",
                                     "Failed to read response",
@@ -1129,9 +1147,10 @@ impl PDRouter {
             Ok(res) => {
                 let status = res.status();
                 error!(
-                    "Decode server returned error status decode_url={} status={}",
-                    decode.url(),
-                    status
+                    ci_event = "worker_http_error",
+                    role = "decode",
+                    status = status.as_u16(),
+                    "Worker returned an error status"
                 );
                 // Streaming errors are ticked on drop by the `BreakerTrackedStream`
                 // that `handle_decode_error_response` wraps them in.
@@ -1143,8 +1162,8 @@ impl PDRouter {
             }
             Err(e) => {
                 error!(
-                    decode_url = %decode.url(),
-                    error = %e,
+                    ci_event = "worker_request_failed",
+                    role = "decode",
                     "Decode request failed"
                 );
                 decode.record_outcome(false);
@@ -1355,7 +1374,6 @@ impl PDRouter {
         if !(status.is_success() || status.is_client_error()) {
             tracked.mark_errored();
         }
-        let decode_for_log = decode.clone();
         let prefill_for_outcome = prefill.clone();
         // Set only when decode is relayed before prefill finished; `pending()`
         // keeps the select arm below inert otherwise.
@@ -1430,8 +1448,8 @@ impl PDRouter {
                     }
                     _ = tx.closed() => {
                         tracing::info!(
-                            "Client disconnected, cancelling upstream PD stream from {}",
-                            decode_for_log.url()
+                            ci_event = "client_disconnected", role = "decode",
+                            "Client disconnected; upstream PD stream cancelled"
                         );
                         client_gone = true;
                         break;
@@ -1476,7 +1494,7 @@ impl PDRouter {
         pending: Pin<
             Box<impl Future<Output = Result<reqwest::Response, reqwest::Error>> + Send + 'static>,
         >,
-        prefill_url: String,
+        _prefill_url: String,
     ) -> PrefillCompletion {
         Box::pin(async move {
             let result = match resolved {
@@ -1485,8 +1503,9 @@ impl PDRouter {
             };
             let response = result.map_err(|e| {
                 error!(
-                    "Prefill server failed prefill_url={} error={} after decode started streaming",
-                    prefill_url, e
+                    ci_event = "worker_request_failed",
+                    role = "prefill",
+                    "Prefill request failed after decode started streaming"
                 );
                 PrefillStreamFailure {
                     status: StatusCode::BAD_GATEWAY,
@@ -1502,8 +1521,10 @@ impl PDRouter {
                     .await
                     .unwrap_or_else(|_| "Unknown prefill error".to_string());
                 error!(
-                    "Prefill server returned error status prefill_url={} status={} body={}",
-                    prefill_url, status, body
+                    ci_event = "worker_http_error",
+                    role = "prefill",
+                    status = status.as_u16(),
+                    "Worker returned an error status"
                 );
                 return Err(PrefillStreamFailure {
                     status,
@@ -1513,8 +1534,9 @@ impl PDRouter {
             }
             response.bytes().await.map(|_| ()).map_err(|e| {
                 warn!(
-                    "Error consuming prefill response prefill_url={} error={}",
-                    prefill_url, e
+                    ci_event = "worker_response_read_failed",
+                    role = "prefill",
+                    "Worker response read failed"
                 );
                 PrefillStreamFailure {
                     status: StatusCode::BAD_GATEWAY,
@@ -1536,8 +1558,12 @@ impl PDRouter {
         let response = res.bytes().await;
         let decode_body = match response {
             Ok(decode_body) => decode_body,
-            Err(e) => {
-                error!("Failed to read decode response: {}", e);
+            Err(_) => {
+                error!(
+                    ci_event = "worker_response_read_failed",
+                    role = "decode",
+                    "Worker response read failed"
+                );
                 return error::internal_error("read_response_failed", "Failed to read response");
             }
         };
@@ -1564,8 +1590,11 @@ impl PDRouter {
         // Return merged response
         match serde_json::to_vec(&decode_json) {
             Ok(body) => (status, body).into_response(),
-            Err(e) => {
-                error!("Failed to serialize merged response: {}", e);
+            Err(_) => {
+                error!(
+                    ci_event = "response_serialization_failed",
+                    "Response serialization failed"
+                );
                 (status, decode_body).into_response()
             }
         }
@@ -1575,7 +1604,7 @@ impl PDRouter {
     async fn process_prefill_response(
         &self,
         prefill_result: Result<reqwest::Response, reqwest::Error>,
-        prefill_url: &str,
+        _prefill_url: &str,
         return_logprob: bool,
     ) -> Result<(StatusCode, Option<bytes::Bytes>), Response> {
         // Check prefill result first - it's critical for disaggregated mode
@@ -1583,9 +1612,9 @@ impl PDRouter {
             Ok(response) => response,
             Err(e) => {
                 error!(
-                    "Prefill server failed (CRITICAL) prefill_url={} error={}. Decode will timeout without prefill KV cache.",
-                    prefill_url,
-                    e
+                    ci_event = "worker_request_failed",
+                    role = "prefill",
+                    "Prefill request failed"
                 );
 
                 // Return error immediately - don't wait for decode to timeout
@@ -1611,8 +1640,10 @@ impl PDRouter {
                 .unwrap_or_else(|_| "Unknown prefill error".to_string());
 
             error!(
-                "Prefill server returned error status prefill_url={} status={} body={}",
-                prefill_url, prefill_status, error_msg
+                ci_event = "worker_http_error",
+                role = "prefill",
+                status = prefill_status.as_u16(),
+                "Worker returned an error status"
             );
 
             // Map prefill_status to appropriate error function
@@ -1649,8 +1680,12 @@ impl PDRouter {
         let prefill_body = if return_logprob {
             match prefill_response.bytes().await {
                 Ok(body) => Some(body),
-                Err(e) => {
-                    warn!("Failed to read prefill response body for logprobs: {}", e);
+                Err(_) => {
+                    warn!(
+                        ci_event = "worker_response_read_failed",
+                        role = "prefill",
+                        "Worker response read failed"
+                    );
                     None
                 }
             }
@@ -1659,7 +1694,11 @@ impl PDRouter {
             debug!("Consuming prefill response body (non-logprob request)");
             match prefill_response.bytes().await {
                 Ok(_) => debug!("Prefill response consumed successfully"),
-                Err(e) => warn!("Error consuming prefill response: {}", e),
+                Err(_) => warn!(
+                    ci_event = "worker_response_read_failed",
+                    role = "prefill",
+                    "Worker response read failed"
+                ),
             }
             None
         };
