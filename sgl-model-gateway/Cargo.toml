@@ -206,3 +206,9 @@ codegen-units = 1
 [profile.dev-opt]
 inherits = "dev"
 opt-level = 1
+
+# openai-protocol 1.0.0 plus `forced_text` on ChatCompletionRequest, so the
+# router forwards Oracle-decoding requests (recipes/deepseek-v41/loadtest).
+# The crate's chat request has no catch-all field; unknown fields are dropped.
+[patch.crates-io]
+openai-protocol = { path = "vendor/openai-protocol" }

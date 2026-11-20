@@ -859,6 +859,22 @@ class TestLaunch(unittest.TestCase):
                     expected,
                 )
 
+    def test_oracle_decode_is_off_by_default_and_reaches_both_roles(self):
+        for worker in launch.build_plan(self.args())["workers"]:
+            self.assertNotIn("SGLANG_ENABLE_ORACLE_DECODE", worker["env"])
+        plan = launch.build_plan(self.args("--oracle-decode", "--oracle-commit-len", "4"))
+        for worker in plan["workers"]:
+            self.assertEqual(worker["env"]["SGLANG_ENABLE_ORACLE_DECODE"], "1")
+            self.assertEqual(worker["env"]["SGLANG_ORACLE_COMMIT_LEN"], "4")
+        for bad in (("--oracle-commit-len", "4"), ("--oracle-decode", "--oracle-commit-len", "99")):
+            with self.assertRaises(ValueError):
+                launch.validate(self.args(*bad))
+
+    def test_worker_metrics_are_on_by_default_for_both_roles(self):
+        for flag, expected in ((), True), (("--no-worker-metrics",), False):
+            for worker in launch.build_plan(self.args(*flag))["workers"]:
+                self.assertEqual("--enable-metrics" in worker["command"], expected)
+
     def test_both_roles_parse_v41_tool_calls_and_reasoning(self):
         for worker in launch.build_plan(self.args())["workers"]:
             command = worker["command"]
@@ -926,7 +942,7 @@ class TestLaunch(unittest.TestCase):
             ("--decode-graph-extra-bs", "12"),  # needs split graphs
         ):
             with self.assertRaises(ValueError):
-                launch.build_plan(self.args(*bad))
+                launch.validate(self.args(*bad))
 
     def test_graph_bs_replace_default_tiers(self):
         plan = launch.build_plan(
@@ -958,7 +974,7 @@ class TestLaunch(unittest.TestCase):
             ("--prefill-graph-bs", "4096"),  # needs split graphs
         ):
             with self.assertRaises(ValueError):
-                launch.build_plan(self.args(*bad))
+                launch.validate(self.args(*bad))
 
     def test_tokenizer_workers_apply_to_both_roles(self):
         flag = "--tokenizer-worker-num"

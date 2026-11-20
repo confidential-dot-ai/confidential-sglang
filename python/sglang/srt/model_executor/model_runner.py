@@ -59,6 +59,7 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.oracle_decode.forced_token_pool import get_oracle_pool
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionMetrics,
@@ -2276,6 +2277,10 @@ class ModelRunner:
                     else {}
                 ),
             )
+        if forward_batch.oracle_active:
+            next_token_ids = get_oracle_pool(
+                self.req_to_token_pool, next_token_ids.device
+            ).apply(next_token_ids, positions, forward_batch.req_pool_indices)
         if observer_state is not None:
             logits_output.auxiliary_device_output = observer.after_sample(
                 observer_state,
