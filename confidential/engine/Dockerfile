@@ -122,6 +122,7 @@ root = pathlib.Path(j.__file__).parent / 'providers'; \
 missing = [a for a in ('sm100a', 'sm103a') if not (root / a / 'jit_cache/sampling/sampling.so').is_file()]; \
 assert not missing, f'jit-cache providers missing sampling.so: {missing}'; \
 print('flashinfer', flashinfer.__version__, 'jit-cache', j.__version__, 'cubin', c.__version__)" \
+    && rm -rf /root/.cache /root/.triton /tmp/* \
     && find /opt/dsv41 -xdev -exec touch -h -d @0 {} +
 # Mooncake's transfer engine links the CUDA 12 runtime from its wheel.
 ENV LD_LIBRARY_PATH=/opt/dsv41/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH}
@@ -161,8 +162,9 @@ RUN --mount=type=bind,source=confidential/helpers,target=/run-src/helpers,readon
     && python -I -B /run-src/helpers/harden_http.py --root /opt/sglang/python/sglang --variant pd \
     && python -I -B /run-src/helpers/harden_media.py --root /opt/sglang/python/sglang \
     && python -I -B /run-src/helpers/harden_dist.py --root /opt/sglang/python/sglang \
-    && python -B -c "import sglang.launch_server, sglang.srt.entrypoints.http_server, sglang.srt.models.deepseek_v4, sglang.srt.models.qwen3_5, mooncake" \
-    && find /opt/sglang/python -name __pycache__ -prune -exec rm -rf {} + \
+    && HOME=/tmp/import-check python -B -c "import sglang.launch_server, sglang.srt.entrypoints.http_server, sglang.srt.models.deepseek_v4, sglang.srt.models.qwen3_5, mooncake" \
+    && rm -rf /tmp/* /root/.cache /root/.triton \
+    && find /opt/sglang/python /opt/dsv41 -name __pycache__ -prune -exec rm -rf {} + \
     && chmod -R go-w /opt/sglang/python
 
 # Both recipes, whole: the DeepSeek-V4.1 launcher, probes, docker recipe and

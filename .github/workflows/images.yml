@@ -233,6 +233,19 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # Per-file listing of the image (path, mode, owner, mtime, SHA-256), so
+      # that a digest mismatch between the two builds can be diffed.
+      - name: list the image's files
+        run: python3 -I confidential/ci/oci_listing.py /mnt/oci/${{ matrix.image }}.tar | gzip -n > /mnt/record/${{ matrix.image }}-${{ matrix.pass }}.listing.jsonl.gz
+
+      - name: upload listing
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: listing-${{ matrix.image }}-${{ matrix.pass }}
+          path: /mnt/record/${{ matrix.image }}-${{ matrix.pass }}.listing.jsonl.gz
+          if-no-files-found: error
+          retention-days: 7
+
       - name: upload oci archive
         if: matrix.pass == 1
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
