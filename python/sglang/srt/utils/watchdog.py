@@ -20,6 +20,22 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import (
 
 logger = logging.getLogger(__name__)
 
+
+def _arm_fatal_exit(grace: float = 30.0) -> threading.Timer:
+    """Arm before diagnostics or NCCL cleanup; either operation may block."""
+    def fatal_exit():
+        try:
+            from sglang.srt.utils.pair_progress import error_event
+            error_event("fatal_exit_deadline")
+        finally:
+            os._exit(1)
+
+    timer = threading.Timer(grace, fatal_exit)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
 # Grace between asking the parent to tear the group down and exiting anyway.
 # Long enough for an orderly shutdown to win, short enough that a wedged rank
 # does not sit in rotation.
@@ -32,15 +48,20 @@ _STARTUP_WATCHDOG_TIMEOUT_SECONDS = 1800.0
 
 def _abort_pynccl_communicators() -> None:
     """Best effort; never let teardown fail on the way to exiting."""
+    from sglang.srt.utils.pair_progress import error_event
+
+    error_event("communicator_abort_started")
     try:
         from sglang.srt.distributed.device_communicators.pynccl import (
             abort_all_communicators,
         )
 
         aborted = abort_all_communicators()
+        error_event("communicator_abort_finished", code=aborted)
         if aborted:
             logger.error("Aborted %d pynccl communicator(s) before teardown", aborted)
     except Exception as e:
+        error_event("communicator_abort_failed")
         logger.error("Could not abort pynccl communicators: %s", e)
 
 
@@ -194,10 +215,17 @@ class WatchdogRaw:
             # sub-timeout resolution during startup.
             time.sleep(self.watchdog_timeout / 2)
 
-        if self.dump_info is not None and (info_msg := self.dump_info()):
-            logger.error(f"{self.debug_name} debug info:\n{info_msg}")
+        if not self.soft:
+            _arm_fatal_exit()
+        from sglang.srt.utils.pair_progress import error_event
 
-        pyspy_dump_schedulers()
+        error_event("watchdog_timeout")
+        # The pair profile exports only reviewed structured records. Existing
+        # dumps can include request objects or arbitrary library messages.
+        if not os.environ.get("SGLANG_PAIR_RUN_DIR"):
+            if self.dump_info is not None and (info_msg := self.dump_info()):
+                logger.error(f"{self.debug_name} debug info:\n{info_msg}")
+            pyspy_dump_schedulers()
         logger.error(
             f"{self.debug_name} watchdog timeout "
             f"({self.watchdog_timeout=}, {self.soft=})"
@@ -294,6 +322,12 @@ class SubprocessWatchdog:
                 f"with exit code {proc.exitcode}. "
                 f"Triggering SIGQUIT for cleanup..."
             )
+            # Uvicorn's multi-process supervisor can ignore SIGQUIT. Always
+            # retain an exit deadline, independently of its signal handling.
+            _arm_fatal_exit()
+            from sglang.srt.utils.pair_progress import error_event
+
+            error_event("rank_failed")
             os.kill(os.getpid(), signal.SIGQUIT)
             return True
         return False

@@ -481,6 +481,10 @@ class NCCLLibrary:
 
     def NCCL_CHECK(self, result: ncclResult_t) -> None:
         if result != 0:
+            from sglang.srt.utils.pair_progress import error_event
+
+            error_event("nccl_error", code=int(result))
+        if result != 0:
             error_str = self.ncclGetErrorString(result)
             raise RuntimeError(f"NCCL error: {error_str}")
 

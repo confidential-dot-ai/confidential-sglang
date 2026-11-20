@@ -145,6 +145,10 @@ class CudaRTLibrary:
 
     def CUDART_CHECK(self, result: cudaError_t) -> None:
         if result != 0:
+            from sglang.srt.utils.pair_progress import error_event
+
+            error_event("cuda_error", code=int(result))
+        if result != 0:
             error_str = self.cudaGetErrorString(result)
             raise RuntimeError(f"CUDART error: {error_str}")
 
