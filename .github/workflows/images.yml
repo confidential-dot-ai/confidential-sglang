@@ -14,11 +14,8 @@ name: images
 # (--locked), a pinned BuildKit, SOURCE_DATE_EPOCH = the commit time,
 # rewrite-timestamp=true, no provenance or SBOM attestations.
 #
-# Called from another repository (workflow_call), it builds source_commit of
-# confidential-dot-ai/confidential-sglang and writes the release to
-# release_repository (default: confidential-sglang, which needs
-# secrets.RELEASE_TOKEN with contents:write on it when the caller is not
-# confidential-sglang itself).
+# It runs only in this repository, on push to main or by hand (workflow_dispatch
+# builds the dispatched ref), and writes the release here with GITHUB_TOKEN.
 
 on:
   workflow_dispatch:
@@ -29,28 +26,12 @@ on:
         default: true
   push:
     branches: [main]
-  workflow_call:
-    inputs:
-      source_commit:
-        description: The confidential-sglang commit to build (40 hex)
-        type: string
-        required: true
-      publish:
-        type: boolean
-        default: true
-      release_repository:
-        description: owner/name that receives the images-<12 hex> release
-        type: string
-        default: confidential-dot-ai/confidential-sglang
-    secrets:
-      RELEASE_TOKEN:
-        required: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: images-${{ inputs.source_commit || github.sha }}
+  group: images-${{ github.sha }}
   cancel-in-progress: false
 
 env:
@@ -76,7 +57,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ inputs.source_commit || github.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           filter: blob:none
           persist-credentials: false
@@ -84,7 +65,7 @@ jobs:
       - name: resolve the source commit
         id: source
         env:
-          WANT: ${{ inputs.source_commit || github.sha }}
+          WANT: ${{ github.sha }}
           PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
         run: |
           set -euo pipefail
@@ -446,19 +427,14 @@ jobs:
           retention-days: 90
       - name: create the release
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
-          RELEASE_REPOSITORY: ${{ inputs.release_repository || github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
           COMMIT: ${{ needs.source.outputs.commit }}
           SHORT: ${{ needs.source.outputs.short }}
         run: |
           set -euo pipefail
           tag="images-$SHORT"
-          # A caller other than confidential-sglang has no commit of it: its
-          # release targets the caller's default branch and names the commit.
           target="$COMMIT"
-          if [[ "$RELEASE_REPOSITORY" != "$SOURCE_REPOSITORY" ]]; then
-            target="$(gh api "repos/$RELEASE_REPOSITORY" --jq .default_branch)"
-          fi
           if gh release view "$tag" --repo "$RELEASE_REPOSITORY" >/dev/null 2>&1; then
             echo "::error::release $tag already exists in $RELEASE_REPOSITORY; records are never replaced"
             exit 1

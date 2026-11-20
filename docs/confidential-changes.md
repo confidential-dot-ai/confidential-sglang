@@ -156,9 +156,16 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
   uv's `uv_cache.json` (an install-time ctime) in the router wheel's
   dist-info; it is removed like the SGLang one. With that, the two clean
   engine builds match (run 44708494033 of confidential-sglang-ci).
-- Triggers: `workflow_dispatch`, push to `main`, and `workflow_call`.
-- GitHub Actions are disabled on this repository (it is an upstream fork, and
-  enabling them needs a repository admin). Until an admin enables them, the
-  workflow runs from `confidential-dot-ai/confidential-sglang-ci`, which only
-  calls this repository's `images.yml@main` with a commit; its release is
-  copied to this repository's release of the same name.
+- Triggers: push to `main` and `workflow_dispatch`. The workflow runs only in
+  this repository. Until 2026-11-20, Actions were disabled here, and the
+  workflow ran from `confidential-dot-ai/confidential-sglang-ci`, which is
+  archived after the first release made here. That repo made the first record,
+  `images-d0169679925d`. Run 44785601702 here rebuilt the same commit without
+  publishing: engine `sha256:8fa664ce…4f1d` and router `sha256:609ab202…f3f6`,
+  both builds equal to that record.
+- Actions settings: only GitHub's actions, `confidential-dot-ai/*`, and the
+  three Docker actions this workflow uses (each allowed at one commit hash);
+  hash pinning required; a read-only default token; approval required for
+  outside contributors. The upstream workflows that remain on other branches
+  (for example `upstream-nightly`) use actions by tag, so they fail at
+  startup and run no step.
