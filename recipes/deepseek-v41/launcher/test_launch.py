@@ -320,6 +320,26 @@ class TestLaunch(unittest.TestCase):
         self.assertEqual(plan["status"], "unqualified")
         self.assertEqual(plan["physical_gpus"], [0, 1, 2, 3])
 
+    def test_install_root_and_source_revision_plan_another_filesystem(self):
+        plan = launch.build_plan(
+            self.args(
+                "--install-root",
+                "/opt/sglang",
+                "--source-revision",
+                "0" * 40,
+                "--python",
+                "/opt/dsv41/bin/python",
+            )
+        )
+        self.assertEqual(plan["revision"], "0" * 40)
+        for item in (*plan["workers"], plan["router"]):
+            self.assertEqual(item["env"]["PYTHONPATH"], "/opt/sglang/python")
+            self.assertEqual(item["command"][0], "/opt/dsv41/bin/python")
+        default = launch.build_plan(self.args())
+        self.assertEqual(
+            default["workers"][0]["env"]["PYTHONPATH"], str(launch.ROOT / "python")
+        )
+
     def test_symmetric_transfer_layout_and_disjoint_devices(self):
         plan = launch.build_plan(self.args("--gpus", "4,5,6,7"))
         prefill, decode = plan["workers"]
