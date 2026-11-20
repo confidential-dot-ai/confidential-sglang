@@ -1,7 +1,7 @@
 # confidential-inference values layer: Qwen3.5-0.8B on one GPU per worker,
 # with this recipe's image. Apply it after release/values.yaml and
 # release/staging/values.yaml, then the deployment's own values, which add
-#   images.sglangWorker: ghcr.io/confidential-dot-ai/sglang-qwen35-0.8b@sha256:...
+#   images.sglangWorker: ghcr.io/confidential-dot-ai/confidential-sglang/engine@sha256:...
 # and the model volume (inference.model.c8sVolumeSource / volumeNames) holding
 # this revision, or inference.model.cache with recipes/qwen35-0.8b/container/
 # model-manifest.json as the manifest.
