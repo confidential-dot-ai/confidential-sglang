@@ -31,6 +31,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -39,6 +40,7 @@ import urllib.request
 
 import live_metrics as lm
 import oracle_replay as replay
+import prom_metrics
 
 
 def sha256(path):
@@ -102,7 +104,10 @@ async def run(args):
     if args.oracle_off:
         args.oracle = False
     convs = replay.load(args)
-    scraper = lm.Scraper(args.prefill, args.decode, args.worker, args.router, 10.0)
+    if args.prom_url:
+        scraper = prom_metrics.from_args(args)
+    else:
+        scraper = lm.Scraper(args.prefill, args.decode, args.worker, args.router, 10.0)
     first = scraper.snapshot()
     missing = lm.check_enabled(first)
     if missing:
@@ -117,8 +122,11 @@ async def run(args):
         await asyncio.sleep(max(0.0, stats.t0 + offset - time.time()))
         if task.done():
             return None, 0
+        # Read before the snapshot: a Prometheus snapshot waits --prom-lag-s,
+        # and the replay stops at the window's end.
+        active = stats.active_sessions
         snap = await loop.run_in_executor(None, scraper.snapshot)
-        return snap, stats.active_sessions
+        return snap, active
 
     snap_a, _ = await snapshot_at(args.warmup_s)
     snap_b, active_at_b = await snapshot_at(args.warmup_s + args.measure_s)
@@ -153,6 +161,19 @@ async def run(args):
     return summary
 
 
+
+def tools_revision() -> str:
+    """The suite's own revision: STRESS_REVISION in the image (which has no git), else git."""
+    if os.environ.get("STRESS_REVISION"):
+        return os.environ["STRESS_REVISION"]
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=sys.path[0] or "."
+        )
+    except FileNotFoundError:
+        return "unknown"
+    return out.stdout.strip() or "unknown"
+
 def main(argv=None):
     p = replay.parser()
     p.description = __doc__.split("\n\n")[0]
@@ -172,10 +193,11 @@ def main(argv=None):
     p.add_argument("--output-share-band", type=band, default=None, help="lo,hi; required unless --allow-failure")
     p.add_argument("--ttft-p50-max", type=float, default=3.0)
     p.add_argument("--allow-failure", action="store_true")
+    prom_metrics.add_args(p)
     p.add_argument("--out", required=True, help="result JSON")
     p.set_defaults(oracle=True)
     args = p.parse_args(argv)
-    if not args.prefill and not args.decode and not args.worker:
+    if not args.prom_url and not args.prefill and not args.decode and not args.worker:
         args.prefill, args.decode = ["http://127.0.0.1:8041"], ["http://127.0.0.1:8042"]
         args.router = args.router or "http://127.0.0.1:29001"
     if not args.allow_failure and not (args.cache_hit_band and args.output_share_band):
@@ -197,10 +219,13 @@ def main(argv=None):
             "topology": args.topology,
             "image": args.image,
             "workers": workers,
+            "metrics_source": (
+                {"prometheus": args.prom_url, "prefill": args.prom_prefill, "decode": args.prom_decode,
+                 "worker": args.prom_worker, "router": args.prom_router}
+                if args.prom_url else "direct"
+            ),
             "host": platform.node(),
-            "git": subprocess.run(
-                ["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=sys.path[0] or "."
-            ).stdout.strip(),
+            "git": tools_revision(),
         },
         **summary,
     }

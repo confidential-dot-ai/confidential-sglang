@@ -55,6 +55,10 @@ and `oracle_scorecard.py` (Oracle decoding, fixed window, pass/fail gates).
 `oracle_replay.py --oracle` sends each completion as text (`forced_text`); the
 server tokenizes it.
 
+`CLUSTER-STRESS.md` runs these and the functional, recall, overload, soak and
+fault tests against a deployed cluster from outside, through its gateway with
+an API key, with server counters read from Prometheus (`cluster_stress.py`).
+
 ## Results (2026-11-09)
 
 Setup: one pair on 4x B200 (non-CED), `dsv41-262k.env` settings without HiCache (no host RAM for it).

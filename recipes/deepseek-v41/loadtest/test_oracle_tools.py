@@ -58,7 +58,8 @@ class ConcurrencyTest(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as d:
                 args = SimpleNamespace(time_limit=0, request_timeout=5, output=os.path.join(d, "o.jsonl"),
-                                       report_every=60, concurrency=concurrency)
+                                       report_every=60, concurrency=concurrency,
+                                       url="http://127.0.0.1:1", api_key_env="", ca_cert="")
                 asyncio.run(oracle_replay.replay(args, [[]] * sessions, oracle_replay.Stats()))
         finally:
             oracle_replay.run_session = real
