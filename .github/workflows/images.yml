@@ -244,8 +244,15 @@ jobs:
       # The builder's state goes first (its cache holds a copy of every layer).
       - name: free the builder's disk
         if: matrix.pass == 1
+        env:
+          BUILDER: ${{ steps.builder.outputs.name }}
         run: |
-          docker buildx rm "${{ steps.builder.outputs.name }}"
+          set -euo pipefail
+          # Not `docker buildx rm`: it gives up after 20 s, and deleting the
+          # engine's ~40 GB of build state takes longer (run 44803687973).
+          # The docker-container driver names node 0 <builder>0.
+          docker rm -f "buildx_buildkit_${BUILDER}0"
+          docker volume rm "buildx_buildkit_${BUILDER}0_state"
           df -h / /mnt
       - name: load
         if: matrix.pass == 1
