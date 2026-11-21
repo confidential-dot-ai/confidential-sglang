@@ -223,4 +223,9 @@ async def confidential_cold_path(disaggregation_mode: str, tokenizer_manager: To
     for batch in COLD_PATH_BATCH_SIZES:
         await asyncio.gather(*(run(request(64 + i, COLD_PATH_SAMPLING[i % len(COLD_PATH_SAMPLING)], 16))
                                for i in range(batch)))
+    # Batches of short prompts, prefilled together: staging-09361fae4780 still compiled
+    # Triton kernels on 16 parallel ~30-token chat requests.
+    for batch in COLD_PATH_BATCH_SIZES:
+        await asyncio.gather(*(run(request(1 + (7 * i) % 63, COLD_PATH_SAMPLING[i % len(COLD_PATH_SAMPLING)], 16))
+                               for i in range(batch)))
     logger.info("confidential_cold_path warmup ended")
