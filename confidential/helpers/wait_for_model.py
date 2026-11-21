@@ -357,7 +357,7 @@ EVENT_KEYS = {
     "nccl_error": frozenset({"event", "code", "location"}),
     "worker_error": frozenset({"event", "error_class", "exception", "location"}),
     "worker_exit": frozenset({"event", "exit_code", "signal"}),
-    "jit_compile": frozenset({"event", "cache", "files"}),
+    "jit_compile": frozenset({"event", "cache", "files", "kernels"}),
 }
 
 EXCEPTION_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,95}")
@@ -429,7 +429,8 @@ def valid_event(event: object) -> bool:
             and nullable(event["location"], LOCATION_PATTERN)
         )
     if name == "jit_compile":
-        return event["cache"] in COMPILE_CACHES and integer(event["files"]) and event["files"] >= 1
+        return (event["cache"] in COMPILE_CACHES and integer(event["files"]) and event["files"] >= 1
+                and isinstance(event["kernels"], str) and KERNELS_PATTERN.fullmatch(event["kernels"]) is not None)
     exit_code, signal_name = event["exit_code"], event["signal"]
     return (
         (exit_code is None or (integer(exit_code) and -255 <= exit_code <= 255))
@@ -940,6 +941,26 @@ def scan_compile_caches(roots: list[tuple[str, str]],
     return found
 
 
+# A Triton cache entry is <hash>/<kernel name>.<cubin|json|ptx|...> (and
+# __grp__<kernel name>.json): the file stem is the kernel's function name in
+# code, never request data. Other caches hash their file names, so "" there.
+KERNEL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+KERNELS_MAX = 8
+KERNELS_PATTERN = re.compile(r"|[A-Za-z_][A-Za-z0-9_]{0,63}(,[A-Za-z_][A-Za-z0-9_]{0,63}){0,7}")
+
+
+def kernel_names(cache: str, paths: Iterable[str]) -> str:
+    """The sorted names of the Triton kernels in `paths`, at most KERNELS_MAX, comma-joined; "" otherwise."""
+    if cache != "triton":
+        return ""
+    names = set()
+    for path in paths:
+        stem = os.path.basename(path).split(".", 1)[0].removeprefix("__grp__")
+        if KERNEL_NAME.fullmatch(stem):
+            names.add(stem)
+    return ",".join(sorted(names)[:KERNELS_MAX])
+
+
 class CompileWatcher:
     """Report files that compilers write after worker_ready.
 
@@ -968,9 +989,10 @@ class CompileWatcher:
         events = []
         for name in COMPILE_CACHES:
             before = self._seen.get(name, {})
-            changed = sum(1 for path, size in current[name].items() if before.get(path) != size)
+            changed = [path for path, size in current[name].items() if before.get(path) != size]
             if changed:
-                events.append({"event": "jit_compile", "cache": name, "files": changed})
+                events.append({"event": "jit_compile", "cache": name, "files": len(changed),
+                               "kernels": kernel_names(name, changed)})
         self._seen = current
         for event in events:
             self._emit(event)
