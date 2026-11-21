@@ -5,7 +5,9 @@ import triton.language as tl
 
 @triton.jit(
     do_not_specialize=["sizes", "cols", "source_strides", "dest_strides"],
-    do_not_specialize_on_alignment=["sizes", "cols", "source_strides", "dest_strides"],
+    # The pointers too: CUDA graph input slices start at batch-dependent offsets, and each
+    # alignment pattern compiled another variant after warmup (staging-6569fd307829).
+    do_not_specialize_on_alignment=["sources", "destinations", "sizes", "cols", "source_strides", "dest_strides"],
 )
 def _small_copy_kernel(
     sources,

@@ -60,7 +60,9 @@ def parser():
     p.add_argument("--concurrency", type=int, default=32)
     p.add_argument("--max-prompt-tokens", type=int, default=80000, help="largest long prompt in the mix")
     p.add_argument("--request-timeout", type=float, default=900)
-    p.add_argument("--max-failures", type=int, default=0)
+    p.add_argument("--max-failures", type=int, default=0, help="failed requests allowed, answers judged bad excluded")
+    # A small model can miss a tool call at temperature 1.0; that is the model, not the serving stack.
+    p.add_argument("--max-bad", type=int, default=0, help="answers judged bad (no tool call, malformed) allowed")
     p.add_argument(
         "--unsupported-params",
         type=lambda t: [x for x in t.split(",") if x],
@@ -80,8 +82,11 @@ def main(argv=None):
     total = traffic.tally(rows)
     kinds = {k: traffic.tally([r for r in rows if r["kind"] == k]) for k in sorted({r["kind"] for r in rows})}
     gates = []
-    if total["failures"] > args.max_failures:
-        gates.append(f"failures {total['failures']} (max {args.max_failures})")
+    bad = total["classes"].get("bad", 0)
+    if total["failures"] - bad > args.max_failures:
+        gates.append(f"failures {total['failures'] - bad} (max {args.max_failures})")
+    if bad > args.max_bad:
+        gates.append(f"bad answers {bad} (max {args.max_bad})")
     if after["cls"] != "ok":
         gates.append(f"endpoint unhealthy after the soak: {after['cls']} {after['err']}")
     result = {
