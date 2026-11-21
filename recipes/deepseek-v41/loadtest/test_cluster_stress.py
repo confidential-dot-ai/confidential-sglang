@@ -437,3 +437,37 @@ class ClusterStressTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ThinkingKwargTests(unittest.TestCase):
+    """A Qwen3.5 deployment (staging-d0d1b05e01e8) thinks by default under the
+    key enable_thinking: without these options every case got empty content."""
+
+    def args(self, *argv):
+        import argparse
+        import endpoint
+        p = argparse.ArgumentParser()
+        endpoint.add_endpoint_args(p)
+        return p.parse_args(list(argv))
+
+    def test_the_default_leaves_the_body_alone(self):
+        import endpoint
+        body = {"messages": [], "chat_template_kwargs": {"thinking": True}}
+        self.assertEqual(endpoint.with_thinking(self.args(), body), body)
+        self.assertEqual(endpoint.with_thinking(self.args(), {"messages": []}), {"messages": []})
+
+    def test_qwen_renames_the_key_and_turns_reasoning_off_by_default(self):
+        import endpoint
+        a = self.args("--thinking-kwarg", "enable_thinking", "--thinking-default", "off")
+        self.assertEqual(endpoint.with_thinking(a, {"messages": []}),
+                         {"messages": [], "chat_template_kwargs": {"enable_thinking": False}})
+        asked = {"messages": [], "chat_template_kwargs": {"thinking": True, "other": 1}}
+        self.assertEqual(endpoint.with_thinking(a, asked)["chat_template_kwargs"], {"enable_thinking": True, "other": 1})
+        self.assertEqual(asked["chat_template_kwargs"], {"thinking": True, "other": 1})
+
+    def test_cluster_stress_passes_the_options_to_every_phase(self):
+        import cluster_stress
+        args = cluster_stress.parser().parse_args(["--thinking-kwarg", "enable_thinking", "--thinking-default", "off"])
+        argv = cluster_stress.endpoint_argv(args)
+        self.assertEqual(argv[argv.index("--thinking-kwarg") + 1], "enable_thinking")
+        self.assertEqual(argv[argv.index("--thinking-default") + 1], "off")

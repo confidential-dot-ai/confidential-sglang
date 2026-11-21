@@ -188,3 +188,16 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
   inductor). Each burst stalled the worker; the router's `/health_generate`
   check failed, and clients got 503.
 - `confidential/engine/check-image.sh` checks that the warmup is registered.
+
+## Stress suite: the model's reasoning switch (2026-11-21)
+
+- `recipes/deepseek-v41/loadtest/endpoint.py`: `--thinking-kwarg` (the
+  `chat_template_kwargs` key, default `thinking`) and `--thinking-default`
+  (`on`, `off`, or empty for the model's default). `func_tests.py` and
+  `needles.py` apply them to every chat request; `cluster_stress.py` passes
+  them to every phase.
+- Why: Qwen3.5 thinks by default under `enable_thinking`. On
+  `staging-d0d1b05e01e8` 50 of 72 func cases and every needle got empty
+  content: the reasoning used the token budget, and `{"thinking": true}` did
+  nothing. A Qwen profile passes `--thinking-kwarg enable_thinking
+  --thinking-default off`.

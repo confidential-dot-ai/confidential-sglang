@@ -84,7 +84,8 @@ PROFILES = {
 
 
 def endpoint_argv(args):
-    out = ["--url", args.url, "--model", args.model, "--api-key-env", args.api_key_env]
+    out = ["--url", args.url, "--model", args.model, "--api-key-env", args.api_key_env,
+           "--thinking-kwarg", args.thinking_kwarg, "--thinking-default", args.thinking_default]
     return out + (["--ca-cert", args.ca_cert] if args.ca_cert else [])
 
 
