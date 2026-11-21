@@ -26,6 +26,25 @@ def add_endpoint_args(p, url_default="http://127.0.0.1:8040", model_default=""):
         help=f"environment variable holding the gateway API key (default {DEFAULT_KEY_ENV}; unset = no key)",
     )
     p.add_argument("--ca-cert", default="", help="PEM bundle to trust for an https --url")
+    # Chat templates name the reasoning switch differently: DeepSeek V4 "thinking"
+    # (off by default), Qwen3.5 "enable_thinking" (on by default).
+    p.add_argument("--thinking-kwarg", default="thinking",
+                   help="the chat_template_kwargs key that turns reasoning on or off")
+    p.add_argument("--thinking-default", choices=("on", "off", ""), default="",
+                   help="reasoning for a request that does not set it (empty: the model's default)")
+
+
+def with_thinking(args, body: dict) -> dict:
+    """body with its chat_template_kwargs "thinking" under --thinking-kwarg, or
+    --thinking-default when the request does not set it."""
+    kwargs = dict(body.get("chat_template_kwargs") or {})
+    if "thinking" in kwargs:
+        kwargs[args.thinking_kwarg] = kwargs.pop("thinking")
+    elif args.thinking_default:
+        kwargs[args.thinking_kwarg] = args.thinking_default == "on"
+    else:
+        return body
+    return {**body, "chat_template_kwargs": kwargs}
 
 
 def api_key(args) -> str:

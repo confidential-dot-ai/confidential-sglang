@@ -79,7 +79,7 @@ def tcalls(r):
 
 
 async def chat(s, body, timeout=600):
-    body = {"model": args.model, **body}
+    body = endpoint.with_thinking(args, {"model": args.model, **body})
     t = time.time()
     async with s.post(URL, json=body, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
         txt = await r.text()
@@ -90,8 +90,8 @@ async def chat(s, body, timeout=600):
 
 
 async def chat_stream(s, body, timeout=600):
-    body = {"model": args.model, "stream": True,
-            "stream_options": {"include_usage": True}, **body}
+    body = endpoint.with_thinking(args, {"model": args.model, "stream": True,
+                                         "stream_options": {"include_usage": True}, **body})
     t, ttft = time.time(), None
     content, reasoning, tcs, usage, finish = "", "", {}, None, None
     async with s.post(URL, json=body, timeout=aiohttp.ClientTimeout(total=timeout)) as r:

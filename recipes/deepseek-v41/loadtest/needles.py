@@ -65,6 +65,7 @@ async def chat(session, args, content, max_tokens, timeout=900):
         "max_tokens": max_tokens,
         "temperature": 0.0,
     }
+    body = endpoint.with_thinking(args, body)
     async with session.post(
         args.url.rstrip("/") + "/v1/chat/completions", json=body, timeout=aiohttp.ClientTimeout(total=timeout)
     ) as r:
