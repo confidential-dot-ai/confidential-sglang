@@ -37,7 +37,7 @@ KEYS = {
     "nccl_error": {"event", "code", "location"},
     "worker_error": {"event", "error_class", "exception", "location"},
     "worker_exit": {"event", "exit_code", "signal"},
-    "jit_compile": {"event", "cache", "files"},
+    "jit_compile": {"event", "cache", "files", "kernels"},
 }
 CACHES = {"flashinfer", "triton", "inductor", "deep_gemm", "sglang_jit", "cuda", "tilelang", "cute_dsl", "tvm_ffi",
           "other"}
@@ -80,6 +80,7 @@ def assert_contract(test: unittest.TestCase, event: dict) -> None:
         test.assertIn(event["cache"], CACHES)
         test.assertIsInstance(event["files"], int)
         test.assertGreaterEqual(event["files"], 1)
+        test.assertRegex(event["kernels"], r"^([A-Za-z_][A-Za-z0-9_]{0,63}(,[A-Za-z_][A-Za-z0-9_]{0,63}){0,7})?$")
     if event["event"] == "worker_exit":
         test.assertTrue(event["exit_code"] is None or isinstance(event["exit_code"], int))
         test.assertTrue(event["signal"] is None or re.fullmatch(r"SIG[A-Z0-9]+", event["signal"]))
@@ -356,9 +357,9 @@ class CompileWatcherTests(unittest.TestCase):
         self.write(".cache/sglang/triton/def/kernel.cubin")
         self.write(".nv/ComputeCache/a/b/0")
         self.watcher.check()
-        self.assertEqual([{"event": "jit_compile", "cache": "flashinfer", "files": 2},
-                          {"event": "jit_compile", "cache": "triton", "files": 1},
-                          {"event": "jit_compile", "cache": "cuda", "files": 1}], self.events)
+        self.assertEqual([{"event": "jit_compile", "cache": "flashinfer", "files": 2, "kernels": ""},
+                          {"event": "jit_compile", "cache": "triton", "files": 1, "kernels": "kernel"},
+                          {"event": "jit_compile", "cache": "cuda", "files": 1, "kernels": ""}], self.events)
         self.watcher.check()
         self.assertEqual(3, len(self.events))
 
@@ -374,8 +375,8 @@ class CompileWatcherTests(unittest.TestCase):
         for path in paths.values():
             self.write(path)
         self.watcher.check()
-        self.assertEqual([{"event": "jit_compile", "cache": name, "files": 1} for name in wfm.COMPILE_CACHES],
-                         self.events)
+        self.assertEqual([{"event": "jit_compile", "cache": name, "files": 1, "kernels": "k" if name == "triton" else ""}
+                          for name in wfm.COMPILE_CACHES], self.events)
 
     def test_a_cache_hit_touch_is_not_a_compile_but_a_rewrite_is(self) -> None:
         marker = self.write(".cache/sglang/deep_gemm/cache/k.abc/.committed", b"")
@@ -386,7 +387,7 @@ class CompileWatcherTests(unittest.TestCase):
         self.assertEqual([], self.events)
         ninja_log.write_bytes(b"a\nb\n")
         self.watcher.check()
-        self.assertEqual([{"event": "jit_compile", "cache": "flashinfer", "files": 1}], self.events)
+        self.assertEqual([{"event": "jit_compile", "cache": "flashinfer", "files": 1, "kernels": ""}], self.events)
 
     def test_a_deleted_file_is_not_a_compile(self) -> None:
         old = self.write(".cache/sglang/jit/sm100/mod/build-1/mod.so")
@@ -395,15 +396,30 @@ class CompileWatcherTests(unittest.TestCase):
         self.watcher.check()
         self.assertEqual([], self.events)
 
-    def test_events_hold_no_path_or_file_name(self) -> None:
+    def test_events_hold_no_path_and_only_triton_kernel_names(self) -> None:
+        # A Triton file stem is the kernel's function name in code; the hash directory and every other
+        # cache's file names stay out (staging-93569af7e3a1 could not tell which kernels compiled).
         self.watcher.start()
-        self.write(f".cache/sglang/triton/{MARKER}/{MARKER}.cubin")
+        self.write(f".cache/sglang/triton/{MARKER}/_fwd_kernel.cubin")
+        self.write(f".cache/sglang/triton/{MARKER}/__grp___fwd_kernel.json")
+        self.write(f".cache/sglang/triton/{MARKER}x/{MARKER}-not-an-identifier.cubin")
+        self.write(f".cache/sglang/jit/sm100/{MARKER}/{MARKER}.so")
         self.watcher.check()
-        self.assertEqual(1, len(self.events))
+        self.assertEqual([{"event": "jit_compile", "cache": "triton", "files": 3, "kernels": "_fwd_kernel"},
+                          {"event": "jit_compile", "cache": "sglang_jit", "files": 1, "kernels": ""}], self.events)
         self.assertNotIn(MARKER, json.dumps(self.events))
-        self.assertFalse(wfm.valid_event({"event": "jit_compile", "cache": MARKER, "files": 1}))
-        self.assertFalse(wfm.valid_event({"event": "jit_compile", "cache": "triton", "files": 0}))
-        self.assertFalse(wfm.valid_event({"event": "jit_compile", "cache": "triton", "files": 1, "path": "/x"}))
+        self.assertFalse(wfm.valid_event({"event": "jit_compile", "cache": MARKER, "files": 1, "kernels": ""}))
+        self.assertFalse(wfm.valid_event({"event": "jit_compile", "cache": "triton", "files": 0, "kernels": ""}))
+        self.assertFalse(wfm.valid_event({"event": "jit_compile", "cache": "triton", "files": 1, "kernels": "a/b"}))
+        self.assertFalse(wfm.valid_event({"event": "jit_compile", "cache": "triton", "files": 1, "kernels": "",
+                                          "path": "/x"}))
+
+    def test_at_most_eight_kernel_names(self) -> None:
+        self.watcher.start()
+        for index in range(12):
+            self.write(f".cache/sglang/triton/h{index}/k{index:02d}.cubin")
+        self.watcher.check()
+        self.assertEqual("k00,k01,k02,k03,k04,k05,k06,k07", self.events[0]["kernels"])
 
     def test_a_scan_is_bounded(self) -> None:
         for index in range(5):
@@ -519,7 +535,7 @@ class SupervisionTests(unittest.TestCase):
         self.assertEqual(0, returncode)
         self.assertNotIn(MARKER, stdout)
         events = self.events(stdout)
-        self.assertEqual([{"event": "jit_compile", "cache": "flashinfer", "files": 1}],
+        self.assertEqual([{"event": "jit_compile", "cache": "flashinfer", "files": 1, "kernels": ""}],
                          [event for event in events if event["event"] == "jit_compile"])
         self.assertEqual(["worker_ready", "jit_compile", "worker_exit"], [e["event"] for e in events])
 
