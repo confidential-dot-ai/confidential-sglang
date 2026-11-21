@@ -1,0 +1,27 @@
+# Image inputs: every path that can change the bytes of the engine or router
+# image. The images workflow builds, tags and records the newest main commit
+# (first parent) that changed one of them (confidential/ci/image_inputs.py).
+# A directory covers everything under it. Add every new COPY, ADD or bind-mount
+# source of either Dockerfile here; confidential/tests/ci/test_image_inputs.py
+# fails otherwise.
+
+# Build settings (BuildKit and buildx pins, compression, build args).
+.github/workflows/images.yml
+confidential/ci/image-inputs.txt
+
+confidential/engine/Dockerfile
+confidential/engine/Dockerfile.dockerignore
+confidential/engine/requirements.lock
+confidential/router/Dockerfile
+confidential/router/Dockerfile.dockerignore
+confidential/router/requirements.lock
+confidential/router/canonicalize_wheel.py
+confidential/router/private_router.py
+
+confidential/helpers
+confidential/layouts
+confidential/simulator
+python
+recipes/deepseek-v41
+recipes/qwen35-0.8b
+sgl-model-gateway

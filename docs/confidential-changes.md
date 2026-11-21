@@ -212,3 +212,24 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
 - `confidential/ci/free-disk.sh` turns on Docker's containerd image store
   (`features.containerd-snapshotter`), which loads it, and bind-mounts
   containerd's root on /mnt, where the image store now lives.
+
+## Images per input commit, not per main commit (2026-11-21)
+
+- `confidential/ci/image-inputs.txt` lists every path that can change the
+  bytes of either image: both Dockerfiles and their `.dockerignore`, every
+  `COPY` and bind-mount source, and `images.yml` itself.
+  `confidential/tests/ci/test_image_inputs.py` fails if a Dockerfile reads a
+  path the list does not cover.
+- The `source` job computes the input commit
+  (`confidential/ci/image_inputs.py`: the newest first-parent commit that
+  changed an input). The images are built from it, labelled, tagged
+  `sha-<input commit>` and recorded as `images-<12 hex of the input commit>`;
+  `SOURCE_DATE_EPOCH` is its commit time. The record format is unchanged.
+  The CI scripts (`free-disk.sh`, `check-image.sh`, `oci_listing.py`,
+  `release_record.py`) and the tests come from the pushed commit.
+- If that release exists (and its record checks for the input commit), the
+  run builds and publishes nothing; the summary names the record. A
+  `workflow_dispatch` with `publish=false` always builds both images twice,
+  and never publishes.
+- Why: on 2026-11-21, five full engine builds (~60 min each) ran for four
+  small fixes, two of which changed only CI scripts.
