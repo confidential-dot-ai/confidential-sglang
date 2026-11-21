@@ -1,17 +1,24 @@
 name: images
 
-# One engine image and one router image per main commit
+# One engine image and one router image per input commit
 # (ghcr.io/confidential-dot-ai/confidential-sglang/{engine,router}).
 #
-# Each image is built twice, clean, on two fresh runners. The two digests must
+# The input commit of a pushed commit is the newest first-parent commit that
+# changed an image input (confidential/ci/image-inputs.txt): every byte of
+# both images comes from it. If the release images-<12 hex of the input
+# commit> exists, the run builds nothing. A workflow_dispatch with
+# publish=false always builds, and never publishes.
+#
+# Each image is built twice, clean, on two fresh runners, from the input
+# commit; the CI scripts come from the pushed commit. The two digests must
 # match, and the image must pass its check, before the bytes of build #1 are
-# pushed, by digest, tagged sha-<commit>. The release record
+# pushed, by digest, tagged sha-<input commit>. The release record
 # (confidential/ci/release_record.py) goes to the GitHub release
-# images-<12 hex of the commit> as images-<12 hex>.json.
+# images-<12 hex of the input commit> as images-<12 hex>.json.
 #
 # Reproducible inputs: base images by digest, Ubuntu/Debian packages by
 # snapshot timestamp, Python wheels by SHA-256, Rust crates by Cargo.lock
-# (--locked), a pinned BuildKit, SOURCE_DATE_EPOCH = the commit time,
+# (--locked), a pinned BuildKit, SOURCE_DATE_EPOCH = the input commit's time,
 # rewrite-timestamp=true, no provenance or SBOM attestations.
 #
 # It runs only in this repository, on push to main or by hand (workflow_dispatch
@@ -21,7 +28,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: Push both images and write the release after two matching builds
+        description: Push both images and write the release after two matching builds (false = build only, even if the release exists)
         type: boolean
         default: true
   push:
@@ -48,9 +55,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
+      # The pushed commit: the CI scripts and tests.
+      head: ${{ steps.source.outputs.head }}
+      # The input commit: the image bytes, the tag and the record.
       commit: ${{ steps.source.outputs.commit }}
       short: ${{ steps.source.outputs.short }}
       epoch: ${{ steps.source.outputs.epoch }}
+      build: ${{ steps.source.outputs.build }}
       publish: ${{ steps.source.outputs.publish }}
     steps:
       - name: checkout
@@ -58,33 +69,74 @@ jobs:
         with:
           repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ github.sha }}
+          # The input commit can be any earlier main commit.
           fetch-depth: 0
           filter: blob:none
           persist-credentials: false
 
-      - name: resolve the source commit
+      - name: resolve the input commit
         id: source
         env:
           WANT: ${{ github.sha }}
           PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           [[ "$WANT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::source commit must be 40 hex: $WANT"; exit 1; }
-          commit="$(git rev-parse HEAD)"
-          test "$commit" = "$WANT"
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$WANT"
           test -z "$(git status --porcelain --untracked-files=all)"
-          # Only commits on main are published: one image per main commit.
+          # Only commits on main are published: one image per main input commit.
           if [[ "$PUBLISH" == true ]]; then
-            git merge-base --is-ancestor "$commit" origin/main \
-              || { echo "::error::$commit is not on main; refusing to publish"; exit 1; }
+            git merge-base --is-ancestor "$head" origin/main \
+              || { echo "::error::$head is not on main; refusing to publish"; exit 1; }
+          fi
+          commit="$(python3 -I confidential/ci/image_inputs.py commit "$head")"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          git merge-base --is-ancestor "$commit" "$head"
+          short="${commit:0:12}"
+          tag="images-$short"
+          # 404: no record. Any other failure stops the run; it never skips a build.
+          status="$(curl -sS -o /tmp/release.json -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/$RELEASE_REPOSITORY/releases/tags/$tag")"
+          case "$status" in
+            200) exists=true ;;
+            404) exists=false ;;
+            *) echo "::error::GitHub API answered $status for release $tag"; cat /tmp/release.json; exit 1 ;;
+          esac
+          if [[ "$exists" == true ]]; then
+            mkdir -p /tmp/existing
+            gh release download "$tag" --repo "$RELEASE_REPOSITORY" --pattern "$tag.json" --dir /tmp/existing
+            python3 -I confidential/ci/release_record.py check "/tmp/existing/$tag.json" --commit "$commit"
+          fi
+          # A record is never replaced. publish=false is a verification build.
+          build=true
+          publish="$PUBLISH"
+          if [[ "$exists" == true ]]; then
+            publish=false
+            if [[ "$PUBLISH" == true ]]; then build=false; fi
           fi
           {
+            echo "head=$head"
             echo "commit=$commit"
-            echo "short=${commit:0:12}"
+            echo "short=$short"
             echo "epoch=$(git show -s --format=%ct "$commit")"
-            echo "publish=$PUBLISH"
+            echo "build=$build"
+            echo "publish=$publish"
           } >> "$GITHUB_OUTPUT"
-          printf '### Source %s\n\npublish: %s\n' "$commit" "$PUBLISH" >> "$GITHUB_STEP_SUMMARY"
+          {
+            printf '### Source %s\n\ninput commit: %s\n\n' "$head" "$commit"
+            if [[ "$exists" == true ]]; then
+              printf 'record: https://github.com/%s/releases/tag/%s (exists)\n\n' "$RELEASE_REPOSITORY" "$tag"
+            fi
+            if [[ "$build" == false ]]; then
+              printf 'No image input changed since %s; the existing record %s covers %s. Nothing built.\n' "$commit" "$tag" "$head"
+            else
+              printf 'build: true, publish: %s\n' "$publish"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   tests:
     name: python tests
@@ -96,7 +148,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ needs.source.outputs.commit }}
+          ref: ${{ needs.source.outputs.head }}
           persist-credentials: false
       - name: run
         run: confidential/ci/python-tests.sh
@@ -104,6 +156,7 @@ jobs:
   router-tests:
     name: router tests
     needs: source
+    if: needs.source.outputs.build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -111,7 +164,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ needs.source.outputs.commit }}
+          ref: ${{ needs.source.outputs.head }}
           persist-credentials: false
       - name: cargo test --lib and --test reliability_tests
         env:
@@ -125,6 +178,7 @@ jobs:
   build:
     name: 'build ${{ matrix.image }} #${{ matrix.pass }}'
     needs: source
+    if: needs.source.outputs.build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     strategy:
@@ -135,21 +189,31 @@ jobs:
     env:
       TMPDIR: /mnt/tmp
     steps:
-      - name: checkout
+      # ci/: the pushed commit, for the CI scripts. src/: the input commit, the build context.
+      - name: checkout the pushed commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ needs.source.outputs.head }}
+          path: ci
+          persist-credentials: false
+      - name: checkout the input commit
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ needs.source.outputs.commit }}
+          path: src
           persist-credentials: false
 
       - name: check clean source
+        working-directory: src
         run: |
           test -z "$(git status --porcelain --untracked-files=all)"
           test "$(git rev-parse HEAD)" = "${{ needs.source.outputs.commit }}"
           test -f confidential/${{ matrix.image }}/Dockerfile
 
       - name: free disk space
-        run: confidential/ci/free-disk.sh
+        run: ci/confidential/ci/free-disk.sh
 
       - name: setup buildx
         id: builder
@@ -174,8 +238,8 @@ jobs:
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           builder: ${{ steps.builder.outputs.name }}
-          context: .
-          file: confidential/${{ matrix.image }}/Dockerfile
+          context: src
+          file: src/confidential/${{ matrix.image }}/Dockerfile
           build-args: |
             SOURCE_REVISION=${{ needs.source.outputs.commit }}
             SOURCE_DATE_EPOCH=${{ needs.source.outputs.epoch }}
@@ -219,7 +283,7 @@ jobs:
       # Per-file listing of the image (path, mode, owner, mtime, SHA-256), so
       # that a digest mismatch between the two builds can be diffed.
       - name: list the image's files
-        run: python3 -I confidential/ci/oci_listing.py /mnt/oci/${{ matrix.image }}.tar | gzip -n > /mnt/record/${{ matrix.image }}-${{ matrix.pass }}.listing.jsonl.gz
+        run: python3 -I ci/confidential/ci/oci_listing.py /mnt/oci/${{ matrix.image }}.tar | gzip -n > /mnt/record/${{ matrix.image }}-${{ matrix.pass }}.listing.jsonl.gz
 
       - name: upload listing
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -268,12 +332,12 @@ jobs:
             --format 'user={{.Config.User}} entrypoint={{json .Config.Entrypoint}} cmd={{json .Config.Cmd}}'
       - name: check
         if: matrix.pass == 1
-        run: confidential/${{ matrix.image }}/check-image.sh confidential-sglang-${{ matrix.image }}:check
+        run: ci/confidential/${{ matrix.image }}/check-image.sh confidential-sglang-${{ matrix.image }}:check
 
   compare:
     name: compare ${{ matrix.image }}
     needs: [source, build]
-    if: always() && needs.source.result == 'success'
+    if: always() && needs.source.result == 'success' && needs.source.outputs.build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     strategy:
@@ -352,7 +416,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: push by digest, tagged sha-<commit>
+      - name: push by digest, tagged sha-<input commit>
         id: push
         env:
           IMAGE_NAME: ${{ env.REGISTRY_PREFIX }}/${{ matrix.image }}
@@ -390,7 +454,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ needs.source.outputs.commit }}
+          ref: ${{ needs.source.outputs.head }}
           persist-credentials: false
       - name: download publications
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
