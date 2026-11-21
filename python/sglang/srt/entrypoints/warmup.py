@@ -183,8 +183,9 @@ COLD_PATH_BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64)
 
 @warmup("confidential_cold_path")
 async def confidential_cold_path(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
-    """Prefill lengths up to 32K, every sampling path (alone and mixed in one
-    batch, with and without logprobs), and decode batch sizes up to 64."""
+    """Prefill lengths from 1 token to 32K, every sampling path (alone and
+    mixed in one batch, with and without logprobs), and decode batch sizes up
+    to 64."""
     import asyncio
 
     def request(size: int, sampling: dict, max_new_tokens: int, logprobs: bool = False) -> GenerateReqInput:
@@ -204,6 +205,16 @@ async def confidential_cold_path(disaggregation_mode: str, tokenizer_manager: To
             pass
 
     await prefill_shapes(disaggregation_mode, tokenizer_manager)
+    # Short prompts, which prefill_shapes (64 and up) does not reach. Below 64
+    # tokens some Triton kernels compile other variants: staging-d0d1b05e01e8
+    # compiled 32 Triton files on the first /health_generate (a 1-token
+    # prompt, input_ids=[0]) and 8 on ~30-token chat prompts. Every length
+    # from 1 to 64, greedy and one token, is cheap.
+    for size in range(1, 65):
+        await run(request(size, {"temperature": 0.0}, 1))
+    for size in (1, 8, 16, 32):
+        for sampling in COLD_PATH_SAMPLING:
+            await run(request(size, sampling, 16, size == 32))
     for sampling in COLD_PATH_SAMPLING:
         for logprobs in (False, True):
             await run(request(64, sampling, 16, logprobs))
