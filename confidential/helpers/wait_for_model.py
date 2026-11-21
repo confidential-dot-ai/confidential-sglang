@@ -75,7 +75,8 @@ def sha256_file(path: Path) -> str:
 
 def parse_expected_file(value: str) -> tuple[str, str]:
     name, separator, digest = value.partition("=")
-    if not separator or not name or name.startswith("/") or ".." in Path(name).parts:
+    if (not separator or not name or name == "." or Path(name).as_posix() != name
+            or name.startswith("/") or ".." in Path(name).parts or "\x00" in name):
         raise argparse.ArgumentTypeError("an expected file must use RELATIVE_PATH=SHA256")
     if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
         raise argparse.ArgumentTypeError("an expected file needs a lowercase SHA-256 value")
@@ -91,26 +92,32 @@ def verify_revision(
 ) -> dict[str, tuple[str, int]]:
     metadata = path / metadata_name
     try:
-        value = json.loads(metadata.read_text(encoding="utf-8"))
+        raw = metadata.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != expected_files.get(metadata_name):
+            raise ModelMountError("the required model file has the wrong digest: " + metadata_name)
+        value = json.loads(raw)
     except (OSError, json.JSONDecodeError, UnicodeError) as error:
         raise ModelMountError("the model revision manifest is invalid") from error
     expected_keys = {
         "canonical_local_manifest_sha256", "classification", "files", "immutable_ref",
         "immutable_revision", "repository", "schema", "source_remote_inventory_sha256",
     }
+    generic = isinstance(value, dict) and value.get("schema") == "confidential.ai/model-manifest/v1"
+    if generic:
+        expected_keys = {"schema", "files"}
     if not isinstance(value, dict) or set(value) != expected_keys:
         raise ModelMountError("the model revision manifest has invalid fields")
-    if value["schema"] != "confidential-benchmark/local-model-byte-manifest/v1":
+    if not generic and value["schema"] != "confidential-benchmark/local-model-byte-manifest/v1":
         raise ModelMountError("the model revision manifest has an invalid schema")
-    if value["classification"] != "verified_local_snapshot_bytes":
+    if not generic and value["classification"] != "verified_local_snapshot_bytes":
         raise ModelMountError("the model revision manifest has an invalid classification")
-    if value["repository"] != repository or value["immutable_revision"] != expected:
+    if not generic and (value["repository"] != repository or value["immutable_revision"] != expected):
         raise ModelMountError("the model revision manifest does not match the release")
-    if value["immutable_ref"] != f"{repository}@{expected}":
+    if not generic and value["immutable_ref"] != f"{repository}@{expected}":
         raise ModelMountError("the model revision manifest reference does not match the release")
     if not isinstance(value["files"], list) or not value["files"]:
         raise ModelMountError("the model revision manifest has no file inventory")
-    for digest_name in ("canonical_local_manifest_sha256", "source_remote_inventory_sha256"):
+    for digest_name in (() if generic else ("canonical_local_manifest_sha256", "source_remote_inventory_sha256")):
         digest = value[digest_name]
         if not isinstance(digest, str) or len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
             raise ModelMountError("the model revision manifest has an invalid digest")
@@ -122,8 +129,9 @@ def verify_revision(
         digest = item["content_sha256"]
         size = item["size"]
         if (
-            not isinstance(name, str) or not name or name.startswith("/") or ".." in Path(name).parts
-            or name in inventory or not isinstance(size, int) or size < 1
+            not isinstance(name, str) or not name or Path(name).as_posix() != name
+            or name.startswith("/") or ".." in Path(name).parts or "\x00" in name
+            or name in inventory or type(size) is not int or size < 0
             or not isinstance(digest, str) or len(digest) != 64
             or any(character not in "0123456789abcdef" for character in digest)
         ):
@@ -136,6 +144,8 @@ def verify_revision(
             raise ModelMountError("the model revision manifest file inventory does not match the release")
     if metadata_name in inventory:
         raise ModelMountError("the model revision manifest lists itself")
+    if not generic:
+        verify_index(path)
     return inventory
 
 
@@ -265,6 +275,8 @@ def verify_once(args: argparse.Namespace) -> None:
         )
     verify_no_write(path)
     for name, expected in args.expected_file:
+        if name == args.revision_metadata:
+            continue
         candidate = path / name
         if not candidate.is_file():
             raise ModelMountError(f"the required model file is missing: {name}")
@@ -280,7 +292,6 @@ def verify_once(args: argparse.Namespace) -> None:
         args.expected_revision,
         expected_files,
     )
-    verify_index(path)
     verify_every_file(path, args.revision_metadata, inventory)
 
 
@@ -1129,9 +1140,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--path", required=True, type=Path)
     parser.add_argument("--timeout-seconds", required=True, type=int)
     parser.add_argument("--poll-seconds", type=float, default=1.0)
-    parser.add_argument("--expected-revision", required=True)
-    parser.add_argument("--expected-repository", required=True)
+    parser.add_argument("--expected-revision", default="")
+    parser.add_argument("--expected-repository", default="")
     parser.add_argument("--revision-metadata", required=True)
+    parser.add_argument("--model-manifest-sha256",
+                        help="SHA-256 of the exact manifest bytes; pin this argument in the workload allowlist")
     parser.add_argument("--expected-file", action="append", type=parse_expected_file, default=[])
     parser.add_argument("--plain-cache", action="store_true",
                         help="the path is a read-only plain cache that fetch-model filled, not a c8s dm-verity volume")
@@ -1143,12 +1156,23 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.timeout_seconds < 1 or args.poll_seconds <= 0:
         parser.error("the timeout and poll interval must be positive")
-    if len(args.expected_revision) != 40 or any(character not in "0123456789abcdef" for character in args.expected_revision):
+    if args.expected_revision and (len(args.expected_revision) != 40 or any(character not in "0123456789abcdef" for character in args.expected_revision)):
         parser.error("the expected revision must be a lowercase 40-character commit")
-    if not args.expected_repository or "@" in args.expected_repository or args.expected_repository.startswith("/"):
+    if args.expected_repository and ("@" in args.expected_repository or args.expected_repository.startswith("/")):
         parser.error("the expected repository is invalid")
-    if len(args.expected_file) < 3:
-        parser.error("at least three expected model files are required")
+    try:
+        parse_expected_file(f"{args.revision_metadata}={'0' * 64}")
+        if args.model_manifest_sha256:
+            pin = parse_expected_file(f"{args.revision_metadata}={args.model_manifest_sha256}")
+            if any(name == pin[0] and digest != pin[1] for name, digest in args.expected_file):
+                parser.error("the model manifest pins disagree")
+            args.expected_file.append(pin)
+    except argparse.ArgumentTypeError as error:
+        parser.error(str(error))
+    if len(dict(args.expected_file)) != len(set(args.expected_file)):
+        parser.error("expected file pins disagree")
+    if not args.expected_file:
+        parser.error("the model byte manifest hash is required")
     if args.gpu_metrics_port is not None and not 1024 <= args.gpu_metrics_port <= 65535:
         parser.error("the GPU metrics port must be between 1024 and 65535")
     if not args.command or args.command[0] != "--" or len(args.command) == 1:
