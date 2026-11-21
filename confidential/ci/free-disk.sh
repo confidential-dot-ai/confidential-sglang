@@ -19,10 +19,19 @@ sudo apt-get clean
 sudo swapoff -a || true
 sudo rm -f /mnt/swapfile /swapfile 2>/dev/null || true
 sudo service docker stop
-sudo mkdir -p /mnt/docker-data /mnt/tmp /mnt/oci /mnt/record
+sudo service containerd stop
+sudo mkdir -p /mnt/docker-data /mnt/containerd /mnt/tmp /mnt/oci /mnt/record
 sudo chown "$(id -u):$(id -g)" /mnt/tmp /mnt/oci /mnt/record
-printf '{"data-root":"/mnt/docker-data"}\n' | sudo tee /etc/docker/daemon.json >/dev/null
-sudo rm -rf /var/lib/docker
+# The containerd image store: the classic store's docker load cannot read an
+# OCI archive with zstd layers (run 44874491789: "open .../blobs/json"). Its
+# images live in containerd's root, so that moves to /mnt too.
+printf '{"data-root":"/mnt/docker-data","features":{"containerd-snapshotter":true}}\n' \
+  | sudo tee /etc/docker/daemon.json >/dev/null
+sudo rm -rf /var/lib/docker /var/lib/containerd
+sudo mkdir -p /var/lib/containerd
+sudo mount --bind /mnt/containerd /var/lib/containerd
+sudo service containerd start
 sudo service docker start
 echo "--- disk after ---"; df -h / /mnt
 test "$(docker info --format '{{.DockerRootDir}}')" = /mnt/docker-data
+docker info --format '{{json .DriverStatus}}' | grep -q io.containerd.snapshotter.v1

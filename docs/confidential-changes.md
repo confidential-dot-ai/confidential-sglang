@@ -201,3 +201,14 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
   content: the reasoning used the token budget, and `{"thinking": true}` did
   nothing. A Qwen profile passes `--thinking-kwarg enable_thinking
   --thinking-default off`.
+
+## zstd layers: the containerd image store on the build runner (2026-11-21)
+
+- #18 compresses image layers with zstd and loads build #1 with
+  `docker load -i` for its check. The runner's classic Docker store cannot
+  load an OCI archive with zstd layers (run 44874491789: `open
+  .../blobs/json: no such file or directory`), and skopeo refuses zstd for
+  `docker-daemon:`.
+- `confidential/ci/free-disk.sh` turns on Docker's containerd image store
+  (`features.containerd-snapshotter`), which loads it, and bind-mounts
+  containerd's root on /mnt, where the image store now lives.
