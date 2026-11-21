@@ -233,3 +233,16 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
   and never publishes.
 - Why: on 2026-11-21, five full engine builds (~60 min each) ran for four
   small fixes, two of which changed only CI scripts.
+
+## The CUDA graph input copy compiles once per dtype layout (2026-11-21)
+
+- `python/sglang/kernels/ops/memory/small_copy.py`: `_small_copy_kernel` no
+  longer specializes on the alignment of its source and destination
+  pointers. With the kernel names in `jit_compile` (#22),
+  `staging-6569fd307829` showed that almost every compile after ready was
+  this kernel: CUDA graph input slices start at batch-dependent offsets, and
+  each alignment pattern was another variant. The copies are at most 8,192
+  elements, so the generic code costs nothing measurable.
+- `recipes/deepseek-v41/loadtest/soak.py`: `--max-bad` allows answers judged
+  bad (no tool call, malformed) apart from failed requests (`--max-failures`).
+  A small model can miss a tool call at temperature 1.0.
