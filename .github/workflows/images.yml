@@ -183,7 +183,7 @@ jobs:
           no-cache: true
           pull: true
           push: false
-          outputs: type=oci,dest=/mnt/oci/${{ matrix.image }}.tar,rewrite-timestamp=true
+          outputs: type=oci,dest=/mnt/oci/${{ matrix.image }}.tar,rewrite-timestamp=true,compression=zstd
           provenance: false
           sbom: false
         env:
@@ -258,8 +258,11 @@ jobs:
         if: matrix.pass == 1
         run: |
           set -euo pipefail
-          skopeo copy --quiet oci-archive:/mnt/oci/${{ matrix.image }}.tar \
-            docker-daemon:confidential-sglang-${{ matrix.image }}:check
+          loaded="$(docker load -i /mnt/oci/${{ matrix.image }}.tar)"
+          echo "$loaded"
+          image_id="$(printf '%s\n' "$loaded" | awk '/^Loaded image ID:/ {print $4}')"
+          test -n "$image_id"
+          docker tag "$image_id" confidential-sglang-${{ matrix.image }}:check
           rm -f /mnt/oci/${{ matrix.image }}.tar
           docker image inspect confidential-sglang-${{ matrix.image }}:check \
             --format 'user={{.Config.User}} entrypoint={{json .Config.Entrypoint}} cmd={{json .Config.Cmd}}'

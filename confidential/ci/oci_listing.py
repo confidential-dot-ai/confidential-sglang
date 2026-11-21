@@ -9,14 +9,56 @@ sha256 or link target). Two clean builds that should be identical give equal
 listings; when their digests differ, `diff` of the two listings shows the
 files that differ. Standard library only; streams the layers.
 """
+import contextlib
 import hashlib
 import json
+import subprocess
 import sys
 import tarfile
+import threading
 
 
 def blob(outer, digest):
     return outer.extractfile("blobs/" + digest.replace(":", "/"))
+
+
+@contextlib.contextmanager
+def open_layer(outer, layer):
+    media = layer["mediaType"]
+    raw = blob(outer, layer["digest"])
+    if media.endswith("zstd"):
+        proc = subprocess.Popen(["zstd", "-dc"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        feed_err = []
+
+        def feed():
+            try:
+                for chunk in iter(lambda: raw.read(1 << 20), b""):
+                    proc.stdin.write(chunk)
+            except BaseException as exc:
+                feed_err.append(exc)
+            finally:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+
+        thread = threading.Thread(target=feed, daemon=True)
+        thread.start()
+        try:
+            with tarfile.open(fileobj=proc.stdout, mode="r|") as inner:
+                yield inner
+        finally:
+            proc.stdout.close()
+            thread.join()
+            rc = proc.wait()
+            if feed_err:
+                raise feed_err[0]
+            if rc != 0:
+                raise RuntimeError(f"zstd -dc failed with exit code {rc} for {layer['digest']}")
+    else:
+        mode = "r|gz" if media.endswith("gzip") else "r|"
+        with tarfile.open(fileobj=raw, mode=mode) as inner:
+            yield inner
 
 
 def main(path):
@@ -31,8 +73,7 @@ def main(path):
         for number, layer in enumerate(manifest["layers"]):
             out.write(json.dumps({"layer": number, "digest": layer["digest"], "size": layer["size"],
                                   "diff_id": config["rootfs"]["diff_ids"][number]}) + "\n")
-            mode = "r|gz" if layer["mediaType"].endswith("gzip") else "r|"
-            with tarfile.open(fileobj=blob(outer, layer["digest"]), mode=mode) as inner:
+            with open_layer(outer, layer) as inner:
                 for entry in inner:
                     row = {"l": number, "p": entry.name, "t": entry.type.decode(), "m": oct(entry.mode),
                            "u": entry.uid, "g": entry.gid, "mt": entry.mtime, "s": entry.size}
