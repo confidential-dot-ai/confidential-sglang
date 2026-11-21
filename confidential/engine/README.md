@@ -21,7 +21,7 @@ build is for development, not a release.
 | `/opt/sglang/layouts/<layout>.json` | Launch plans of the DeepSeek-V4.1 layouts (`confidential/layouts/README.md`). |
 | `/opt/sglang/SOURCE_RECORD.json` | The source commit (`launch.py` reads it). |
 | `/usr/local/bin/wait-for-model` | Model check and private supervisor of `python3 -m sglang.launch_server ...`. |
-| `/usr/local/bin/fetch-model` | Model download into a plain cache. |
+| `/usr/local/bin/fetch-model` | Model download into a plain cache, and reproducible local model manifests. |
 | `/usr/local/bin/sglang-pair` | Paired PD supervisor, with `pair_diagnostics.py` and `private_log_sink.py`. |
 | `/usr/local/bin/dcgm-exporter` | NVIDIA DCGM exporter, `/etc/dcgm-exporter/counters.csv`. |
 | `sglang_router` | The router wheel built from this checkout's `sgl-model-gateway` (the launcher runs it in the pod). The cluster router is the separate router image. |
@@ -50,3 +50,29 @@ Change a Python pin in `requirements.in`, then run `lock.sh`.
 `check-image.sh IMAGE` runs the image as the chart does (uid 1001, read-only
 root, no network) and checks the routes, files, helpers, FlashInfer kernels,
 layouts and permissions. CI runs it on build #1 before publishing.
+
+## Model identity
+
+The engine image is independent of the model provider and weight format.
+`wait-for-model --model-manifest-sha256 <hex> --revision-metadata <filename>`
+checks the exact manifest bytes, then every listed file before it starts the
+server. Pin the argument, the model path, the served model name, and the
+engine image digest in the workload policy. Extra, missing, changed, linked,
+and non-regular files are refused. This is a startup check; it does not make
+writable storage immutable or authenticate a router's worker selection.
+
+To produce a manifest from a local copy, write the output outside the model
+directory, then copy it into the model directory at the selected metadata
+filename:
+
+```sh
+fetch-model local-manifest --path /path/to/model > /tmp/model-manifest.json
+sha256sum /tmp/model-manifest.json
+```
+
+The format is `confidential.ai/model-manifest/v1`, with `schema` and a `files`
+list. Each file has `path`, `size`, and `content_sha256`. The manifest describes
+all files, including configuration and tokenizers; it excludes itself. Files
+are sorted by relative path; JSON keys are sorted, with compact separators,
+UTF-8 encoding, and one final newline. No provider metadata or safetensors
+index is required. Existing Hugging Face manifests remain supported.
