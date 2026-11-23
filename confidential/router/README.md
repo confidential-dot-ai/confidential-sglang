@@ -36,6 +36,20 @@ only reviewed JSON records (fixed event names, role, HTTP status, exit code)
 to stdout. It refuses `--log-dir`, `--enable-trace` and
 `--otlp-traces-endpoint`.
 
+It also serves the router's metrics endpoint (`--prometheus-host` and
+`--prometheus-port`, default `0.0.0.0:29000`): the router's exporter runs on
+a loopback port, and `GET /metrics` answers with the router's metrics
+followed by two unlabeled gauges of the container's own cgroup (cgroup v2):
+
+| Metric | Source | Meaning |
+| --- | --- | --- |
+| `ci_router_memory_current_bytes` | `/sys/fs/cgroup/memory.current` | The container's memory use now |
+| `ci_router_memory_peak_bytes` | `/sys/fs/cgroup/memory.peak` | The most the container used since it started |
+
+A file that cannot be read leaves its gauge out. If the launcher cannot
+listen on the metrics address, the router listens there itself, as before,
+without the gauges. The listener never logs a request and resolves no name.
+
 ## Changes to upstream's router
 
 Upstream base: the fork's `main` (upstream `314bce7` plus this repository's

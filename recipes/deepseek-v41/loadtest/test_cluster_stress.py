@@ -369,7 +369,8 @@ class ClusterStressTest(unittest.TestCase):
         os.environ["STRESS_API_KEY"] = KEY
         import endpoint
 
-        args = SimpleNamespace(url=self.url, api_key_env="STRESS_API_KEY", ca_cert="", model="fake-model")
+        args = SimpleNamespace(url=self.url, api_key_env="STRESS_API_KEY", ca_cert="", model="fake-model",
+                               thinking_kwarg="thinking", thinking_default="")
         stats = oracle_replay.Stats()
         stats.active_sessions, stats.skipped_context = 0, 0
 
@@ -586,3 +587,20 @@ class ThinkingKwargTests(unittest.TestCase):
         argv = cluster_stress.endpoint_argv(args)
         self.assertEqual(argv[argv.index("--thinking-kwarg") + 1], "enable_thinking")
         self.assertEqual(argv[argv.index("--thinking-default") + 1], "off")
+
+    @unittest.skipIf(web is None, "needs aiohttp")  # oracle_replay imports aiohttp
+    def test_the_load_phase_command_line_parses_with_the_scorecard_and_applies_the_switch(self):
+        import cluster_stress
+        import oracle_replay
+        import oracle_scorecard
+        args = cluster_stress.parse_args(
+            ["--url", "http://127.0.0.1:1", "--model", "m", "--profile", "dsv41-full",
+             "--dataset", "realmix.jsonl", "--source-tokenizer", "tok", "--gpus", "4", "--gpu-model", "B200",
+             "--topology", "t", "--metrics-router", "http://127.0.0.1:2",
+             "--thinking-kwarg", "enable_thinking", "--thinking-default", "off"])
+        argv = cluster_stress.phase_argv("load", args, "/tmp/load.json")
+        self.assertEqual(argv[0], "oracle_scorecard.py")
+        sc = oracle_scorecard.parser().parse_args(argv[1:])
+        self.assertEqual((sc.thinking_kwarg, sc.thinking_default), ("enable_thinking", "off"))
+        self.assertEqual(oracle_replay.parser().parse_args(["d.jsonl"]).model, "dsv41")
+
