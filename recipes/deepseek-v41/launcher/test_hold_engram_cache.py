@@ -83,6 +83,20 @@ class TestHoldEngramCache(unittest.TestCase):
         self.assertIn("READY: mode=locked", out)
         self.assertGreaterEqual(locked_kib(status) * 1024, (3 << 20) + (2 << 20))
 
+    def test_resident_is_this_process_mapped_rss_not_mincore(self):
+        # mincore() reports a read-only file all resident to a caller that
+        # cannot write it, so the refresh must count the holder's own mapping.
+        sys.path.insert(0, str(HOLDER.parent))
+        try:
+            import hold_engram_cache as holder
+        finally:
+            sys.path.pop(0)
+        shard = holder.Shard(self.model / "a.safetensors")
+        self.assertEqual(shard.resident(), 0)  # mapped, never touched
+        shard.populate()
+        self.assertGreaterEqual(shard.resident(), shard.nbytes)
+        self.assertLess(shard.resident(), shard.nbytes + holder.PAGE)
+
 
 if __name__ == "__main__":
     unittest.main()

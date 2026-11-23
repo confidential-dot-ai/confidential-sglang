@@ -41,8 +41,6 @@ libc.mmap.restype = ctypes.c_void_p
 for name in ("mlock", "munlock", "madvise"):
     getattr(libc, name).argtypes = (ctypes.c_void_p, ctypes.c_size_t) + ((ctypes.c_int,) if name == "madvise" else ())
     getattr(libc, name).restype = ctypes.c_int
-libc.mincore.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
-libc.mincore.restype = ctypes.c_int
 
 
 class Shard:
@@ -67,12 +65,24 @@ class Shard:
         libc.munlock(self.addr, self.nbytes)
 
     def resident(self) -> int:
-        """Bytes of the mapping that are in memory now (mincore)."""
-        pages = -(-self.nbytes // PAGE)
-        vec = (ctypes.c_ubyte * pages)()
-        if libc.mincore(self.addr, self.nbytes, vec):
+        """Bytes of this mapping in this process's page tables (its smaps Rss).
+
+        Not mincore(): for a file the caller cannot write, the kernel reports
+        every page resident, so as uid 1001 on a read-only model mincore said
+        100% while reclaim had dropped 43% of a shard (4x B200, 2026-11-23).
+        Reclaiming a page cache page unmaps it from every process, so the
+        holder's own Rss of its mapping is what is actually still cached."""
+        try:
+            lines = Path("/proc/self/smaps").read_text().splitlines()
+        except OSError:
             return -1
-        return (pages - bytes(vec).count(0)) * PAGE
+        start, inside = f"{self.addr:x}-", False
+        for line in lines:
+            if line[:1] in "0123456789abcdef" and "-" in line.split(" ", 1)[0]:
+                inside = line.startswith(start)
+            elif inside and line.startswith("Rss:"):
+                return int(line.split()[1]) * 1024
+        return -1
 
     def populate(self) -> None:
         """Fault every page into the page cache."""
@@ -167,7 +177,7 @@ def main():
     while True:
         time.sleep(args.refresh_seconds)
         before = sum(shard.resident() for shard in shards)
-        if before < total:
+        if before < total - PAGE * len(shards):
             for shard in shards:
                 shard.populate()
             print(f"mode=populated: refreshed, {total - before} bytes had been reclaimed", flush=True)
