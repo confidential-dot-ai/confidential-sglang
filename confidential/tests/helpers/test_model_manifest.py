@@ -77,6 +77,44 @@ class GenericManifestTests(unittest.TestCase):
         with patch("sys.argv", argv), self.assertRaises(SystemExit):
             gate.parse_args()
 
+    def test_empty_explicit_manifest_pin_is_refused(self):
+        from unittest.mock import patch
+        argv = ["wait-for-model", "--path", str(self.model), "--timeout-seconds", "1",
+                "--revision-metadata", "manifest.json", "--model-manifest-sha256", "",
+                "--expected-file", f"manifest.json={self.digest}", "--", "python3"]
+        with patch("sys.argv", argv), self.assertRaises(SystemExit):
+            gate.parse_args()
+
+    def fetch_args(self):
+        return SimpleNamespace(manifest=self.model / "manifest.json", manifest_sha256=self.digest,
+                               repository="vendor/model", revision="a" * 40,
+                               endpoint="https://models.example", path=self.root / "download",
+                               revision_metadata="manifest.json")
+
+    def test_generic_fetch_uses_explicit_source_and_verifies_downloads(self):
+        import io
+        from unittest.mock import patch
+        args = self.fetch_args()
+        def response(url, timeout):
+            self.assertEqual(60, timeout)
+            self.assertTrue(url.startswith("https://models.example/vendor/model/resolve/" + "a" * 40 + "/"))
+            return io.BytesIO((self.model / url.rsplit("/", 1)[1]).read_bytes())
+        with patch.object(fetch.urllib.request, "urlopen", side_effect=response):
+            fetch.fetch(args)
+        for name in ("weights.gguf", "empty-config", "manifest.json"):
+            self.assertEqual((self.model / name).read_bytes(), (args.path / name).read_bytes())
+
+    def test_generic_fetch_requires_both_source_arguments(self):
+        from unittest.mock import patch
+        for missing in ("repository", "revision"):
+            args = self.fetch_args()
+            setattr(args, missing, "")
+            with self.subTest(missing=missing), patch.object(fetch, "download") as download:
+                with self.assertRaisesRegex(fetch.FetchError, "needs --repository and --revision"):
+                    fetch.fetch(args)
+                download.assert_not_called()
+                self.assertFalse(args.path.exists())
+
     def test_modified_same_size_weights_are_refused(self):
         weights = self.model / "weights.gguf"
         weights.write_bytes(b"x" * weights.stat().st_size)

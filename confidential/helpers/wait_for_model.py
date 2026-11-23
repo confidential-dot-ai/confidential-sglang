@@ -1162,7 +1162,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("the expected repository is invalid")
     try:
         parse_expected_file(f"{args.revision_metadata}={'0' * 64}")
-        if args.model_manifest_sha256:
+        if args.model_manifest_sha256 is not None:
             pin = parse_expected_file(f"{args.revision_metadata}={args.model_manifest_sha256}")
             if any(name == pin[0] and digest != pin[1] for name, digest in args.expected_file):
                 parser.error("the model manifest pins disagree")
