@@ -473,6 +473,7 @@ class ThinkingKwargTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--thinking-kwarg") + 1], "enable_thinking")
         self.assertEqual(argv[argv.index("--thinking-default") + 1], "off")
 
+    @unittest.skipIf(web is None, "needs aiohttp")  # oracle_replay imports aiohttp
     def test_the_load_phase_command_line_parses_with_the_scorecard_and_applies_the_switch(self):
         import cluster_stress
         import oracle_replay
