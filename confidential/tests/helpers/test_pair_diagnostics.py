@@ -32,7 +32,7 @@ secret_prompt='PRIVATE_PROMPT_TEXT'
 secret_response='PRIVATE_RESPONSE_TEXT'
 credential='PRIVATE_API_CREDENTIAL'
 request_id='PRIVATE_CLIENT_REQUEST_ID'
-source='def PRIVATE_FUNCTION_NAME():\n local_value="PRIVATE_LOCAL_VALUE"\n ready.write_text("ready")\n if delayed:\n  time.sleep(1)\n  signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGUSR2})\n while True: time.sleep(0.01)\n'
+source='def PRIVATE_FUNCTION_NAME():\n local_value="PRIVATE_LOCAL_VALUE"\n ready.write_text("ready")\n if delayed:\n  time.sleep(0.3)\n  signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGUSR2})\n while True: time.sleep(0.01)\n'
 namespace={'time':time,'ready':Path(sys.argv[2])/'fixture.ready','delayed':delayed,'signal':signal}
 exec(compile(source,sys.argv[3],'exec'),namespace)
 exec(compile('PRIVATE_FUNCTION_NAME()', '/PRIVATE_FILENAME_SECRET.py', 'exec'),namespace)
