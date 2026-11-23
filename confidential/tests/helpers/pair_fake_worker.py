@@ -40,10 +40,22 @@ def main():
                                   "message": "FAKE-KEY-DO-NOT-LOG"}).encode(), str(directory / "events.sock"))
         sender.sendto(json.dumps({"event": "cuda_error", "role": role, "rank": 0,
                                   "code": 7}).encode(), str(directory / "events.sock"))
+        # A compile during startup (the warmup's): the supervisor does not report it.
+        sender.sendto(json.dumps({"event": "jit_compile", "role": role, "rank": 0, "kernel": "_startup_kernel",
+                                  "duration_ms": 5}).encode(), str(directory / "events.sock"))
+        # A worker cannot claim readiness or a model gate event for itself.
+        sender.sendto(json.dumps({"event": "worker_ready", "role": role, "load_seconds": 0}).encode(),
+                      str(directory / "events.sock"))
+    compiled = False
     while True:
         command = control.read_text() if control.exists() else ""
         if command == "exit":
             return 7
+        if command == "compile" and not compiled:
+            compiled = True
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sender:
+                sender.sendto(json.dumps({"event": "jit_compile", "role": role, "rank": 0, "kernel": "_late_kernel",
+                                          "duration_ms": 1234}).encode(), str(directory / "events.sock"))
         if command != "stall":
             record = {"pid": os.getpid(), "state": "idle", "updated": time.monotonic(),
                       "completed": 0, "pending_since": 0}

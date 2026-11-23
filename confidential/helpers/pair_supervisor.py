@@ -47,12 +47,36 @@ EVENTS = {
     "scheduler_snapshot", "scheduler_snapshot_unavailable",
     "gpu_event_query_failed",
     "diagnostic_delivery_failed",
+    # A worker answers after its warmup; a Triton kernel compiled after that.
+    "worker_ready", "jit_compile",
+} | {
+    # The model gate's own events (fetch-model, wait-for-model), forwarded.
+    "model_fetch_started", "model_fetch_retry", "model_fetch_complete", "model_fetch_failed",
+    "model_verified", "model_check_failed",
 }
+GATE_EVENTS = {"model_fetch_started", "model_fetch_retry", "model_fetch_complete", "model_fetch_failed",
+               "model_verified", "model_check_failed"}
 NUMBER_FIELDS = {"rank", "code", "count", "bytes", "queue_depth", "sequence", "duration_ms",
                  "age_ms", "gpu_pending_ms", "thread", "frame", "line", "rejected",
                  "created_ns", "started_ns", "completed_ns", "timeout_ms",
                  "stage_code", "batch_size", "input_tokens", "output_tokens",
-                 "step_age_ms", "last_step_ms", "exported", "dropped", "pending", "failures", "group_id"}
+                 "step_age_ms", "last_step_ms", "exported", "dropped", "pending", "failures", "group_id",
+                 # worker_ready, and the model gate's events.
+                 "load_seconds", "gpus", "attempt", "http_status", "files", "size_bytes", "downloaded",
+                 "kept", "expected_size", "got_size"}
+# String fields, each with its exact pattern. Each value is a fixed name, a
+# name of the pinned model manifest, the model server's host name, or a
+# SHA-256 of model bytes; never a URL, a path of the pod or free text.
+STRING_FIELDS = {
+    "kernel": re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}"),
+    "file": re.compile(r"[A-Za-z0-9_.-]{1,128}(/[A-Za-z0-9_.-]{1,128}){0,8}"),
+    "host": re.compile(r"[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?"),
+    "error_class": re.compile(r"http_error|connection|timeout|size_mismatch|digest_mismatch|io|manifest_digest"
+                              r"|manifest_invalid|unsafe_path|unavailable|writable|missing|extra|unexpected_file"
+                              r"|index_invalid|root"),
+    "expected_sha256": re.compile(r"[0-9a-f]{64}"),
+    "got_sha256": re.compile(r"[0-9a-f]{64}"),
+}
 COLLECTIVES = {"all_reduce", "broadcast", "reduce", "all_gather", "reduce_scatter",
                "all_to_all", "send", "recv", "barrier"}
 CODE_LOCATIONS = set()
@@ -84,8 +108,12 @@ def reviewed_event(value: object) -> dict | None:
     """Reject whole records, rather than try to remove sensitive substrings."""
     if type(value) is not dict or not {"event", "role"} <= value.keys():
         return None
-    if value.keys() - ({"event", "role", "location", "op", "state"} | NUMBER_FIELDS):
+    if value.keys() - ({"event", "role", "location", "op", "state"} | NUMBER_FIELDS | STRING_FIELDS.keys()):
         return None
+    for name in value.keys() & STRING_FIELDS.keys():
+        if (type(value[name]) is not str or STRING_FIELDS[name].fullmatch(value[name]) is None
+                or (name == "file" and ".." in value[name].split("/"))):
+            return None
     if type(value["event"]) is not str or type(value["role"]) is not str:
         return None
     if value["event"] not in EVENTS or value["role"] not in ROLES | {"pair"}:
@@ -124,6 +152,39 @@ def emit(event: str, role: str = "pair", **fields) -> None:
             LOG_STDOUT.write(record)
         if LOG_SINK is not None:
             LOG_SINK.submit(record)
+
+
+def gate_event(value: object) -> dict | None:
+    """One model gate event as this supervisor emits it, or None.
+
+    The event must be one of GATE_EVENTS. Null fields are left out (the gate
+    tools write every key of their event); every other field must pass
+    reviewed_event. The role is always the pair's.
+    """
+    if type(value) is not dict or value.get("event") not in GATE_EVENTS or "role" in value:
+        return None
+    return reviewed_event({**{key: item for key, item in value.items() if item is not None}, "role": "pair"})
+
+
+def forward_gate_events(stream) -> None:
+    """Read the model gate's stdout until it closes; emit each reviewed event, drop every other line."""
+    try:
+        while True:
+            line = stream.readline(4097)
+            if not line:
+                return
+            if len(line) > 4096:
+                while line and not line.endswith(b"\n"):
+                    line = stream.readline(4097)
+                continue
+            try:
+                value = gate_event(json.loads(line))
+            except (ValueError, UnicodeError):
+                continue
+            if value is not None:
+                emit(**value)
+    except (OSError, ValueError):
+        return
 
 
 class PrivateStatusServer(ThreadingHTTPServer):
@@ -274,6 +335,8 @@ class Supervisor:
         self.server = None
         self.events = None
         self.diagnostics = None
+        # The roles that answered after their warmup (worker_ready).
+        self.ready_roles: set[str] = set()
 
     def serve(self) -> None:
         supervisor = self
@@ -305,7 +368,11 @@ class Supervisor:
                 if len(data) >= 4096:
                     continue
                 value = reviewed_event(json.loads(data))
-                if value is not None:
+                # Workers send error events, snapshots and jit_compile. Only this
+                # supervisor reports readiness and the model gate's events; a
+                # compile counts once its worker is warm (startup compiles are the warmup's).
+                if value is not None and value["event"] not in GATE_EVENTS | {"worker_ready"} and (
+                        value["event"] != "jit_compile" or value["role"] in self.ready_roles):
                     emit(**value)
                     if value["event"] in {"nccl_snapshot", "nccl_snapshot_unavailable"} and self.diagnostics is not None:
                         self.diagnostics.acknowledge(value["role"], value.get("rank"))
@@ -337,9 +404,13 @@ class Supervisor:
         gate_command = [arg.replace("/run/dsv41/engram.ready", str(ready_file))
                         for arg in self.config["modelGate"]]
         gate_env = {k: v for k, v in os.environ.items() if k in INHERITED_ENV}
+        # The gate's stdout holds only fetch-model's and wait-for-model's fixed
+        # events (the Engram holder's output stays inside wait-for-model);
+        # forward_gate_events re-checks each. Its stderr is free text: discarded.
         self.children["model"] = subprocess.Popen(gate_command, env=gate_env, stdin=subprocess.DEVNULL,
-                                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                                    start_new_session=True)
+        threading.Thread(target=forward_gate_events, args=(self.children["model"].stdout,), daemon=True).start()
         while not self.stop.wait(0.2):
             if self.children["model"].poll() is not None:
                 emit("child_exit", code=self.children["model"].returncode)
@@ -393,6 +464,9 @@ class Supervisor:
                     break
                 state = self.worker_state(worker)
                 if state == "ready":
+                    self.ready_roles.add(role)
+                    emit("worker_ready", role, gpus=worker["gpus"],
+                         load_seconds=max(0, int(time.monotonic() - self.started)))
                     break
                 if state == "failed" or time.monotonic() - self.started > self.config["startupTimeoutSeconds"]:
                     emit("rank_failed" if state == "failed" else "startup_timeout", role)

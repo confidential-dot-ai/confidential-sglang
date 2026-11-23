@@ -283,5 +283,107 @@ class ProcessAcceptanceTests(unittest.TestCase):
         self.exercise_failure("exit")
 
 
+
+GATE_SCRIPT = r"""
+import json, pathlib, sys, time
+events = [
+    {"event": "model_fetch_started", "host": "models.example.invalid", "files": 83, "size_bytes": 510299999999},
+    {"event": "model_fetch_retry", "host": "models.example.invalid", "file": "model-00003-of-00046.safetensors",
+     "attempt": 1, "error_class": "http_error", "http_status": 503},
+    {"event": "model_fetch_complete", "host": "models.example.invalid", "downloaded": 83, "kept": 0,
+     "size_bytes": 510299999999, "duration_ms": 900000},
+    {"event": "model_verified", "files": 83, "size_bytes": 510299999999, "duration_ms": 120000},
+    # Refused whole: a field outside the contract, a URL as a file, a role, an event the gate does not have.
+    {"event": "model_fetch_failed", "error_class": "http_error", "url": "http://FAKE-PROMPT-DO-NOT-LOG"},
+    {"event": "model_check_failed", "error_class": "missing", "file": "../FAKE-KEY-DO-NOT-LOG"},
+    {"event": "model_verified", "role": "decode", "files": 1, "size_bytes": 1, "duration_ms": 1},
+    {"event": "worker_ready", "load_seconds": 1},
+]
+for event in events:
+    print(json.dumps(event), flush=True)
+print("Traceback FAKE-PROMPT-DO-NOT-LOG", flush=True)
+pathlib.Path(sys.argv[1]).write_text("ready")
+time.sleep(120)
+"""
+
+
+class GateAndReadyEventTests(unittest.TestCase):
+    def test_gate_events_pass_only_their_reviewed_fields(self):
+        failed = {"event": "model_check_failed", "error_class": "digest_mismatch",
+                  "file": "model-00001-of-00046.safetensors", "expected_size": 7, "got_size": 7,
+                  "expected_sha256": "a" * 64, "got_sha256": "b" * 64}
+        self.assertEqual({**failed, "role": "pair"}, pair.gate_event(failed))
+        # Null fields are left out.
+        self.assertEqual({"event": "model_check_failed", "role": "pair", "error_class": "timeout"},
+                         pair.gate_event({"event": "model_check_failed", "error_class": "timeout", "file": None}))
+        for bad in ({**failed, "file": "/etc/passwd"}, {**failed, "file": "a/../b"}, {**failed, "got_sha256": "x"},
+                    {**failed, "error_class": "Traceback"}, {**failed, "message": "x"}, {**failed, "role": "decode"},
+                    {"event": "rank_failed"}, {"event": "worker_ready", "load_seconds": 1},
+                    {"event": "model_fetch_started", "host": "http://models.example", "files": 1, "size_bytes": 1}):
+            with self.subTest(bad=bad):
+                self.assertIsNone(pair.gate_event(bad))
+
+    def test_jit_compile_carries_only_a_kernel_name_and_a_time(self):
+        record = {"event": "jit_compile", "role": "decode", "rank": 1, "kernel": "_fwd_kernel", "duration_ms": 9}
+        self.assertEqual(record, pair.reviewed_event(record))
+        for kernel in ("/tmp/x.cubin", "a b", "x" * 65, 3):
+            self.assertIsNone(pair.reviewed_event({**record, "kernel": kernel}))
+
+    def test_a_pair_reports_its_gate_its_readiness_and_late_compiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config()
+            cfg["modelGate"] = [sys.executable, "-c", GATE_SCRIPT, "/run/dsv41/engram.ready"]
+            controls = {}
+            for worker in cfg["workers"]:
+                role = worker["role"]
+                controls[role] = Path(directory) / role
+                worker["command"] = [sys.executable, str(Path(__file__).with_name("pair_fake_worker.py")),
+                                     "--port", str(worker["port"])]
+                worker["env"] = {"PAIR_TEST_CONTROL": str(controls[role])}
+            supervisor = pair.Supervisor(cfg, Path(directory) / "run", ["GPU-fake-a", "GPU-fake-b"])
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                try:
+                    supervisor.start()
+                    deadline = time.monotonic() + 4
+                    while supervisor.ready_roles != {"prefill", "decode"} and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    self.assertEqual({"prefill", "decode"}, supervisor.ready_roles)
+                    controls["decode"].write_text("compile")
+                    deadline = time.monotonic() + 4
+                    while "_late_kernel" not in output.getvalue() and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                finally:
+                    supervisor.shutdown()
+            raw = output.getvalue()
+            for canary in ("FAKE-KEY-DO-NOT-LOG", "FAKE-PROMPT-DO-NOT-LOG", "Traceback", "_startup_kernel"):
+                self.assertNotIn(canary, raw)
+            records = [json.loads(line) for line in raw.splitlines()]
+            strip = lambda record: {k: v for k, v in record.items()  # noqa: E731
+                                    if k not in {"timestamp_ns", "run_id", "source_revision"}}
+            gate = [strip(record) for record in records if record["event"].startswith("model_")]
+            self.assertEqual([
+                {"event": "model_fetch_started", "role": "pair", "host": "models.example.invalid", "files": 83,
+                 "size_bytes": 510299999999},
+                {"event": "model_fetch_retry", "role": "pair", "host": "models.example.invalid",
+                 "file": "model-00003-of-00046.safetensors", "attempt": 1, "error_class": "http_error",
+                 "http_status": 503},
+                {"event": "model_fetch_complete", "role": "pair", "host": "models.example.invalid", "downloaded": 83,
+                 "kept": 0, "size_bytes": 510299999999, "duration_ms": 900000},
+                {"event": "model_verified", "role": "pair", "files": 83, "size_bytes": 510299999999,
+                 "duration_ms": 120000},
+            ], gate)
+            ready = [strip(record) for record in records if record["event"] == "worker_ready"]
+            self.assertEqual(["prefill", "decode"], [record["role"] for record in ready])
+            for record in ready:
+                self.assertEqual({"event", "role", "gpus", "load_seconds"}, set(record))
+                self.assertEqual(1, record["gpus"])
+            self.assertEqual([{"event": "jit_compile", "role": "decode", "rank": 0, "kernel": "_late_kernel",
+                               "duration_ms": 1234}],
+                             [strip(record) for record in records if record["event"] == "jit_compile"])
+            for record in records:
+                self.assertIsNotNone(pair.reviewed_event(strip(record)), record)
+
+
 if __name__ == "__main__":
     unittest.main()

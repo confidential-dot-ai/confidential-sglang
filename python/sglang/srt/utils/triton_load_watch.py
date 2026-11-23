@@ -75,6 +75,16 @@ def _on_compilation(*, src, metadata, metadata_group, times, cache_hit) -> None:
             times=times,
             cache_hit=cache_hit,
         )
+    if not cache_hit:
+        # A pair's supervisor gets every compile (its kernel name and time)
+        # and reports those after the worker is ready (pair_progress).
+        try:
+            from sglang.srt.utils import pair_progress
+
+            name = metadata.get("name") if isinstance(metadata, dict) else None
+            pair_progress.compile_event(name or getattr(src, "name", None), int(times.total / 1000))
+        except Exception:
+            pass
     if not _serving_started or cache_hit:
         return
 
