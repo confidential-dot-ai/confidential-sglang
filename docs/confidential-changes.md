@@ -246,3 +246,39 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
 - `recipes/deepseek-v41/loadtest/soak.py`: `--max-bad` allows answers judged
   bad (no tool call, malformed) apart from failed requests (`--max-failures`).
   A small model can miss a tool call at temperature 1.0.
+
+## Cold-path warmup under DSpark; dsv41-262k runs it on both workers (2026-11-23)
+
+- `python/sglang/srt/entrypoints/warmup.py`: `cold_path_plan()` gives the
+  cold-path sampling paths and whether to ask for logprobs, minus what the
+  scheduler refuses under the server's speculative algorithm. DSpark refuses
+  `min_p` (scheduler.py, any speculative algorithm) and `return_logprob`
+  (`validate_dflash_request`); a refused warmup request aborts, the warmup
+  raises, and the server never listens. Plain DFlash also drops grammars, UNO
+  also drops penalties. A path that loses a parameter still runs the others
+  (`top_p` without `min_p`). Without speculation nothing changes.
+- `recipes/deepseek-v41/launcher/launch.py`: `--warmups NAMES` passes SGLang
+  custom warmups to every worker. `dsv41-262k.env` sets
+  `--warmups confidential_cold_path`, so the baked `dsv41-262k.json` plan has
+  it on prefill and decode, and `sglang-pair` (which waits for each worker's
+  `/health`) reports the pair ready only once both are warm.
+- Tests: `test/registered/unit/entrypoints/test_cold_path_warmup.py`,
+  `test_launch.py::test_warmups_are_off_by_default_and_reach_both_roles`.
+
+## Engram holder without mlock (2026-11-23)
+
+- `recipes/deepseek-v41/launcher/hold_engram_cache.py`: `--lock auto`
+  (default) tries `mlock` and, when it is refused (`EPERM`/`ENOMEM`/`EAGAIN`:
+  no `RLIMIT_MEMLOCK` headroom, no `CAP_IPC_LOCK`), releases any partial locks
+  and holds the shards unlocked: read-only mappings faulted in with
+  `MADV_POPULATE_READ`, populated again every `--refresh-seconds` (300) if
+  the kernel reclaimed pages. It logs `mode=locked` or `mode=populated` and
+  the resident bytes (`mincore`). `--lock required` keeps the old behavior;
+  `--lock off` never locks. `--reserve-gib` (default 32) is the RAM headroom
+  check that was hard-coded.
+- Why: under C8s the worker's containerd sets no `LimitMEMLOCK`, and the
+  chart runs the holder as uid 1001 with no capabilities, so the ~198 GiB
+  `mlock` fails and the pair never starts.
+- `recipes/deepseek-v41/container/entrypoint.sh` passes `--lock required`:
+  the docker recipe's launcher credits only locked pages.
+- Tests: `recipes/deepseek-v41/launcher/test_hold_engram_cache.py`.
