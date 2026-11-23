@@ -212,7 +212,10 @@ def assigned_gpus() -> list[str]:
 
 
 def validate_config(config: dict) -> None:
-    if set(config) != {"workers", "modelGate", "statusPort", "progressTimeoutSeconds", "startupTimeoutSeconds", "shutdownTimeoutSeconds"}:
+    if set(config) - {"parallelStart"} != {"workers", "modelGate", "statusPort", "progressTimeoutSeconds",
+                                           "startupTimeoutSeconds", "shutdownTimeoutSeconds"}:
+        raise ValueError("invalid pair configuration")
+    if type(config.get("parallelStart", False)) is not bool:
         raise ValueError("invalid pair configuration")
     if not config["modelGate"] or any(type(v) is not str for v in config["modelGate"]):
         raise ValueError("model verification command is required")
@@ -447,6 +450,12 @@ class Supervisor:
             self.children[role] = subprocess.Popen(worker["command"], env=env, stdin=subprocess.DEVNULL,
                                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                                   start_new_session=True)
+            if self.config.get("parallelStart", False):
+                # Load and warm both workers at once (prefill is still spawned
+                # first). monitor() reports the pair starting until every rank
+                # is ready, and fails it on any worker failure or the startup
+                # timeout. dsv41-262k on a 4x B200: see confidential-changes.md.
+                continue
             # Load and warm one worker before the next, preserving the existing
             # launch order and avoiding concurrent cold-build memory spikes.
             while not self.stop.wait(0.2):
@@ -465,9 +474,7 @@ class Supervisor:
                     break
                 state = self.worker_state(worker)
                 if state == "ready":
-                    self.ready_roles.add(role)
-                    emit("worker_ready", role, gpus=worker["gpus"],
-                         load_seconds=max(0, int(time.monotonic() - self.started)))
+                    self.note_ready(worker)
                     break
                 if state == "failed" or time.monotonic() - self.started > self.config["startupTimeoutSeconds"]:
                     emit("rank_failed" if state == "failed" else "startup_timeout", role)
@@ -476,6 +483,14 @@ class Supervisor:
                     break
             if self.stop.is_set():
                 break
+
+    def note_ready(self, worker: dict) -> None:
+        """Report a worker's first readiness once (worker_ready); its later compiles are reported."""
+        role = worker["role"]
+        if role not in self.ready_roles:
+            self.ready_roles.add(role)
+            emit("worker_ready", role, gpus=worker["gpus"],
+                 load_seconds=max(0, int(time.monotonic() - self.started)))
 
     def worker_state(self, worker: dict) -> str:
         role = worker["role"]
@@ -530,6 +545,10 @@ class Supervisor:
     def monitor(self) -> int:
         while not self.stop.wait(0.5):
             states = [self.worker_state(w) for w in self.config["workers"]]
+            # With parallelStart, readiness is first seen here, not in start().
+            for worker, worker_state in zip(self.config["workers"], states):
+                if worker_state == "ready":
+                    self.note_ready(worker)
             if self.children["model"].poll() is not None:
                 emit("child_exit", code=self.children["model"].returncode)
                 states.append("failed")

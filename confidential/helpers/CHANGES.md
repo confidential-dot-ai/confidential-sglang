@@ -144,6 +144,13 @@ signals, HTTP/media/listener policy against this checkout's source, simulator
 parser no-op, pair supervisor/diagnostics/log and snapshot delivery against
 this checkout's `pair_progress` and `pair_nccl_diagnostics`).
 
+## pair_supervisor.py: parallelStart (2026-11-23)
+
+`pair_supervisor.py` (`/usr/local/bin/sglang-pair`) is now `db3f44ba…64021128`
+(was `51769868…40ddb80a5`): the optional config key `parallelStart` starts
+prefill and decode together. Without the key the behavior is unchanged. See
+`docs/confidential-changes.md`.
+
 ## Pair events: the model gate, readiness and late compiles
 
 A failed pair candidate must be diagnosable from its telemetry alone.
@@ -166,6 +173,8 @@ worker's readiness nor a compile after it. Now:
   started, `gpus`). It forwards a worker's `jit_compile` (`kernel`,
   `duration_ms`) only once that role is ready, and never a worker's own
   `worker_ready` or gate event.
+  With `parallelStart`, `monitor()` reports each worker's readiness.
+  `pair_supervisor.py` is now `0e87f5f6…550389b7`.
 - `sglang/srt/utils/pair_progress.py` `compile_event` sends one `jit_compile`
   per Triton compile that is not a cache hit, from the existing Triton
   listener (`triton_load_watch.py`): the kernel's function name and the

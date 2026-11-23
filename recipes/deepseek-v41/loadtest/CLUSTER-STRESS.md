@@ -25,10 +25,10 @@ and faults go through the control plane.
 
 | Phase | Tool | Passes when |
 |---|---|---|
-| func | `func_tests.py` | Tool calls (11 cases x 10), API features (JSON schema, stop, max tokens, thinking, unicode, history), needles up to the context length, over-context prompt gets a 4xx, a storm of client disconnects leaves the server healthy. Only `--known-failures` may fail. |
+| func | `func_tests.py` | Tool calls (11 cases x 10), API features (JSON schema, stop, max tokens, thinking, unicode, history), needles up to the context length, over-context prompt gets a 4xx, a storm of client disconnects leaves the server healthy. `t_logprobs`, `t_logprobs_stream` and `t_min_p` check the declared behavior: a parameter in `--unsupported-params` must get a clean client error (4xx other than 408/429 with an error body, or a 200 stream that holds only a 4xx error event), never a 5xx, a dropped connection or a timeout, and the server must answer the next request; any other parameter must work (logprobs with 3 alternatives). Only `--known-failures` may fail. |
 | needles | `needles.py` | Every one of the fixed long-prompt recall cases (default: the 64 cases that caught the CED tail-graph bug, 14K-60K tokens) returns its code. |
 | load | `oracle_scorecard.py` | Realmix agent traces at `--sessions` in flight; in the measured window: 0 failed requests and KV-transfer failures, prefix hit and output share inside the dataset's bands, TTFT p50 at most 3 s, 0 retractions. Reports served TPM per GPU. |
-| overload | `overload.py` | 64 to 512 clients of short requests, then a burst: only 429s refuse the excess (no 5xx, connection errors or wrong answers), and a request succeeds within 2 minutes afterwards. The report says whether any step was refused at all (`shed`); if none was, the levels never reached capacity and the refusal path is untested (`--require-shed` makes that a failure). |
+| overload | `overload.py` | 64 to 512 clients of short requests, then a burst: only 429s refuse the excess (no 5xx, connection errors or wrong answers), and a request succeeds within 2 minutes afterwards. The report says whether any step was refused at all (`shed`); if none was, the levels never reached capacity and the refusal path is untested (`--require-shed` makes that a failure). `--shed-codes` names the error codes of a capacity shed (the gateway's `inference_capacity`): then only those count, so a 429 of a per-address cap or of the key's own limit does not prove a shed. Each step lists its 429 codes (`codes_429`). |
 | soak | `soak.py` | Mixed traffic (short chat, 6K-80K prompts, tool calls, thinking, full and dropped streams) at `--sessions` for `--soak-minutes`: 0 failed requests and healthy at the end. Per-minute latency and 429s show drift. |
 | fault | `fault.py` | Load at 16 clients, then `--fault-cmd` (for example deleting a worker pod): the endpoint recovers (60 s with no failures at 90% of baseline throughput) within an hour, and `--check-cmd` exits 0. Reports the requests lost and the time to recover. |
 
@@ -44,7 +44,7 @@ python cluster_stress.py --url https://GATEWAY --context-length 131072 --session
     --prom-prefill 'environment="candidate",role="prefill"' --prom-decode 'environment="candidate",role="decode"' \
     --fault-cmd 'kubectl -n inference delete pod inference-pair-0 --wait=false' \
     --check-cmd './check-node-gpus.sh' \
-    --known-failures t_n2 --unsupported-params min_p \
+    --known-failures t_n2 --unsupported-params logprobs,min_p --require-metrics \
     --soak-minutes 240 --out-dir stress-candidate
 ```
 
@@ -57,6 +57,20 @@ The result directory holds each phase's JSON and log, `report.json`, and
 `report.md`, a table for a PR or a release note. The exit code is 1 if any phase
 failed.
 
+`report.json` names the suite's source (`suite.commit`, from the checkout or
+`$STRESS_SUITE_COMMIT`, and `suite.dirty`). With `--prom-url` (or the direct
+`--metrics-*` URLs) each phase's result holds `metrics`: the server's window
+over that phase (TTFT and ITL quantiles, served tokens, KV use, preemptions,
+router non-2xx, KV-transfer failures), read after the run at the recorded phase
+boundaries once `--prom-lag-s` has passed. `metrics.errors` lists any window
+that could not be read; `--require-metrics` makes that a failure.
+
+Every model behavior is an option (`--context-length`, `--thinking-kwarg`,
+`--thinking-default`, `--known-failures`, `--unsupported-params`). A validation
+(confidential-inference-internal `bin/validate-deployment --stress`) passes each
+one from the release recipe and the environment's `validation.yaml` and uses no
+profile, so the same suite validates any model.
+
 ## Profiles
 
 `--profile` sets the defaults for one kind of deployment. Any option on the
@@ -65,13 +79,12 @@ command line still wins over the profile.
 | Profile | For | Phases | Settings | Run time |
 |---|---|---|---|---|
 | (none) | the tools' own defaults | all | 131072 context, 32 sessions, 60-minute soak | hours |
-| `qwen-short` | a 1-GPU Qwen3.5-0.8B staging deployment (`recipes/qwen35-0.8b`) | func, needles, overload, soak | 262144 context; func with 4 trials, needles up to 253952 tokens (context - 8192); needles phase at 16K-240K tokens, calibrated on the served tokenizer; overload at 16-128 clients (30 s steps), burst 500; 8 sessions, 5-minute soak, prompts up to 48K; `t_logprobs_rejected` is a known failure | about 15-20 minutes (estimate; not yet run on staging) |
-| `dsv41-full` | DeepSeek-V4.1 PD with DSpark | all (load needs `--dataset`, fault needs `--fault-cmd`) | 131072 context, 32 sessions, `--known-failures t_n2 --unsupported-params min_p`, 240-minute soak | about 5 hours |
+| `qwen-short` | a 1-GPU Qwen3.5-0.8B staging deployment (`recipes/qwen35-0.8b`) | func, needles, overload, soak | 262144 context; func with 4 trials, needles up to 253952 tokens (context - 8192); needles phase at 16K-240K tokens, calibrated on the served tokenizer; overload at 16-128 clients (30 s steps), burst 500; 8 sessions, 5-minute soak, prompts up to 48K | about 15-20 minutes (estimate; not yet run on staging) |
+| `dsv41-full` | DeepSeek-V4.1 PD with DSpark | all (load needs `--dataset`, fault needs `--fault-cmd`) | 131072 context, 32 sessions, `--known-failures t_n2 --unsupported-params logprobs,min_p`, 240-minute soak | about 5 hours |
 
 `qwen-short` leaves out the load phase: its realmix dataset and bands are
 DeepSeek-V4.1 traces. Qwen3.5-0.8B has no speculative decoding, so it serves
-logprobs, and `t_logprobs_rejected` (a clean 4xx expected under DSpark) fails
-by design. The 0.8B model's tool-call and reasoning accuracy was not measured
+logprobs and min_p, and `t_logprobs` and `t_min_p` require that. The 0.8B model's tool-call and reasoning accuracy was not measured
 before this profile was written: add `--known-failures` for any case the first
 staging run shows to be a model limit, not a serving fault.
 
@@ -180,9 +193,9 @@ Mount a CA bundle and pass `--ca-cert` for a private CA, and use
   never be in a production allowlist.
 - **Known failures and rejected parameters.** PD deployments do not support
   `n > 1` (`--known-failures t_n2`); speculative decoding returns no logprobs,
-  which `t_logprobs_rejected` expects as a clean 4xx. DSpark also rejects
-  `min_p`: pass `--unsupported-params min_p` so the soak and fault mixes leave
-  it out instead of failing on it.
+  and DSpark also rejects `min_p`: pass `--unsupported-params logprobs,min_p`.
+  `t_logprobs` and `t_min_p` then require a clean client error for them, and
+  the soak and fault mixes leave min_p out instead of failing on it.
 - **Errors inside a stream.** A streamed request refused after the 200 header
   arrives as an error event in the stream. Every tool here counts that, and a
   stream that ends without `[DONE]`, as a failed request.

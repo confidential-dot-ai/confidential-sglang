@@ -276,6 +276,54 @@ class ProcessAcceptanceTests(unittest.TestCase):
                     self.assertIsNotNone(pair.reviewed_event({k: v for k, v in record.items() if k not in {"timestamp_ns", "run_id", "source_revision"}}))
             self.assertTrue(all(child.poll() is not None for child in supervisor.children.values()))
 
+    def test_parallel_start_is_an_optional_boolean(self):
+        cfg = config()
+        pair.validate_config(cfg)
+        cfg["parallelStart"] = True
+        pair.validate_config(cfg)
+        for bad in ("yes", 1, None):
+            cfg["parallelStart"] = bad
+            with self.assertRaises(ValueError):
+                pair.validate_config(cfg)
+        cfg = config()
+        cfg["parallelStartup"] = True
+        with self.assertRaises(ValueError):
+            pair.validate_config(cfg)
+
+    def test_parallel_start_runs_decode_while_prefill_loads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config()
+            cfg["parallelStart"] = True
+            controls = {}
+            for worker in cfg["workers"]:
+                role = worker["role"]
+                controls[role] = Path(directory) / role
+                worker["command"] = [sys.executable, str(Path(__file__).with_name("pair_fake_worker.py")),
+                                     "--port", str(worker["port"])]
+                worker["env"] = {"PAIR_TEST_CONTROL": str(controls[role])}
+            # Prefill writes no progress record yet: it is still loading.
+            controls["prefill"].write_text("stall")
+            supervisor = pair.Supervisor(cfg, Path(directory) / "run", ["GPU-fake-a", "GPU-fake-b"])
+            with contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    supervisor.start()
+                    self.assertEqual({"model", "prefill", "decode"}, set(supervisor.children))
+                    result = []
+                    monitor = threading.Thread(target=lambda: result.append(supervisor.monitor()), daemon=True)
+                    monitor.start()
+                    deadline = time.monotonic() + 1.5
+                    while time.monotonic() < deadline:
+                        self.assertEqual("starting", supervisor.snapshot[0])
+                        time.sleep(0.05)
+                    controls["prefill"].write_text("")
+                    deadline = time.monotonic() + 4
+                    while supervisor.snapshot[0] != "ready" and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    self.assertEqual("ready", supervisor.snapshot[0])
+                    self.assertTrue(all(child.poll() is None for child in supervisor.children.values()))
+                finally:
+                    supervisor.shutdown()
+
     def test_http_alive_gpu_progress_stalled_fails_and_stops_pair(self):
         self.exercise_failure("stall")
 
@@ -339,8 +387,16 @@ class GateAndReadyEventTests(unittest.TestCase):
             self.assertIsNone(pair.reviewed_event({**record, "kernel": kernel}))
 
     def test_a_pair_reports_its_gate_its_readiness_and_late_compiles(self):
+        self.run_pair(parallel=False)
+
+    def test_a_parallel_start_reports_readiness_and_late_compiles_too(self):
+        self.run_pair(parallel=True)
+
+    def run_pair(self, parallel):
         with tempfile.TemporaryDirectory() as directory:
             cfg = config()
+            if parallel:
+                cfg["parallelStart"] = True
             cfg["modelGate"] = [sys.executable, "-c", GATE_SCRIPT, "/run/dsv41/engram.ready"]
             controls = {}
             for worker in cfg["workers"]:
@@ -354,6 +410,8 @@ class GateAndReadyEventTests(unittest.TestCase):
             with contextlib.redirect_stdout(output):
                 try:
                     supervisor.start()
+                    monitor = threading.Thread(target=supervisor.monitor, daemon=True)
+                    monitor.start()
                     deadline = time.monotonic() + 4
                     while supervisor.ready_roles != {"prefill", "decode"} and time.monotonic() < deadline:
                         time.sleep(0.05)
@@ -383,7 +441,9 @@ class GateAndReadyEventTests(unittest.TestCase):
                  "duration_ms": 120000},
             ], gate)
             ready = [strip(record) for record in records if record["event"] == "worker_ready"]
-            self.assertEqual(["prefill", "decode"], [record["role"] for record in ready])
+            self.assertEqual(["decode", "prefill"] if parallel else ["prefill", "decode"],
+                             sorted(record["role"] for record in ready) if parallel else
+                             [record["role"] for record in ready])
             for record in ready:
                 self.assertEqual({"event", "role", "gpus", "load_seconds"}, set(record))
                 self.assertEqual(1, record["gpus"])

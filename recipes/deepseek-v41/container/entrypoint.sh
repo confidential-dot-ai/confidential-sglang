@@ -21,8 +21,10 @@ checkpoint)
     ;;
 engram)
     shift
+    # The recipe's launcher credits only locked pages (--resident-engram-pid),
+    # so a refused mlock fails here instead of falling back to unlocked.
     exec python recipes/deepseek-v41/launcher/hold_engram_cache.py \
-        --model "$MODEL" --ready-file "$READY_FILE" "$@"
+        --model "$MODEL" --ready-file "$READY_FILE" --lock required "$@"
     ;;
 pd)
     shift

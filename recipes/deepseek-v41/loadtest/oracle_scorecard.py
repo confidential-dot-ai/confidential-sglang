@@ -174,7 +174,7 @@ def tools_revision() -> str:
         return "unknown"
     return out.stdout.strip() or "unknown"
 
-def main(argv=None):
+def parser():
     p = replay.parser()
     p.description = __doc__.split("\n\n")[0]
     p.add_argument("--oracle-off", action="store_true", help="replay without forced tokens (not scorecard-comparable)")
@@ -196,6 +196,11 @@ def main(argv=None):
     prom_metrics.add_args(p)
     p.add_argument("--out", required=True, help="result JSON")
     p.set_defaults(oracle=True)
+    return p
+
+
+def main(argv=None):
+    p = parser()
     args = p.parse_args(argv)
     if not args.prom_url and not args.prefill and not args.decode and not args.worker:
         args.prefill, args.decode = ["http://127.0.0.1:8041"], ["http://127.0.0.1:8042"]

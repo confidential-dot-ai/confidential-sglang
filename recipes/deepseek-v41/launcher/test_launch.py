@@ -879,6 +879,15 @@ class TestLaunch(unittest.TestCase):
                     expected,
                 )
 
+    def test_warmups_are_off_by_default_and_reach_both_roles(self):
+        for worker in launch.build_plan(self.args())["workers"]:
+            self.assertNotIn("--warmups", worker["command"])
+        plan = launch.build_plan(self.args("--warmups", "confidential_cold_path"))
+        self.assertEqual(len(plan["workers"]), 2)
+        for worker in plan["workers"]:
+            command = worker["command"]
+            self.assertEqual(command[command.index("--warmups") + 1], "confidential_cold_path")
+
     def test_oracle_decode_is_off_by_default_and_reaches_both_roles(self):
         for worker in launch.build_plan(self.args())["workers"]:
             self.assertNotIn("SGLANG_ENABLE_ORACLE_DECODE", worker["env"])
