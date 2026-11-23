@@ -368,3 +368,22 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
 - `test_stream_first_chunk_refusal.py`; `test_serving_chat_stream_errors.py`
   `test_explicit_abort_keeps_status_and_closes_source` now expects the HTTP
   error (that file fails to set up on this fork today, independently).
+
+## DeepSeek-V4.1 weight load: expert-map cache, 2 loader threads (2026-11-23)
+
+- `python/sglang/srt/eplb/expert_location.py` `logical_to_all_physical`: each
+  layer's physical-ids-per-logical-expert table is built once (one
+  `.tolist()` per layer) and kept with the map tensor's `_version`; an
+  in-place change of the map (`update()`, EPLB) rebuilds it. It was a
+  `(map == id).nonzero().tolist()` per expert tensor, called from the
+  loader's 32 threads under the GIL: 62% of the weight-load samples (py-spy,
+  prefill TP0, 4x B200 CC). Same result for every (layer, expert)
+  (`test_expert_location_weight_loading.py`).
+- `recipes/deepseek-v41/launcher/launch.py --loader-threads N` passes
+  `--model-loader-extra-config {"num_threads": N}`; `dsv41-262k.env` sets 2.
+  mmap shard reads in a TDX guest collapse with threads per process: 4
+  processes x 8 threads read ~5 GB/s each, 4 x 2 threads ~22 GB/s.
+- Measured (pair, parallel start, warm kernel cache, page cache dropped):
+  target weight load 310 s -> 252 s (2 threads) -> 175 s (both); pair
+  `/readyz` 10 min 47 s -> 9 min 32 s -> 8 min 20 s. Functional suite on the
+  last boot: 167/168 (t_n2 known), needles to 253K all found.

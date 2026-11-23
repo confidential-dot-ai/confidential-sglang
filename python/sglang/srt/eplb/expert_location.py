@@ -71,6 +71,9 @@ class ExpertLocationMetadata:
     logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     # dispatch algorithm -> int32 (map, replica count), built on first use by mega_gate_maps
     _mega_gate_maps: dict = field(default_factory=dict, init=False, repr=False)
+    # layer -> (physical_to_logical_map_cpu._version, physical ids per logical
+    # expert), built on first use by logical_to_all_physical
+    _physical_by_logical: dict = field(default_factory=dict, init=False, repr=False)
 
     # -------------------------------- properties ------------------------------------
 
@@ -340,6 +343,7 @@ class ExpertLocationMetadata:
                 mask_update = mask_update.to(self_field.device, non_blocking=True)
                 self_field[...] = torch.where(mask_update, other_field, self_field)
 
+        self._physical_by_logical.clear()
         for algorithm, (to_physical_map, logical_count) in self._mega_gate_maps.items():
             if algorithm == "static":
                 to_physical_map[..., 0].copy_(
@@ -407,7 +411,21 @@ class ExpertLocationMetadata:
             )
         # Every replica on every rank: logical_to_all_physical_map may narrow the
         # dispatch candidates to one replica, but the loaders must fill every slot.
-        return (cpu_map[layer_id] == logical_expert_id).nonzero().flatten().tolist()
+        # confidential-sglang: the weight loaders call this once per expert
+        # tensor from many threads; a per-call tensor compare under the GIL was
+        # 62% of DeepSeek-V4.1's weight-load time (4x B200 CC, 2026-11-23).
+        # Build each layer's inverse map once; an in-place change of the map
+        # (update(), EPLB) bumps the tensor's _version and rebuilds it.
+        version = cpu_map._version
+        cached = self._physical_by_logical.get(layer_id)
+        if cached is None or cached[0] != version:
+            inverse = [[] for _ in range(self.num_logical_experts)]
+            for physical_id, logical_id in enumerate(cpu_map[layer_id].tolist()):
+                if 0 <= logical_id < self.num_logical_experts:
+                    inverse[logical_id].append(physical_id)
+            cached = (version, inverse)
+            self._physical_by_logical[layer_id] = cached
+        return list(cached[1][logical_expert_id])
 
 
 def format_expert_location_layout(

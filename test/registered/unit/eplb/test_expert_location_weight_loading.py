@@ -368,5 +368,37 @@ class TestExpertLocationWeightLoading(CustomTestCase):
                 metadata.logical_to_all_physical(0, bad_id)
 
 
+
+class TestLogicalToAllPhysicalCache(CustomTestCase):
+    """The per-layer inverse map gives what the tensor compare gave, and follows
+    in-place changes of the map (update(), EPLB rebalancing)."""
+
+    @staticmethod
+    def _reference(meta, layer, logical):
+        cpu_map = meta.physical_to_logical_map_cpu
+        return (cpu_map[layer] == logical).nonzero().flatten().tolist()
+
+    def _check(self, meta):
+        for layer in range(meta.physical_to_logical_map_cpu.shape[0]):
+            for logical in range(meta.num_logical_experts):
+                self.assertEqual(meta.logical_to_all_physical(layer, logical),
+                                 self._reference(meta, layer, logical))
+
+    def test_matches_tensor_compare_and_follows_updates(self):
+        rng = random.Random(0)
+        layout = _random_layout(rng, num_layers=3, num_logical_experts=8, num_physical_experts=12)
+        meta = _metadata(layout, ep_size=2, nnodes=1, moe_ep_rank=0)
+        self._check(meta)
+        # The returned list is a copy: a caller cannot corrupt the cache.
+        meta.logical_to_all_physical(0, 0).append(999)
+        self._check(meta)
+        # In place, as update() writes it.
+        new_layout = _random_layout(rng, num_layers=3, num_logical_experts=8, num_physical_experts=12)
+        other = _metadata(new_layout, ep_size=2, nnodes=1, moe_ep_rank=0)
+        meta.update(other, update_layer_ids=[1])
+        self._check(meta)
+        meta.physical_to_logical_map_cpu[2] = torch.tensor(new_layout[0])
+        self._check(meta)
+
 if __name__ == "__main__":
     unittest.main()
