@@ -22,15 +22,13 @@ import argparse
 import ctypes
 import errno
 import json
-import mmap
 import os
 import signal
 import socket
 import time
 from pathlib import Path
 
-import numpy as np
-
+PROT_READ, MAP_SHARED = 1, 1
 MADV_WILLNEED = 3
 MADV_POPULATE_READ = 22  # Linux 5.14+
 PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -38,6 +36,8 @@ PAGE = os.sysconf("SC_PAGE_SIZE")
 LOCK_REFUSED = {errno.EPERM, errno.ENOMEM, errno.EAGAIN}
 
 libc = ctypes.CDLL(None, use_errno=True)
+libc.mmap.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long)
+libc.mmap.restype = ctypes.c_void_p
 for name in ("mlock", "munlock", "madvise"):
     getattr(libc, name).argtypes = (ctypes.c_void_p, ctypes.c_size_t) + ((ctypes.c_int,) if name == "madvise" else ())
     getattr(libc, name).restype = ctypes.c_int
@@ -45,22 +45,44 @@ libc.mincore.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
 libc.mincore.restype = ctypes.c_int
 
 
-def resident_bytes(view):
-    """Bytes of the mapping that are in memory now (mincore)."""
-    pages = -(-view.nbytes // PAGE)
-    vec = np.zeros(pages, dtype=np.uint8)
-    if libc.mincore(view.ctypes.data, view.nbytes, vec.ctypes.data):
-        return -1
-    return int(np.count_nonzero(vec & 1)) * PAGE
+class Shard:
+    """One checkpoint file mapped read-only (standard library only: no numpy)."""
 
+    def __init__(self, path: Path):
+        self.path, self.nbytes = path, path.stat().st_size
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            addr = libc.mmap(None, self.nbytes, PROT_READ, MAP_SHARED, fd, 0)
+        finally:
+            os.close(fd)
+        if addr in (None, ctypes.c_void_p(-1).value):
+            error = ctypes.get_errno()
+            raise OSError(error, f"mmap {path.name}: {os.strerror(error)}")
+        self.addr = addr
 
-def populate(view):
-    """Fault every page of a read-only mapping into the page cache."""
-    if libc.madvise(view.ctypes.data, view.nbytes, MADV_POPULATE_READ) == 0:
-        return
-    # Kernels before 5.14 (EINVAL): ask for read-ahead, then read one byte per page.
-    libc.madvise(view.ctypes.data, view.nbytes, MADV_WILLNEED)
-    int(view[::PAGE].sum(dtype=np.uint64))
+    def lock(self) -> int:
+        return 0 if libc.mlock(self.addr, self.nbytes) == 0 else ctypes.get_errno()
+
+    def unlock(self) -> None:
+        libc.munlock(self.addr, self.nbytes)
+
+    def resident(self) -> int:
+        """Bytes of the mapping that are in memory now (mincore)."""
+        pages = -(-self.nbytes // PAGE)
+        vec = (ctypes.c_ubyte * pages)()
+        if libc.mincore(self.addr, self.nbytes, vec):
+            return -1
+        return (pages - bytes(vec).count(0)) * PAGE
+
+    def populate(self) -> None:
+        """Fault every page into the page cache."""
+        if libc.madvise(self.addr, self.nbytes, MADV_POPULATE_READ) == 0:
+            return
+        # Kernels before 5.14 (EINVAL): ask for read-ahead, then read the file.
+        libc.madvise(self.addr, self.nbytes, MADV_WILLNEED)
+        with self.path.open("rb", buffering=0) as f:
+            while f.read(8 << 20):
+                pass
 
 
 def main():
@@ -98,36 +120,32 @@ def main():
             f"Insufficient available RAM to hold Engram with a {args.reserve_gib:g} GiB reserve"
         )
     started = time.monotonic()
-    mappings = []
-    for path in paths:
-        with path.open("rb") as f:
-            mapping = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-        mappings.append((path, mapping, np.frombuffer(mapping, dtype=np.uint8)))
+    shards = [Shard(path) for path in paths]
 
     mode, reason = "populated", "--lock off"
     if args.lock != "off":
         locked = []
-        for path, _, view in mappings:
-            print(f"Locking {path.name}: {view.nbytes} bytes", flush=True)
-            if libc.mlock(view.ctypes.data, view.nbytes):
-                error = ctypes.get_errno()
+        for shard in shards:
+            print(f"Locking {shard.path.name}: {shard.nbytes} bytes", flush=True)
+            error = shard.lock()
+            if error:
                 if args.lock == "required" or error not in LOCK_REFUSED:
                     raise OSError(error, os.strerror(error))
                 # All or nothing: a part-locked set would hide the refusal.
-                for view_locked in locked:
-                    libc.munlock(view_locked.ctypes.data, view_locked.nbytes)
+                for done in locked:
+                    done.unlock()
                 reason = f"mlock refused ({errno.errorcode.get(error, error)}: {os.strerror(error)})"
                 print(f"mode=populated: {reason}; holding the shards unlocked", flush=True)
                 break
-            locked.append(view)
-            print(f"Resident: {path.name}", flush=True)
+            locked.append(shard)
+            print(f"Resident: {shard.path.name}", flush=True)
         else:
             mode, reason = "locked", "mlock"
     if mode == "populated":
-        for path, _, view in mappings:
-            populate(view)
-            print(f"Populated {path.name}: {resident_bytes(view)} of {view.nbytes} bytes resident", flush=True)
-    resident = sum(resident_bytes(view) for _, _, view in mappings)
+        for shard in shards:
+            shard.populate()
+            print(f"Populated {shard.path.name}: {shard.resident()} of {shard.nbytes} bytes resident", flush=True)
+    resident = sum(shard.resident() for shard in shards)
     print(
         f"READY: mode={mode} ({reason}): {total} checkpoint bytes read-only in the shared "
         f"CPU page cache, {resident} resident, {time.monotonic() - started:.1f} s",
@@ -148,10 +166,10 @@ def main():
             signal.pause()
     while True:
         time.sleep(args.refresh_seconds)
-        before = sum(resident_bytes(view) for _, _, view in mappings)
+        before = sum(shard.resident() for shard in shards)
         if before < total:
-            for _, _, view in mappings:
-                populate(view)
+            for shard in shards:
+                shard.populate()
             print(f"mode=populated: refreshed, {total - before} bytes had been reclaimed", flush=True)
 
 
