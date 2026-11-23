@@ -301,3 +301,14 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
   `harden_http.py`'s pinned hash still matches.
 - Tests: `test_cold_path_warmup.py` (decode plan; four forked processes warm
   up once and none finishes before the warmup ends).
+
+## sglang-pair: parallel start (2026-11-23)
+
+- `confidential/helpers/pair_supervisor.py`: optional config key
+  `parallelStart` (boolean, default `false`). When true, prefill and decode
+  start together once the model gate is ready (prefill is spawned first);
+  the pair is `starting` until every rank is ready and fails on any worker
+  failure or the startup timeout, as before. The chart's pair template sets
+  it for `dsv41-262k`. Measured times and peak host RAM: see the PR.
+- Tests: `test_pair_supervisor.py` (the key is an optional boolean; decode
+  runs while prefill still loads, and the pair is ready only once both are).
