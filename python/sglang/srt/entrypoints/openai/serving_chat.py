@@ -2478,6 +2478,10 @@ class OpenAIServingChat(OpenAIServingBase):
             first_chunk = await generator.__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))
+        refused = self.error_response_for_first_chunk(first_chunk)
+        if refused is not None:
+            await generator.aclose()
+            return refused
 
         async def prepend_first_chunk():
             try:
