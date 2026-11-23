@@ -87,7 +87,7 @@ async def run_step(session, args, sid, idx, history, max_tokens, stats, out, for
     }
     if forced is not None:
         body["forced_text"] = forced
-    payload = json.dumps(body)
+    payload = json.dumps(endpoint.with_thinking(args, body))
     retries = 0
     while True:
         t0 = time.time()
@@ -240,14 +240,7 @@ async def reporter(stats, stop, interval):
 def parser():
     p = argparse.ArgumentParser()
     p.add_argument("dataset")
-    p.add_argument("--url", default="http://127.0.0.1:8040")
-    p.add_argument("--model", default="dsv41")
-    p.add_argument(
-        "--api-key-env",
-        default=endpoint.DEFAULT_KEY_ENV,
-        help="environment variable holding the gateway API key (unset = no key)",
-    )
-    p.add_argument("--ca-cert", default="", help="PEM bundle to trust for an https --url")
+    endpoint.add_endpoint_args(p, model_default="dsv41")
     p.add_argument("--sessions", type=int, default=0, help="first N sessions (0 = all)")
     p.add_argument("--concurrency", type=int, default=0,
                    help="sessions in flight at once; the next session starts when one ends (0 = all at once)")

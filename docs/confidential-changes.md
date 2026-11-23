@@ -247,6 +247,45 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
   bad (no tool call, malformed) apart from failed requests (`--max-failures`).
   A small model can miss a tool call at temperature 1.0.
 
+## Stress suite: the load phase takes the reasoning switch (2026-11-22)
+
+- `recipes/deepseek-v41/loadtest/oracle_replay.py` takes its endpoint options
+  from `endpoint.add_endpoint_args` (model default still `dsv41`) and applies
+  `endpoint.with_thinking` to every request. `oracle_scorecard.py` builds on
+  that parser, now a function of its own (`parser()`).
+- Why: since `--thinking-kwarg`/`--thinking-default` (2026-11-21),
+  `cluster_stress.py` passes both to every phase, but the scorecard declared
+  its own endpoint options and exited 2 on them. Every run with the load
+  phase failed there (seen on a 4x B200 run of the `dsv41-full` profile).
+- `test_cluster_stress.py` parses the load phase's command line with the
+  scorecard's parser.
+
+## Stress suite: declared parameters, capacity sheds, metrics and the suite commit (2026-11-23)
+
+- `func_tests.py`: `t_logprobs_rejected` is replaced by `t_logprobs`,
+  `t_logprobs_stream` and `t_min_p`, which check the behavior declared with
+  the new `--unsupported-params`: a listed parameter must get a clean client
+  error (4xx other than 408/429 with an error body, or a 200 stream holding
+  only a 4xx error event; never a 5xx, a dropped connection or a timeout) and
+  the server must answer the next request; an unlisted one must work.
+  `cluster_stress.py` passes `--unsupported-params` to func too. Why: staging
+  listed `t_logprobs_rejected` as a known failure because Qwen serves
+  logprobs, so the case could not catch a 5xx under DSpark either.
+- `overload.py`: `--shed-codes` names the 429 error codes of a capacity shed;
+  `--require-shed` then counts only those. Each step records `codes_429`.
+  Why: a 429 of a per-address cap or of the key's limit is not a capacity shed.
+- `cluster_stress.py`: with `--prom-url` (or direct `--metrics-*` URLs) each
+  phase result holds the server's metrics window over that phase
+  (`live_metrics.window`), read after the run at the phase boundaries
+  (`prom_metrics.PromScraper.snapshot_at`); `--require-metrics` fails the run
+  if a window could not be read. `report.json` records `suite.commit`.
+- `prom_metrics.py` names each series exactly and joins them with `or`, each
+  tagged with `label_replace`. Why: Azure Monitor managed Prometheus refuses a
+  regex on `__name__`, so the scorecard's `--prom-url` never worked against
+  it, and `or` drops series whose labels are equal apart from the name.
+- The `qwen-short` profile drops its known failure; `dsv41-full` declares
+  `logprobs,min_p` unsupported.
+
 ## Cold-path warmup under DSpark; dsv41-262k runs it on both workers (2026-11-23)
 
 - `python/sglang/srt/entrypoints/warmup.py`: `cold_path_plan()` gives the

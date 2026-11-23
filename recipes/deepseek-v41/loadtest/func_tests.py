@@ -313,14 +313,99 @@ async def t_n2(s, sp):
     return dt
 
 
-async def t_logprobs_rejected(s, sp):
-    """Known limitation: speculative decoding has no logprobs. Pass = clean 4xx, server unaffected."""
-    body = {"model": args.model, "messages": [{"role": "user", "content": "Say hello."}],
-            "logprobs": True, "top_logprobs": 3, "max_tokens": 16, **sp}
+# The parameters whose support the deployment declares (--unsupported-params).
+# Each case checks the declared behavior either way: a served parameter must
+# work, a rejected one must get a clean client error.
+PARAM_BODIES = {
+    "logprobs": {"logprobs": True, "top_logprobs": 3},
+    "min_p": {"temperature": 1.0, "min_p": 0.05},
+}
+# A client error that says the request is wrong. 408 and 429 are not answers
+# about the request (a timeout, capacity), so they do not count as a refusal.
+CLEAN_REFUSAL = set(range(400, 500)) - {408, 429}
+
+
+def unsupported():
+    return {x for x in (args.unsupported_params or "").split(",") if x}
+
+
+def error_status(text):
+    """The HTTP-like code an error body or stream event carries, or None."""
+    ev = _json_or_empty(text)
+    err = ev.get("error") if isinstance(ev.get("error"), dict) else ev
+    code = err.get("code") if isinstance(err, dict) else None
+    try:
+        return int(code)
+    except (TypeError, ValueError):
+        return None
+
+
+def _json_or_empty(text):
+    try:
+        v = json.loads(text)
+    except ValueError:
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+async def refused_cleanly(s, body, stream):
+    """Assert that the gateway refused `body` with a clean client error: a 4xx
+    (not 408/429) with a JSON error body, or for a stream a 200 whose events are
+    one error of such a code and no tokens. Never a 5xx, a dropped connection or
+    a timeout."""
+    body = endpoint.with_thinking(args, {"model": args.model, **body, **({"stream": True} if stream else {})})
     t = time.time()
     async with s.post(URL, json=body, timeout=aiohttp.ClientTimeout(total=60)) as r:
-        assert 400 <= r.status < 500, f"HTTP {r.status}"
+        txt = await r.text()
+    if r.status in CLEAN_REFUSAL:
+        assert error_status(txt) is not None or "error" in txt.lower(), f"HTTP {r.status} without an error body: {txt[:200]!r}"
+        return time.time() - t
+    assert stream and r.status == 200, f"HTTP {r.status} (expected a clean 4xx): {txt[:300]}"
+    events = [ln[5:].strip() for ln in txt.splitlines() if ln.startswith("data:") and ln[5:].strip() != "[DONE]"]
+    codes = [error_status(e) for e in events]
+    tokens = [e for e in events if any((ch.get("delta") or {}).get("content")
+                                       for ch in (_json_or_empty(e).get("choices") or []))]
+    assert any(c in CLEAN_REFUSAL for c in codes), f"stream of 200 without a 4xx error event: {txt[:300]}"
+    assert not tokens, f"stream produced tokens before refusing: {tokens[0][:200]}"
     return time.time() - t
+
+
+async def healthy_after(s):
+    """The server still answers after a refused request."""
+    r, _ = await chat(s, {"messages": [{"role": "user", "content": "Reply with OK."}], "max_tokens": 8, "temperature": 0})
+    assert r["choices"][0]["message"].get("content") is not None, "no answer after the refused request"
+
+
+async def param_case(s, sp, param, stream=False):
+    extra = PARAM_BODIES[param]
+    msgs = [{"role": "user", "content": "Say hello."}]
+    if param in unsupported():
+        dt = await refused_cleanly(s, {"messages": msgs, "max_tokens": 16, **sp, **extra}, stream)
+        await healthy_after(s)
+        return dt
+    if stream:
+        out, dt = await chat_stream(s, {"messages": msgs, "max_tokens": 16, **sp, **extra})
+        assert out["content"] or out["reasoning"], "served stream without tokens"
+        return dt
+    r, dt = await chat(s, {"messages": msgs, "max_tokens": 16, **sp, **extra})
+    if param == "logprobs":
+        lp = (r["choices"][0].get("logprobs") or {}).get("content") or []
+        assert lp and len(lp[0].get("top_logprobs") or []) == 3, f"logprobs served without top_logprobs: {str(lp)[:200]}"
+    return dt
+
+
+async def t_logprobs(s, sp):
+    """logprobs: served (logprobs with 3 alternatives) or, if declared unsupported, a clean 4xx."""
+    return await param_case(s, sp, "logprobs")
+
+
+async def t_logprobs_stream(s, sp):
+    return await param_case(s, sp, "logprobs", stream=True)
+
+
+async def t_min_p(s, sp):
+    """min_p: served, or, if declared unsupported, a clean 4xx."""
+    return await param_case(s, {k: v for k, v in sp.items() if k != "temperature"}, "min_p")
 
 
 async def t_system_and_history(s, sp):
@@ -383,7 +468,7 @@ TOOL_TESTS = [t_single_tool, t_parallel_tools, t_tool_choice_none, t_tool_choice
               t_tool_choice_named, t_no_tool_needed, t_multi_turn_tool_result, t_stream_tool,
               t_many_tools, t_complex_schema, t_thinking_tool]
 API_TESTS = [t_thinking_plain, t_json_schema, t_stop_seq, t_max_tokens, t_unicode,
-             t_logprobs_rejected, t_system_and_history]
+             t_logprobs, t_logprobs_stream, t_min_p, t_system_and_history]
 
 
 def needle_targets(context_length):
@@ -481,6 +566,9 @@ def parser():
     p.add_argument("--context-length", type=int, default=131072, help="the deployment's context length")
     p.add_argument("--only", default="", help="tools,api,needle,disconnect (default: all)")
     p.add_argument("--known-failures", default="", help="comma-separated test names that may fail")
+    p.add_argument("--unsupported-params", default="",
+                   help="parameters the deployment rejects (e.g. logprobs,min_p under speculative decoding): "
+                        "their cases then require a clean 4xx; the others require the parameter to work")
     p.add_argument("--out", default="func.json")
     p.add_argument("--out-jsonl", default="func.jsonl")
     return p
@@ -494,7 +582,8 @@ def main(argv=None):
     known = {x for x in args.known_failures.split(",") if x}
     summary = summarize(asyncio.run(run_all()), known)
     with open(args.out, "w") as f:
-        json.dump({"endpoint": endpoint.describe(args), "context_length": args.context_length, **summary}, f, indent=1)
+        json.dump({"endpoint": endpoint.describe(args), "context_length": args.context_length,
+                   "unsupported_params": sorted(unsupported()), **summary}, f, indent=1)
     print(f"\n{'group':8} {'test':32} {'pass':>7} {'p50 s':>7}  first failure")
     for x in summary["tests"]:
         mark = " (known)" if x["known_failure"] and x["passed"] < x["runs"] else ""
