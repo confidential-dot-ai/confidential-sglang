@@ -148,7 +148,10 @@ async def send(session, url, model, kind, stream, body, rnd, t0, timeout):
         ) as r:
             row["status"] = r.status
             if r.status != 200:
-                row["cls"], row["err"] = _status_class(r.status), (await r.text())[:200]
+                text = await r.text()
+                row["cls"], row["err"] = _status_class(r.status), text[:200]
+                if r.status == 429:
+                    row["code"] = error_code(text)
             elif stream:
                 await _read_stream(r, row, start, cancel_at=rnd.randint(3, 60) if kind == "stream_cancel" else None)
             else:
@@ -172,6 +175,17 @@ async def send(session, url, model, kind, stream, body, rnd, t0, timeout):
     return row
 
 
+def error_code(text):
+    """The error code of an error body ({"error": {"code": ...}} or {"code": ...}), or None."""
+    try:
+        v = json.loads(text)
+    except ValueError:
+        return None
+    err = v.get("error") if isinstance(v, dict) else None
+    code = (err if isinstance(err, dict) else v if isinstance(v, dict) else {}).get("code")
+    return None if code is None else str(code)
+
+
 def pct(xs, q):
     if not xs:
         return None
@@ -193,7 +207,16 @@ def tally(rows):
         "latency_s": {q: pct(lat, q) for q in (50, 95, 99)},
         "stream_ttft_s": {q: pct(ttft, q) for q in (50, 95, 99)},
         "first_errors": [r["err"] for r in rows if r["cls"] in FAILURES][:5],
+        # The error codes of the 429s: which limit refused (capacity, a per-address cap, the key's own limit).
+        "codes_429": _count(r.get("code") or "?" for r in rows if r["cls"] == "429"),
     }
+
+
+def _count(items):
+    out = {}
+    for x in items:
+        out[x] = out.get(x, 0) + 1
+    return out
 
 
 def per_second(rows, duration):

@@ -15,6 +15,12 @@ can legitimately wait past a short client timeout.
 endpoint queued everything and the refusal path was never exercised: raise
 --levels and --burst until it is, or pass --require-shed to fail such a run.
 
+A 429 can come from different limits: the deployment's capacity, a
+per-address cap in front of it, or the key's own rate limit. --shed-codes
+names the error codes ({"error": {"code": ...}}) that count as a capacity
+shed; `shed` then counts only those, and `codes_429` of each step lists every
+code seen. Without --shed-codes any 429 counts.
+
   python overload.py --url https://GATEWAY --levels 64,128,256,512 --burst 2000
 """
 
@@ -98,9 +104,22 @@ def gates(steps, recovered, args):
             out.append(f"{s['step']}: {hard}")
     if recovered is None:
         out.append(f"no successful request within {args.recover_s} s after the overload")
-    if args.require_shed and not any(s["classes"]["429"] for s in steps):
-        out.append("no 429 at any step: the endpoint was not overloaded (raise --levels / --burst)")
+    if args.require_shed and not shed_count(steps, args.shed_codes):
+        seen = sorted({c for s in steps for c in s.get("codes_429", {})})
+        which = f" with code {'/'.join(args.shed_codes)} (429 codes seen: {seen or 'none'})" if args.shed_codes else ""
+        out.append(f"no 429{which} at any step: the endpoint was not overloaded (raise --levels / --burst)")
     return out
+
+
+def shed_count(steps, codes):
+    """The 429s that count as a capacity shed: those with one of `codes`, or every 429 without codes."""
+    if not codes:
+        return sum(s["classes"]["429"] for s in steps)
+    return sum(n for s in steps for c, n in s.get("codes_429", {}).items() if c in codes)
+
+
+def codes(text):
+    return [x for x in text.split(",") if x]
 
 
 def ints(text):
@@ -117,6 +136,8 @@ def parser():
     p.add_argument("--recover-s", type=float, default=120)
     p.add_argument("--fail-on-timeout", action="store_true")
     p.add_argument("--require-shed", action="store_true", help="fail unless some step got 429s")
+    p.add_argument("--shed-codes", type=codes, default=[],
+                   help="429 error codes that count as a capacity shed (default: any 429)")
     p.add_argument("--out", default="overload.json")
     return p
 
@@ -127,8 +148,10 @@ def main(argv=None):
     endpoint.resolve_model(args)
     steps, recovered = asyncio.run(overload(args))
     failures = gates(steps, recovered, args)
-    shed = any(s["classes"]["429"] for s in steps)
+    shed_n = shed_count(steps, args.shed_codes)
+    shed = shed_n > 0
     result = {"endpoint": endpoint.describe(args), "steps": steps, "recovered_after_s": recovered, "shed": shed,
+              "shed_requests": shed_n, "shed_codes": args.shed_codes,
               "gate_failures": failures, "passed": not failures}
     with open(args.out, "w") as f:
         json.dump(result, f, indent=1)

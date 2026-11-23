@@ -36,6 +36,8 @@ class FakeGateway:
     def __init__(self):
         self.capacity, self.inflight = 1000, 0
         self.down_until, self.wrong_needles, self.over_capacity_status = 0.0, False, 429
+        self.refused, self.refuse_status, self.query_times = {"min_p"}, 400, []
+        self.busy_code = "inference_capacity"
         self.unauthorized = 0
         self.port = free_port()
         self.counters = {"prompt": 0.0, "cached": 0.0, "generated": 0.0}
@@ -68,7 +70,8 @@ class FakeGateway:
         if time.time() < self.down_until:
             return web.json_response({"error": "no upstream"}, status=503)
         if self.inflight >= self.capacity:
-            return web.json_response({"error": "busy"}, status=self.over_capacity_status)
+            return web.json_response({"error": {"code": self.busy_code, "message": "busy"}},
+                                     status=self.over_capacity_status)
         self.inflight += 1
         try:
             body = await request.json()
@@ -78,10 +81,12 @@ class FakeGateway:
             self.inflight -= 1
 
     async def _answer(self, request, body):
-        if "min_p" in body:  # as DSpark does: a 400, or for a stream a 200 with an error event
-            err = {"object": "error", "message": "min_p is not supported with DSPARK", "code": 400}
+        refused = sorted(set(body) & self.refused)
+        if refused:  # as DSpark does: a 400, or for a stream a 200 with an error event
+            err = {"object": "error", "message": f"{refused[0]} is not supported with DSPARK",
+                   "code": self.refuse_status}
             if not body.get("stream"):
-                return web.json_response({"error": err}, status=400)
+                return web.json_response({"error": err}, status=self.refuse_status)
             resp = web.StreamResponse(headers={"content-type": "text/event-stream"})
             await resp.prepare(request)
             await resp.write(f"data: {json.dumps({'error': err})}\n\ndata: [DONE]\n\n".encode())
@@ -103,13 +108,20 @@ class FakeGateway:
             await resp.write(f"data: {json.dumps({'choices': [], 'usage': usage})}\n\ndata: [DONE]\n\n".encode())
             return resp
         msg = {"role": "assistant", "content": text}
+        choice = {"index": 0, "message": msg, "finish_reason": "stop"}
+        if body.get("logprobs"):
+            n = body.get("top_logprobs") or 0
+            choice["logprobs"] = {"content": [{"token": "fine", "logprob": -0.1,
+                                               "top_logprobs": [{"token": "fine", "logprob": -0.1}] * n}]}
         if body.get("tools") and body.get("tool_choice") != "none":
             msg = {"role": "assistant", "content": None, "tool_calls": [
                 {"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Oslo"}'}}]}
-        return web.json_response({"choices": [{"index": 0, "message": msg, "finish_reason": "stop"}], "usage": usage})
+        choice["message"] = msg
+        return web.json_response({"choices": [choice], "usage": usage})
 
     async def prom_query(self, request):
         q = request.query["query"]
+        self.query_times.append(float(request.query.get("time") or 0))
         role = "prefill" if 'role="prefill"' in q else "decode" if 'role="decode"' in q else "router"
         series = []
         if role == "prefill":
@@ -193,7 +205,7 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(needles[needles.index("--tokens-per-sentence") + 1], "0")
         func = self.cs.phase_argv("func", args, "/tmp/f.json")
         self.assertEqual(func[func.index("--context-length") + 1], "262144")
-        self.assertIn("t_logprobs_rejected", func[func.index("--known-failures") + 1])
+        self.assertNotIn("--known-failures", func)  # Qwen serves logprobs and min_p: t_logprobs passes
         overload = self.cs.phase_argv("overload", args, "/tmp/o.json")
         levels = overload[overload.index("--levels") + 1]
         self.assertEqual(max(int(x) for x in levels.split(",")), 128)
@@ -204,7 +216,7 @@ class ProfileTest(unittest.TestCase):
         args = self.cs.parse_args(self.argv("--profile", "dsv41-full"))
         self.assertEqual(args.phases, ",".join(self.cs.PHASES))
         self.assertEqual((args.context_length, args.sessions), (131072, 32))
-        self.assertEqual((args.known_failures, args.unsupported_params), ("t_n2", "min_p"))
+        self.assertEqual((args.known_failures, args.unsupported_params), ("t_n2", "logprobs,min_p"))
         self.assertEqual(args.soak_minutes, 240)
 
     def test_explicit_options_override_the_profile(self):
@@ -228,6 +240,8 @@ class ClusterStressTest(unittest.TestCase):
     def setUp(self):
         self.fake.capacity, self.fake.wrong_needles, self.fake.over_capacity_status = 1000, False, 429
         self.fake.down_until = 0.0
+        self.fake.refused, self.fake.refuse_status, self.fake.query_times = {"min_p"}, 400, []
+        self.fake.busy_code = "inference_capacity"
         self.tmp = tempfile.mkdtemp()
 
     def out(self, name):
@@ -273,6 +287,23 @@ class ClusterStressTest(unittest.TestCase):
                  "--recover-s", "10", "--require-shed", "--out", self.out("o.json"))
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertFalse(self.load("o.json")["shed"])
+
+    def test_require_shed_counts_only_the_given_capacity_codes(self):
+        self.fake.capacity = 4
+        argv = ["--url", self.url, "--levels", "16", "--step-s", "2", "--burst", "40", "--recover-s", "10",
+                "--require-shed", "--out", self.out("o.json")]
+        r = tool("overload.py", *argv, "--shed-codes", "inference_capacity")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = self.load("o.json")
+        self.assertGreater(res["shed_requests"], 0)
+        self.assertIn("inference_capacity", res["steps"][-1]["codes_429"])
+        # A 429 of another limit (a per-address cap, the key's rate limit) does not prove a capacity shed.
+        self.fake.busy_code = "address_capacity"
+        r = tool("overload.py", *argv, "--shed-codes", "inference_capacity")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        res = self.load("o.json")
+        self.assertFalse(res["shed"])
+        self.assertIn("address_capacity", " ".join(res["gate_failures"]))
 
     def test_a_client_out_of_file_descriptors_is_not_blamed_on_the_server(self):
         r = tool("overload.py", "--url", self.url, "--levels", "200", "--step-s", "2", "--burst", "0",
@@ -395,6 +426,21 @@ class ClusterStressTest(unittest.TestCase):
         self.assertEqual(snap.prefill.values["sglang:cached_tokens_total"], 400.0)
         self.assertEqual(snap.decode.values["sglang:generation_tokens_total"], 50.0)
 
+    def test_the_prometheus_query_names_each_series_and_keeps_them_apart(self):
+        # Azure Monitor managed Prometheus refuses a regex on __name__, and `or` matches label sets without
+        # the name: each series is named exactly and tagged (seen on ci-admin-next-amw, 2026-11-23).
+        sys.path.insert(0, HERE)
+        import prom_metrics
+
+        q = prom_metrics.union('environment="staging"')
+        self.assertNotIn("__name__", q)
+        for name in ("sglang:prompt_tokens_total", "sglang:generation_tokens_total",
+                     "sglang:time_to_first_token_seconds_bucket"):
+            self.assertIn(f'label_replace({name}{{environment="staging"}}, "series_name", "{name}", "", "")', q)
+        text = prom_metrics.exposition([{"metric": {"__name__": "sglang:token_usage", "series_name": "x"},
+                                         "value": [0, "0.5"]}])
+        self.assertNotIn("series_name", text)
+
     def test_exposition_escapes_label_values(self):
         sys.path.insert(0, HERE)
         import live_metrics
@@ -404,6 +450,75 @@ class ClusterStressTest(unittest.TestCase):
             [{"metric": {"__name__": "smg_http_responses_total", "status_code": '5"0\\0'}, "value": [0, "3"]}]
         )
         self.assertEqual(live_metrics.parse(text).values["smg_http_responses_total"], 3.0)
+
+    # The declared-behavior cases of func_tests (t_logprobs, t_logprobs_stream, t_min_p).
+
+    def func(self, *extra):
+        r = tool("func_tests.py", "--url", self.url, "--only", "api", "--trials", "1", "--concurrency", "4",
+                 "--out", self.out("f.json"), "--out-jsonl", self.out("f.jsonl"), *extra)
+        tests = {t["test"]: t for t in self.load("f.json")["tests"]}
+        return r, tests
+
+    def test_a_declared_unsupported_parameter_must_get_a_clean_4xx(self):
+        self.fake.refused = {"logprobs", "min_p"}
+        _, tests = self.func("--unsupported-params", "logprobs,min_p")
+        for name in ("t_logprobs", "t_logprobs_stream", "t_min_p"):
+            self.assertEqual(tests[name]["passed"], tests[name]["runs"], tests[name])
+        self.assertEqual(self.load("f.json")["unsupported_params"], ["logprobs", "min_p"])
+
+    def test_a_5xx_for_an_unsupported_parameter_fails(self):
+        self.fake.refused, self.fake.refuse_status = {"logprobs", "min_p"}, 500
+        _, tests = self.func("--unsupported-params", "logprobs,min_p")
+        for name in ("t_logprobs", "t_logprobs_stream", "t_min_p"):
+            self.assertEqual(tests[name]["passed"], 0, tests[name])
+            self.assertIn("500", tests[name]["first_error"])
+
+    def test_a_429_is_not_a_refusal_of_the_parameter(self):
+        self.fake.refused, self.fake.refuse_status = {"logprobs"}, 429
+        _, tests = self.func("--unsupported-params", "logprobs")
+        self.assertEqual(tests["t_logprobs"]["passed"], 0, tests["t_logprobs"])
+
+    def test_a_served_parameter_must_work(self):
+        self.fake.refused = set()
+        _, tests = self.func()
+        for name in ("t_logprobs", "t_logprobs_stream", "t_min_p"):
+            self.assertEqual(tests[name]["passed"], tests[name]["runs"], tests[name])
+
+    def test_a_parameter_refused_without_the_declaration_fails(self):
+        self.fake.refused = {"logprobs"}
+        _, tests = self.func()
+        self.assertEqual(tests["t_logprobs"]["passed"], 0)
+
+    def test_the_report_holds_the_suite_commit_and_per_phase_metrics(self):
+        out = self.out("metrics")
+        r = tool("cluster_stress.py", "--url", self.url, "--phases", "needles,soak", "--out-dir", out,
+                 "--soak-minutes", "0.05", "--sessions", "2", "--needles-args", "--sizes 2000 --seeds 1",
+                 "--unsupported-params", "min_p", "--prom-url", self.url, "--prom-prefill", 'role="prefill"', "--prom-decode", 'role="decode"',
+                 "--prom-lag-s", "0", "--require-metrics", timeout=300)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr)
+        with open(os.path.join(out, "report.json")) as f:
+            rep = json.load(f)
+        head = subprocess.run(["git", "-C", HERE, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        self.assertEqual(rep["suite"]["commit"], head or None)
+        self.assertEqual(rep["metrics"], {"source": "prometheus", "errors": []})
+        for res in rep["results"]:
+            self.assertGreaterEqual(res["ended_at"], res["started_at"])
+            # The fake serves its counters of now at any time, so the rate is 0, but it was read.
+            self.assertIsNotNone(res["metrics"]["traffic"]["input_tok_s"])
+        # The windows are read at the phase boundaries, not at the time of the query.
+        starts = {round(x["started_at"], 3) for x in rep["results"]}
+        self.assertTrue(starts <= {round(t, 3) for t in self.fake.query_times})
+
+    def test_require_metrics_fails_when_prometheus_does_not_answer(self):
+        out = self.out("nometrics")
+        r = tool("cluster_stress.py", "--url", self.url, "--phases", "needles", "--out-dir", out,
+                 "--needles-args", "--sizes 2000 --seeds 1", "--prom-url", "http://127.0.0.1:1",
+                 "--prom-worker", 'job="x"', "--prom-lag-s", "0", "--require-metrics", timeout=120)
+        self.assertEqual(r.returncode, 1, r.stdout[-2000:])
+        with open(os.path.join(out, "report.json")) as f:
+            rep = json.load(f)
+        self.assertFalse(rep["passed"])
+        self.assertTrue(rep["metrics"]["errors"])
 
     def test_suite_writes_one_report_and_passes(self):
         out = self.out("suite")
