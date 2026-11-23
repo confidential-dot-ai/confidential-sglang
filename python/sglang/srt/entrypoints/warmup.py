@@ -179,6 +179,31 @@ COLD_PATH_SAMPLING = (
     {"temperature": 0.0, "json_schema": '{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}'},
 )
 COLD_PATH_BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64)
+_GRAMMAR_KEYS = ("json_schema", "regex", "ebnf", "structural_tag")
+_PENALTY_KEYS = ("repetition_penalty", "frequency_penalty", "presence_penalty", "min_new_tokens")
+
+
+def cold_path_plan(spec_algorithm) -> tuple[tuple[dict, ...], bool]:
+    """The cold-path sampling paths and whether to ask for logprobs, minus what
+    the scheduler refuses under the server's speculative algorithm. A refused
+    request aborts, the warmup raises, and the server never listens: DSpark
+    (dsv41 layouts) aborts min_p (scheduler.py, any speculative algorithm) and
+    return_logprob (validate_dflash_request). The paths follow the scheduler's
+    admission checks; a stripped path still runs its other parameters."""
+    if not spec_algorithm.is_some():
+        return COLD_PATH_SAMPLING, True
+    drop = {"min_p"}
+    if spec_algorithm.is_uno():
+        drop.update(_PENALTY_KEYS)
+    if spec_algorithm.is_uno() or (spec_algorithm.is_dflash_family() and not spec_algorithm.is_dspark()):
+        drop.update(_GRAMMAR_KEYS)
+    sampling = []
+    for path in COLD_PATH_SAMPLING:
+        kept = {k: v for k, v in path.items() if k not in drop}
+        if (kept or not path) and kept not in sampling:
+            sampling.append(kept)
+    logprobs = not (spec_algorithm.is_dflash_family() or spec_algorithm.is_uno())
+    return tuple(sampling), logprobs
 
 
 @warmup("confidential_cold_path")
@@ -187,6 +212,14 @@ async def confidential_cold_path(disaggregation_mode: str, tokenizer_manager: To
     mixed in one batch, with and without logprobs), and decode batch sizes up
     to 64."""
     import asyncio
+
+    from sglang.srt.runtime_context import get_spec
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    spec_algorithm = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
+    sampling_paths, with_logprobs = cold_path_plan(spec_algorithm)
+    logger.info("confidential_cold_path: %d sampling paths, logprobs %s (speculative %s)",
+                len(sampling_paths), "on" if with_logprobs else "off", spec_algorithm.name)
 
     def request(size: int, sampling: dict, max_new_tokens: int, logprobs: bool = False) -> GenerateReqInput:
         req = GenerateReqInput(
@@ -213,19 +246,19 @@ async def confidential_cold_path(disaggregation_mode: str, tokenizer_manager: To
     for size in range(1, 65):
         await run(request(size, {"temperature": 0.0}, 1))
     for size in (1, 8, 16, 32):
-        for sampling in COLD_PATH_SAMPLING:
-            await run(request(size, sampling, 16, size == 32))
-    for sampling in COLD_PATH_SAMPLING:
-        for logprobs in (False, True):
+        for sampling in sampling_paths:
+            await run(request(size, sampling, 16, with_logprobs and size == 32))
+    for sampling in sampling_paths:
+        for logprobs in ((False, True) if with_logprobs else (False,)):
             await run(request(64, sampling, 16, logprobs))
     # One batch that mixes every sampling path, like the gateway's real traffic.
-    await asyncio.gather(*(run(request(64, s, 16, lp)) for s in COLD_PATH_SAMPLING for lp in (False, True)))
+    await asyncio.gather(*(run(request(64, s, 16, lp)) for s in sampling_paths for lp in ((False, True) if with_logprobs else (False,))))
     for batch in COLD_PATH_BATCH_SIZES:
-        await asyncio.gather(*(run(request(64 + i, COLD_PATH_SAMPLING[i % len(COLD_PATH_SAMPLING)], 16))
+        await asyncio.gather(*(run(request(64 + i, sampling_paths[i % len(sampling_paths)], 16))
                                for i in range(batch)))
     # Batches of short prompts, prefilled together: staging-09361fae4780 still compiled
     # Triton kernels on 16 parallel ~30-token chat requests.
     for batch in COLD_PATH_BATCH_SIZES:
-        await asyncio.gather(*(run(request(1 + (7 * i) % 63, COLD_PATH_SAMPLING[i % len(COLD_PATH_SAMPLING)], 16))
+        await asyncio.gather(*(run(request(1 + (7 * i) % 63, sampling_paths[i % len(sampling_paths)], 16))
                                for i in range(batch)))
     logger.info("confidential_cold_path warmup ended")

@@ -209,6 +209,13 @@ def parser():
         "prefill sends only the pages past the prefix decode already holds",
     )
     p.add_argument(
+        "--warmups",
+        metavar="NAME[,NAME...]",
+        help="SGLang custom warmups (entrypoints/warmup.py) for every worker, "
+        "e.g. confidential_cold_path. They run before the server listens, so a "
+        "worker answers /health (and sglang-pair calls it ready) only once warm",
+    )
+    p.add_argument(
         "--tokenizer-workers",
         type=int,
         default=1,
@@ -1095,6 +1102,8 @@ def build_plan(args):
         ]
         if args.tokenizer_workers != 1:
             command += ["--tokenizer-worker-num", str(args.tokenizer_workers)]
+        if args.warmups:
+            command += ["--warmups", args.warmups]
         if role == "prefill" and args.prefill_schedule_policy != "fcfs":
             command += ["--schedule-policy", args.prefill_schedule_policy]
         if args.worker_metrics:
