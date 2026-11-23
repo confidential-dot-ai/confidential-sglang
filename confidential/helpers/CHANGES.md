@@ -143,3 +143,10 @@ fastapi/httpx): 174 passed (wait-for-model, fetch-model, server output and
 signals, HTTP/media/listener policy against this checkout's source, simulator
 parser no-op, pair supervisor/diagnostics/log and snapshot delivery against
 this checkout's `pair_progress` and `pair_nccl_diagnostics`).
+
+## pair_supervisor.py: parallelStart (2026-11-23)
+
+`pair_supervisor.py` (`/usr/local/bin/sglang-pair`) is now `db3f44ba…64021128`
+(was `51769868…40ddb80a5`): the optional config key `parallelStart` starts
+prefill and decode together. Without the key the behavior is unchanged. See
+`docs/confidential-changes.md`.

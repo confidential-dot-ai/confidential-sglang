@@ -285,3 +285,69 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
   it, and `or` drops series whose labels are equal apart from the name.
 - The `qwen-short` profile drops its known failure; `dsv41-full` declares
   `logprobs,min_p` unsupported.
+
+## Cold-path warmup under DSpark; dsv41-262k runs it on both workers (2026-11-23)
+
+- `python/sglang/srt/entrypoints/warmup.py`: `cold_path_plan()` gives the
+  cold-path sampling paths and whether to ask for logprobs, minus what the
+  scheduler refuses under the server's speculative algorithm. DSpark refuses
+  `min_p` (scheduler.py, any speculative algorithm) and `return_logprob`
+  (`validate_dflash_request`); a refused warmup request aborts, the warmup
+  raises, and the server never listens. Plain DFlash also drops grammars, UNO
+  also drops penalties. A path that loses a parameter still runs the others
+  (`top_p` without `min_p`). Without speculation nothing changes.
+- `recipes/deepseek-v41/launcher/launch.py`: `--warmups NAMES` passes SGLang
+  custom warmups to every worker. `dsv41-262k.env` sets
+  `--warmups confidential_cold_path`, so the baked `dsv41-262k.json` plan has
+  it on prefill and decode, and `sglang-pair` (which waits for each worker's
+  `/health`) reports the pair ready only once both are warm.
+- Tests: `test/registered/unit/entrypoints/test_cold_path_warmup.py`,
+  `test_launch.py::test_warmups_are_off_by_default_and_reach_both_roles`.
+
+## Engram holder without mlock (2026-11-23)
+
+- `recipes/deepseek-v41/launcher/hold_engram_cache.py`: `--lock auto`
+  (default) tries `mlock` and, when it is refused (`EPERM`/`ENOMEM`/`EAGAIN`:
+  no `RLIMIT_MEMLOCK` headroom, no `CAP_IPC_LOCK`), releases any partial locks
+  and holds the shards unlocked: read-only mappings faulted in with
+  `MADV_POPULATE_READ`, populated again every `--refresh-seconds` (300) if
+  the kernel reclaimed pages. It logs `mode=locked` or `mode=populated` and
+  the resident bytes (`mincore`). `--lock required` keeps the old behavior;
+  `--lock off` never locks. `--reserve-gib` (default 32) is the RAM headroom
+  check that was hard-coded.
+- Why: under C8s the worker's containerd sets no `LimitMEMLOCK`, and the
+  chart runs the holder as uid 1001 with no capabilities, so the ~198 GiB
+  `mlock` fails and the pair never starts.
+- `recipes/deepseek-v41/container/entrypoint.sh` passes `--lock required`:
+  the docker recipe's launcher credits only locked pages.
+- Tests: `recipes/deepseek-v41/launcher/test_hold_engram_cache.py`.
+
+## The PD decode warmup skips grammars; warmups run once per server (2026-11-23)
+
+- `python/sglang/srt/entrypoints/warmup.py` `cold_path_plan(spec, mode)`: on a
+  PD decode server the cold path leaves out the grammar paths (`json_schema`,
+  `regex`, `ebnf`, `structural_tag`). A decode warmup request takes the fake
+  bootstrap, so no prefill samples its first token under the grammar; the
+  grammar refused it ("Grammar accept_token failed ... Tokens not accepted",
+  HTTP 500), the warmup raised and decode exited (4x B200, `dsv41-262k`, run
+  R1, 10:21 UTC). Prefill still warms the grammar paths.
+- `execute_warmups`: with `--tokenizer-worker-num N` every tokenizer process
+  runs the lifespan, so each ran the whole warmup (N=4 on `dsv41-262k`). The
+  processes of one server (main process ID and start time) now elect one
+  with `flock` on a file in `/dev/shm`; it runs the warmups and writes a done
+  marker, and the others wait on the lock (none answers `/health` before the
+  warmup ends), then skip. `http_server.py` is unchanged, so
+  `harden_http.py`'s pinned hash still matches.
+- Tests: `test_cold_path_warmup.py` (decode plan; four forked processes warm
+  up once and none finishes before the warmup ends).
+
+## sglang-pair: parallel start (2026-11-23)
+
+- `confidential/helpers/pair_supervisor.py`: optional config key
+  `parallelStart` (boolean, default `false`). When true, prefill and decode
+  start together once the model gate is ready (prefill is spawned first);
+  the pair is `starting` until every rank is ready and fails on any worker
+  failure or the startup timeout, as before. The chart's pair template sets
+  it for `dsv41-262k`. Measured times and peak host RAM: see the PR.
+- Tests: `test_pair_supervisor.py` (the key is an optional boolean; decode
+  runs while prefill still loads, and the pair is ready only once both are).

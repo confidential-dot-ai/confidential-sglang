@@ -150,7 +150,10 @@ def assigned_gpus() -> list[str]:
 
 
 def validate_config(config: dict) -> None:
-    if set(config) != {"workers", "modelGate", "statusPort", "progressTimeoutSeconds", "startupTimeoutSeconds", "shutdownTimeoutSeconds"}:
+    if set(config) - {"parallelStart"} != {"workers", "modelGate", "statusPort", "progressTimeoutSeconds",
+                                           "startupTimeoutSeconds", "shutdownTimeoutSeconds"}:
+        raise ValueError("invalid pair configuration")
+    if type(config.get("parallelStart", False)) is not bool:
         raise ValueError("invalid pair configuration")
     if not config["modelGate"] or any(type(v) is not str for v in config["modelGate"]):
         raise ValueError("model verification command is required")
@@ -375,6 +378,12 @@ class Supervisor:
             self.children[role] = subprocess.Popen(worker["command"], env=env, stdin=subprocess.DEVNULL,
                                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                                   start_new_session=True)
+            if self.config.get("parallelStart", False):
+                # Load and warm both workers at once (prefill is still spawned
+                # first). monitor() reports the pair starting until every rank
+                # is ready, and fails it on any worker failure or the startup
+                # timeout. dsv41-262k on a 4x B200: see confidential-changes.md.
+                continue
             # Load and warm one worker before the next, preserving the existing
             # launch order and avoiding concurrent cold-build memory spikes.
             while not self.stop.wait(0.2):
