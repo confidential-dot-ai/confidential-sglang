@@ -307,6 +307,9 @@ async def t_unicode(s, sp):
 
 
 async def t_n2(s, sp):
+    """n=2: two choices, or, if declared unsupported (--unsupported-params n), a clean 4xx."""
+    if "n" in unsupported():
+        return await param_case(s, sp, "n")
     r, dt = await chat(s, {"messages": [{"role": "user", "content": "Name a random fruit."}],
                            "n": 2, "max_tokens": 64, **sp}, timeout=60)
     assert len(r["choices"]) == 2, len(r["choices"])
@@ -319,6 +322,8 @@ async def t_n2(s, sp):
 PARAM_BODIES = {
     "logprobs": {"logprobs": True, "top_logprobs": 3},
     "min_p": {"temperature": 1.0, "min_p": 0.05},
+    # A PD pair has no n>1: the gateway refuses it (confidential-inference #369).
+    "n": {"n": 2},
 }
 # A client error that says the request is wrong. 408 and 429 are not answers
 # about the request (a timeout, capacity), so they do not count as a refusal.

@@ -192,9 +192,11 @@ Mount a CA bundle and pass `--ca-cert` for a private CA, and use
   0.030-0.035). `--oracle-decode` lets a request dictate the output, so it must
   never be in a production allowlist.
 - **Known failures and rejected parameters.** PD deployments do not support
-  `n > 1` (`--known-failures t_n2`); speculative decoding returns no logprobs,
-  and DSpark also rejects `min_p`: pass `--unsupported-params logprobs,min_p`.
-  `t_logprobs` and `t_min_p` then require a clean client error for them, and
+  `n > 1`: behind a gateway that refuses it (confidential-inference #369),
+  pass `n` in `--unsupported-params` and `t_n2` requires a clean client error;
+  straight to the router, `--known-failures t_n2`. Speculative decoding returns
+  no logprobs, and DSpark also rejects `min_p`: pass `--unsupported-params
+  logprobs,min_p`. `t_logprobs` and `t_min_p` then require a clean client error for them, and
   the soak and fault mixes leave min_p out instead of failing on it.
 - **Errors inside a stream.** A streamed request refused after the 200 header
   arrives as an error event in the stream. Every tool here counts that, and a
