@@ -44,3 +44,12 @@ Build inputs:
   `confidential/tests/router/`). Not moved: `smoke_alias.py` (drives
   `CI_ROUTER_PD_PAIRS`, which no longer exists) and the public `test_recipe.py`
   (checks patch files, replaced by the new `test_recipe.py`).
+
+## Launcher: router memory gauges
+
+`private_router.py` serves the router's metrics endpoint itself and adds
+`ci_router_memory_current_bytes` and `ci_router_memory_peak_bytes` from the
+container's cgroup (`memory.current`, `memory.peak`). The router's exporter
+moves to a loopback port; the chart's arguments and scrape target stay the
+same. confidential-inference's validation reads the router's peak memory from
+it (its `load/not-automated` check had no series for it).
