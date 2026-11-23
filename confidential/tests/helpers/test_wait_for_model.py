@@ -179,6 +179,24 @@ class ModelMountGateTests(unittest.TestCase):
                          tuple(failed[key] for key in ("error_class", "file", "expected_size", "got_size",
                                                        "expected_sha256", "got_sha256")))
 
+    def test_a_shard_name_outside_the_manifest_is_not_reported(self) -> None:
+        # The index is not pinned on the argv here: its shard names are not the release's.
+        digests = self.create_model()
+        self.set_mount()
+        index = self.model / "model.safetensors.index.json"
+        self.model.chmod(0o755)
+        index.chmod(0o644)
+        index.write_text(json.dumps({"weight_map": {"x": "PRIVATE-planted-shard.safetensors"}}))
+        index.chmod(0o444)
+        self.model.chmod(0o555)
+        digests.pop("model.safetensors.index.json")
+        digests["model-00001-of-00001.safetensors"] = hashlib.sha256(b"weights").hexdigest()
+        result = self.run_gate(digests)
+        self.assertNotIn("PRIVATE", result.stdout)
+        failed = self.events(result)[0]
+        self.assertEqual(("model_check_failed", "index_invalid", None),
+                         (failed["event"], failed["error_class"], failed["file"]))
+
     def test_an_extra_file_is_reported_without_its_name(self) -> None:
         digests = self.create_model()
         self.set_mount()

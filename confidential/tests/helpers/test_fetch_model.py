@@ -35,7 +35,16 @@ class FakeHub(http.server.BaseHTTPRequestHandler):
         self.requests.append(self.path)
         name = self.path.rsplit("/resolve/" + REVISION + "/", 1)[-1]
         if self.failures.get(name):
-            self.send_error(self.failures[name].pop(0))
+            status = self.failures[name].pop(0)
+            if status == 0:
+                # A response that ends before its Content-Length (IncompleteRead).
+                self.send_response(200)
+                self.send_header("Content-Length", "1000000")
+                self.end_headers()
+                self.wfile.write(b"partial")
+                self.close_connection = True
+                return
+            self.send_error(status)
             return
         tree = f"/api/models/{REPOSITORY}/tree/{REVISION}?recursive=true"
         prefix = f"/{REPOSITORY}/resolve/{REVISION}/"
@@ -204,6 +213,40 @@ class FetchModelTests(unittest.TestCase):
                           "error_class": "http_error", "http_status": 503},
                          next(event for event in events if event["event"] == "model_fetch_retry"))
         self.assertEqual("model_fetch_complete", events[-1]["event"])
+
+    def test_an_interrupted_response_is_retried(self) -> None:
+        FakeHub.failures = {"config.json": [0]}
+        result = self.fetch()
+        self.assertEqual(0, result.returncode, result.stderr)
+        retry = next(event for event in self.events(result) if event["event"] == "model_fetch_retry")
+        # A short body reads as a size mismatch; a read that raises is a connection error.
+        self.assertEqual("config.json", retry["file"])
+        self.assertIn(retry["error_class"], {"connection", "size_mismatch"})
+
+    def test_a_read_that_raises_incomplete_read_is_a_connection_error(self) -> None:
+        import http.client
+        import importlib.util
+        from unittest import mock
+
+        spec = importlib.util.spec_from_file_location("fetch_model_module", FETCH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        class Broken:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self, _amount):
+                raise http.client.IncompleteRead(b"partial", 10)
+        target = self.cache / "config.json"
+        with mock.patch.object(module.urllib.request, "urlopen", return_value=Broken()):
+            with self.assertRaises(module.FetchError) as caught:
+                module.download("http://unused", target, "0" * 64, 10)
+        self.assertEqual("connection", caught.exception.error_class)
+        self.assertFalse(target.with_name("config.json.partial").exists())
 
     def test_a_changed_byte_is_reported_with_both_sizes_and_digests(self) -> None:
         body = FILES["model.safetensors"]

@@ -235,7 +235,7 @@ def verify_every_file(path: Path, metadata_name: str, inventory: dict[str, tuple
     return {"files": len(inventory), "size_bytes": total, "duration_ms": int((time.monotonic() - started) * 1000)}
 
 
-def verify_index(path: Path) -> None:
+def verify_index(path: Path, inventory: dict[str, tuple[str, int]] | None = None) -> None:
     """Check the shard index, or the one weight file of an unsharded model."""
     index = path / "model.safetensors.index.json"
     if not os.path.lexists(index):
@@ -255,9 +255,10 @@ def verify_index(path: Path) -> None:
         raise ModelMountError("the model index contains an invalid shard name", "index_invalid")
     missing = [name for name in sorted(shards) if not (path / name).is_file() or (path / name).stat().st_size == 0]
     if missing:
-        # The index's digest is pinned, so its shard names are the release's.
+        # The index is not yet checked against the manifest here: report the
+        # shard's name only when the pinned manifest lists it.
         raise ModelMountError(f"the model index references a missing shard: {missing[0]}", "index_invalid",
-                              file=missing[0])
+                              file=missing[0] if inventory is not None and missing[0] in inventory else None)
 
 
 def verify_no_write(path: Path) -> None:
@@ -311,7 +312,7 @@ def verify_once(args: argparse.Namespace) -> dict[str, int]:
         args.expected_revision,
         expected_files,
     )
-    verify_index(path)
+    verify_index(path, inventory)
     return verify_every_file(path, args.revision_metadata, inventory)
 
 

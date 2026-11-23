@@ -161,7 +161,8 @@ def gate_event(value: object) -> dict | None:
     tools write every key of their event); every other field must pass
     reviewed_event. The role is always the pair's.
     """
-    if type(value) is not dict or value.get("event") not in GATE_EVENTS or "role" in value:
+    if type(value) is not dict or type(value.get("event")) is not str or value["event"] not in GATE_EVENTS \
+            or "role" in value:
         return None
     return reviewed_event({**{key: item for key, item in value.items() if item is not None}, "role": "pair"})
 
@@ -179,7 +180,7 @@ def forward_gate_events(stream) -> None:
                 continue
             try:
                 value = gate_event(json.loads(line))
-            except (ValueError, UnicodeError):
+            except (ValueError, UnicodeError, TypeError, RecursionError):
                 continue
             if value is not None:
                 emit(**value)

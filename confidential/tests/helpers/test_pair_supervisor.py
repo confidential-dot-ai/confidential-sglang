@@ -323,6 +323,15 @@ class GateAndReadyEventTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertIsNone(pair.gate_event(bad))
 
+    def test_a_malformed_gate_record_does_not_stop_forwarding(self):
+        lines = [b'{"event":[]}\n', b'{"event":{"a":1}}\n', b'[1,2]\n', b'"x"\n',
+                 b'{"event":"model_verified","files":1,"size_bytes":2,"duration_ms":3}\n']
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            pair.forward_gate_events(io.BytesIO(b"".join(lines)))
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(["model_verified"], [record["event"] for record in records])
+
     def test_jit_compile_carries_only_a_kernel_name_and_a_time(self):
         record = {"event": "jit_compile", "role": "decode", "rank": 1, "kernel": "_fwd_kernel", "duration_ms": 9}
         self.assertEqual(record, pair.reviewed_event(record))

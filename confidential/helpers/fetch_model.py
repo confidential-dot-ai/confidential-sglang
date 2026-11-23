@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -157,6 +158,10 @@ def download(url: str, target: Path, digest: str, size: int) -> None:
     except TimeoutError:
         partial.unlink(missing_ok=True)
         raise FetchError(f"{target.name}: the download timed out", "timeout") from None
+    except http.client.HTTPException:
+        # IncompleteRead and other broken responses: the connection ended early.
+        partial.unlink(missing_ok=True)
+        raise FetchError(f"{target.name}: the response ended early", "connection") from None
     except urllib.error.URLError as error:
         partial.unlink(missing_ok=True)
         kind = "timeout" if isinstance(error.reason, TimeoutError) else "connection"
