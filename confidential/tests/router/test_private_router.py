@@ -4,10 +4,14 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import urllib.error
+import urllib.request
 
 ROOT = Path(__file__).resolve().parents[3]
 PROGRAM = ROOT / "confidential/router/private_router.py"
@@ -131,11 +135,14 @@ open({str(argv)!r},'w').write(json.dumps(sys.argv[1:]))
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(0, result.returncode)
                 expected = ["--port=1", *(["--json-log"] if json_log else []), "--log-level", "warn"]
-                self.assertEqual(expected, json.loads(argv.read_text()))
+                given = json.loads(argv.read_text())
+                # The launcher serves the metrics address; the router's exporter moves to loopback.
+                self.assertEqual(expected + ["--prometheus-host", "127.0.0.1", "--prometheus-port"], given[:-1])
+                self.assertTrue(1024 <= int(given[-1]) <= 65535)
                 self.assertEqual(["router_started"],
                                  [json.loads(line)["event"] for line in result.stdout.splitlines()])
 
-    def test_launcher_sends_no_network_events(self):
+    def test_launcher_opens_only_its_metrics_listener(self):
         with tempfile.TemporaryDirectory() as directory:
             environment = self.fake(directory, "print('private child output', flush=True)\n")
             audit = Path(directory) / "network-events"
@@ -154,7 +161,9 @@ open({str(argv)!r},'w').write(json.dumps(sys.argv[1:]))
             self.assertEqual("", result.stderr)
             self.assertEqual(["router_started"],
                              [json.loads(line)["event"] for line in result.stdout.splitlines()])
-            self.assertEqual("", audit.read_text())
+            # It binds its metrics listener (and a loopback port probe); it connects nowhere
+            # and looks up no name until a scrape asks for the router's metrics.
+            self.assertEqual({"socket.bind"}, set(audit.read_text().split()))
 
     def test_emit_refuses_fields_outside_the_contract(self):
         for event, fields in (("router_exit", {"role": "router", "code": "1"}),
@@ -200,6 +209,106 @@ while True:time.sleep(1)
                     process.kill()
                     process.wait()
 
+
+
+class MemoryMetricsTests(unittest.TestCase):
+    """The launcher serves the router's metrics endpoint with two cgroup memory gauges added."""
+
+    def test_the_gauges_read_the_cgroup_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cgroup = Path(directory)
+            (cgroup / "memory.current").write_text("123456\n")
+            (cgroup / "memory.peak").write_text("987654321\n")
+            text = module.memory_metrics(cgroup)
+            self.assertIn("# TYPE ci_router_memory_current_bytes gauge\nci_router_memory_current_bytes 123456\n", text)
+            self.assertIn("# TYPE ci_router_memory_peak_bytes gauge\nci_router_memory_peak_bytes 987654321\n", text)
+            # A missing file or a value that is not a number leaves its gauge out.
+            (cgroup / "memory.peak").unlink()
+            (cgroup / "memory.current").write_text("max\n")
+            self.assertEqual("", module.memory_metrics(cgroup))
+
+    def test_the_metrics_address_is_the_routers(self):
+        self.assertEqual(("0.0.0.0", 29000), module.metrics_address([]))
+        self.assertEqual(("0.0.0.0", 29001), module.metrics_address(["--prometheus-host=0.0.0.0", "--prometheus-port=29001"]))
+        self.assertEqual(("::", 7), module.metrics_address(["--prometheus-host", "::", "--prometheus-port", "8",
+                                                            "--prometheus-port=7"]))
+        self.assertIsNone(module.metrics_address(["--prometheus-port=x"]))
+
+    def free_port(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    def router(self, directory):
+        """A fake router that serves its metrics on the --prometheus-port it gets last."""
+        return PrivateRouterTests.fake(self, directory, """
+import http.server,signal,sys,threading
+args=sys.argv[1:]
+port=[int(args[i+1]) for i,a in enumerate(args) if a=='--prometheus-port'][-1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body=b'# TYPE smg_requests_total counter\\nsmg_requests_total 3'
+        self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+    def log_message(self,*a):pass
+s=http.server.HTTPServer(('127.0.0.1',port),H)
+signal.signal(signal.SIGTERM,lambda *_:sys.exit(0))
+s.serve_forever()
+""")
+
+    def test_the_endpoint_serves_the_routers_metrics_and_the_gauges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = self.router(directory)
+            port = self.free_port()
+            process = subprocess.Popen([sys.executable, str(PROGRAM), "--prometheus-host=127.0.0.1",
+                                        f"--prometheus-port={port}"], env=environment,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual("router_started", json.loads(process.stdout.readline())["event"])
+                body = ""
+                for _ in range(50):
+                    try:
+                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=2) as response:
+                            body = response.read().decode()
+                        if "smg_requests_total" in body:
+                            break
+                    except OSError:
+                        pass
+                    time.sleep(0.1)
+                self.assertIn("smg_requests_total 3\n", body)
+                gauges = [line for line in body.splitlines() if line.startswith("ci_router_memory")]
+                # The gauges of this process's cgroup, when it has the files (in a container).
+                expected = module.memory_metrics()
+                names = lambda lines: [line.split()[0] for line in lines]  # noqa: E731
+                self.assertEqual(names(line for line in expected.splitlines() if not line.startswith("#")),
+                                 names(gauges))
+                for line in gauges:
+                    self.assertRegex(line, r"\Aci_router_memory_(current|peak)_bytes [0-9]+\Z")
+                with self.assertRaises(urllib.error.HTTPError):
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/other", timeout=2)
+                process.send_signal(signal.SIGTERM)
+                _, stderr = process.communicate(timeout=10)
+                self.assertEqual("", stderr)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+
+    def test_a_taken_address_leaves_the_router_its_own_endpoint(self):
+        with tempfile.TemporaryDirectory() as directory, socket.socket() as taken:
+            taken.bind(("127.0.0.1", 0))
+            taken.listen()
+            port = taken.getsockname()[1]
+            argv = Path(directory) / "argv.json"
+            environment = PrivateRouterTests.fake(self, directory, f"""
+import json,sys
+open({str(argv)!r},'w').write(json.dumps(sys.argv[1:]))
+""")
+            result = subprocess.run([sys.executable, str(PROGRAM), "--prometheus-host=127.0.0.1",
+                                     f"--prometheus-port={port}"], env=environment,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(["--prometheus-host=127.0.0.1", f"--prometheus-port={port}", "--json-log",
+                              "--log-level", "warn"], json.loads(argv.read_text()))
 
 if __name__ == "__main__":
     unittest.main()
