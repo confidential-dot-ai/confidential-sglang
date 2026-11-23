@@ -888,6 +888,16 @@ class TestLaunch(unittest.TestCase):
             command = worker["command"]
             self.assertEqual(command[command.index("--warmups") + 1], "confidential_cold_path")
 
+    def test_loader_threads_reach_both_roles(self):
+        for worker in launch.build_plan(self.args())["workers"]:
+            self.assertNotIn("--model-loader-extra-config", worker["command"])
+        for worker in launch.build_plan(self.args("--loader-threads", "2"))["workers"]:
+            command = worker["command"]
+            value = command[command.index("--model-loader-extra-config") + 1]
+            self.assertEqual(json.loads(value), {"num_threads": 2})
+        with self.assertRaises(ValueError):
+            launch.validate(self.args("--loader-threads", "0"))
+
     def test_oracle_decode_is_off_by_default_and_reaches_both_roles(self):
         for worker in launch.build_plan(self.args())["workers"]:
             self.assertNotIn("SGLANG_ENABLE_ORACLE_DECODE", worker["env"])

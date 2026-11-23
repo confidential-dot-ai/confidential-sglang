@@ -216,6 +216,14 @@ def parser():
         "worker answers /health (and sglang-pair calls it ready) only once warm",
     )
     p.add_argument(
+        "--loader-threads",
+        type=int,
+        help="Shard-reading threads per worker rank (--model-loader-extra-config "
+        "num_threads; SGLang's default is 8). In a TDX guest, mmap reads of the "
+        "checkpoint collapse with many threads in one process: 4 ranks x 8 threads "
+        "read ~5 GB/s each, 4 x 2 threads ~22 GB/s (4x B200, 2026-11-23)",
+    )
+    p.add_argument(
         "--tokenizer-workers",
         type=int,
         default=1,
@@ -739,6 +747,8 @@ def validate(args):
         )
     if args.decode_polling_interval < 1:
         raise ValueError("--decode-polling-interval must be at least 1")
+    if args.loader_threads is not None and args.loader_threads < 1:
+        raise ValueError("--loader-threads must be positive")
     if args.tokenizer_workers < 1:
         raise ValueError("--tokenizer-workers must be at least 1")
     if any(bs < 1 for bs in args.decode_graph_extra_bs):
@@ -1104,6 +1114,9 @@ def build_plan(args):
             command += ["--tokenizer-worker-num", str(args.tokenizer_workers)]
         if args.warmups:
             command += ["--warmups", args.warmups]
+        if args.loader_threads:
+            command += ["--model-loader-extra-config",
+                        json.dumps({"num_threads": args.loader_threads})]
         if role == "prefill" and args.prefill_schedule_policy != "fcfs":
             command += ["--schedule-policy", args.prefill_schedule_policy]
         if args.worker_metrics:
