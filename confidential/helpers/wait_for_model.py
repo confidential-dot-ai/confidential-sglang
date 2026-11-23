@@ -29,11 +29,27 @@ PROGRESS_STEP = 0.1
 
 
 class ModelMountError(ValueError):
-    """The model mount does not match the release contract."""
+    """The model mount does not match the release contract.
+
+    `error_class` (CHECK_ERROR_CLASSES) and the file fields describe the
+    failure in the model_check_failed event. `file` is only ever a name of
+    the pinned manifest or of the release argv, never a name read from disk.
+    """
+
+    def __init__(self, message: str, error_class: str = "manifest_invalid", *, file: str | None = None,
+                 expected_size: int | None = None, got_size: int | None = None,
+                 expected_sha256: str | None = None, got_sha256: str | None = None) -> None:
+        super().__init__(message)
+        self.error_class = error_class
+        self.details = {"file": file, "expected_size": expected_size, "got_size": got_size,
+                        "expected_sha256": expected_sha256, "got_sha256": got_sha256}
 
 
 class MountUnavailable(ModelMountError):
     """The c8s sidecar has not propagated the model mount yet."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, "unavailable")
 
 
 def decode_mount_path(value: str) -> str:
@@ -146,17 +162,18 @@ def list_model_files(path: Path) -> set[str]:
         base = Path(directory)
         for name in directories:
             if (base / name).is_symlink():
-                raise ModelMountError(f"the model volume contains a symbolic link: {(base / name).relative_to(path)}")
+                raise ModelMountError(f"the model volume contains a symbolic link: {(base / name).relative_to(path)}",
+                                      "unexpected_file")
         for name in files:
             candidate = base / name
             relative = str(candidate.relative_to(path))
             if candidate.is_symlink() or not candidate.is_file():
-                raise ModelMountError(f"the model volume contains a non-regular file: {relative}")
+                raise ModelMountError(f"the model volume contains a non-regular file: {relative}", "unexpected_file")
             found.add(relative)
     return found
 
 
-def verify_every_file(path: Path, metadata_name: str, inventory: dict[str, tuple[str, int]]) -> None:
+def verify_every_file(path: Path, metadata_name: str, inventory: dict[str, tuple[str, int]]) -> dict[str, int]:
     """Check every file on the volume against the pinned byte manifest.
 
     The manifest is trusted because its own SHA-256 is pinned in the
@@ -167,13 +184,17 @@ def verify_every_file(path: Path, metadata_name: str, inventory: dict[str, tuple
     expected = set(inventory) | {metadata_name}
     missing = sorted(expected - found)
     if missing:
-        raise ModelMountError(f"the model volume is missing a manifest file: {missing[0]}")
+        raise ModelMountError(f"the model volume is missing a manifest file: {missing[0]}", "missing",
+                              file=missing[0], expected_size=inventory.get(missing[0], (None, None))[1])
     extra = sorted(found - expected)
     if extra:
-        raise ModelMountError(f"the model volume contains a file the manifest does not list: {extra[0]}")
-    for name, (_digest, size) in inventory.items():
-        if (path / name).stat().st_size != size:
-            raise ModelMountError(f"the model file has the wrong size: {name}")
+        # The name is not reported: it was read from disk, not from the manifest.
+        raise ModelMountError(f"the model volume contains a file the manifest does not list: {extra[0]}", "extra")
+    for name, (digest, size) in inventory.items():
+        got_size = (path / name).stat().st_size
+        if got_size != size:
+            raise ModelMountError(f"the model file has the wrong size: {name}", "size_mismatch", file=name,
+                                  expected_size=size, got_size=got_size, expected_sha256=digest)
     total = sum(size for _digest, size in inventory.values())
     done = 0
     next_report = PROGRESS_STEP
@@ -189,8 +210,11 @@ def verify_every_file(path: Path, metadata_name: str, inventory: dict[str, tuple
         try:
             for future in concurrent.futures.as_completed(futures):
                 name = futures[future]
-                if future.result() != inventory[name][0]:
-                    raise ModelMountError(f"the model file has the wrong digest: {name}")
+                got = future.result()
+                if got != inventory[name][0]:
+                    raise ModelMountError(f"the model file has the wrong digest: {name}", "digest_mismatch",
+                                          file=name, expected_size=inventory[name][1], got_size=inventory[name][1],
+                                          expected_sha256=inventory[name][0], got_sha256=got)
                 done += inventory[name][1]
                 if total and done / total >= next_report:
                     print(
@@ -208,29 +232,33 @@ def verify_every_file(path: Path, metadata_name: str, inventory: dict[str, tuple
         f"model-mount: every model file matches the manifest ({time.monotonic() - started:.0f}s)",
         file=sys.stderr,
     )
+    return {"files": len(inventory), "size_bytes": total, "duration_ms": int((time.monotonic() - started) * 1000)}
 
 
-def verify_index(path: Path) -> None:
+def verify_index(path: Path, inventory: dict[str, tuple[str, int]] | None = None) -> None:
     """Check the shard index, or the one weight file of an unsharded model."""
     index = path / "model.safetensors.index.json"
     if not os.path.lexists(index):
         single = path / "model.safetensors"
         if single.is_symlink() or not single.is_file() or single.stat().st_size == 0:
-            raise ModelMountError("the model has no index and no single model.safetensors file")
+            raise ModelMountError("the model has no index and no single model.safetensors file", "index_invalid")
         return
     try:
         value = json.loads(index.read_text(encoding="utf-8"))
         weight_map = value["weight_map"]
     except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
-        raise ModelMountError("the model index is invalid") from error
+        raise ModelMountError("the model index is invalid", "index_invalid") from error
     if not isinstance(weight_map, dict) or not weight_map:
-        raise ModelMountError("the model index has no weights")
+        raise ModelMountError("the model index has no weights", "index_invalid")
     shards = set(weight_map.values())
     if any(not isinstance(name, str) or Path(name).name != name for name in shards):
-        raise ModelMountError("the model index contains an invalid shard name")
+        raise ModelMountError("the model index contains an invalid shard name", "index_invalid")
     missing = [name for name in sorted(shards) if not (path / name).is_file() or (path / name).stat().st_size == 0]
     if missing:
-        raise ModelMountError(f"the model index references a missing shard: {missing[0]}")
+        # The index is not yet checked against the manifest here: report the
+        # shard's name only when the pinned manifest lists it.
+        raise ModelMountError(f"the model index references a missing shard: {missing[0]}", "index_invalid",
+                              file=missing[0] if inventory is not None and missing[0] in inventory else None)
 
 
 def verify_no_write(path: Path) -> None:
@@ -240,14 +268,14 @@ def verify_no_write(path: Path) -> None:
     except OSError as error:
         if error.errno in {errno.EROFS, errno.EACCES, errno.EPERM}:
             return
-        raise ModelMountError(f"the write probe failed unexpectedly: {error}") from error
+        raise ModelMountError(f"the write probe failed unexpectedly: {error}", "io") from error
     else:
         os.close(descriptor)
         probe.unlink(missing_ok=True)
-        raise ModelMountError("the model mount permits writes")
+        raise ModelMountError("the model mount permits writes", "writable")
 
 
-def verify_once(args: argparse.Namespace) -> None:
+def verify_once(args: argparse.Namespace) -> dict[str, int]:
     path = args.path.resolve()
     record = mount_record(path, args.mountinfo)
     if record is None:
@@ -267,9 +295,13 @@ def verify_once(args: argparse.Namespace) -> None:
     for name, expected in args.expected_file:
         candidate = path / name
         if not candidate.is_file():
-            raise ModelMountError(f"the required model file is missing: {name}")
-        if sha256_file(candidate) != expected:
-            raise ModelMountError(f"the required model file has the wrong digest: {name}")
+            raise ModelMountError(f"the required model file is missing: {name}", "missing", file=name,
+                                  expected_sha256=expected)
+        got = sha256_file(candidate)
+        if got != expected:
+            raise ModelMountError(f"the required model file has the wrong digest: {name}", "digest_mismatch",
+                                  file=name, got_size=candidate.stat().st_size, expected_sha256=expected,
+                                  got_sha256=got)
     expected_files = dict(args.expected_file)
     if args.revision_metadata not in expected_files:
         raise ModelMountError("the release does not pin the model byte manifest digest")
@@ -280,8 +312,8 @@ def verify_once(args: argparse.Namespace) -> None:
         args.expected_revision,
         expected_files,
     )
-    verify_index(path)
-    verify_every_file(path, args.revision_metadata, inventory)
+    verify_index(path, inventory)
+    return verify_every_file(path, args.revision_metadata, inventory)
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +390,18 @@ EVENT_KEYS = {
     "worker_error": frozenset({"event", "error_class", "exception", "location"}),
     "worker_exit": frozenset({"event", "exit_code", "signal"}),
     "jit_compile": frozenset({"event", "cache", "files", "kernels"}),
+    # The model check before the server starts (sglang-pair forwards both).
+    "model_verified": frozenset({"event", "files", "size_bytes", "duration_ms"}),
+    "model_check_failed": frozenset({"event", "error_class", "file", "expected_size", "got_size",
+                                     "expected_sha256", "got_sha256"}),
 }
+CHECK_ERROR_CLASSES = frozenset({
+    "unavailable", "timeout", "writable", "missing", "extra", "unexpected_file", "size_mismatch",
+    "digest_mismatch", "manifest_invalid", "index_invalid", "io", "root",
+})
+# A file of the pinned manifest: relative, no "..", plain characters.
+MODEL_FILE_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,128}(/[A-Za-z0-9_.-]{1,128}){0,8}")
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 EXCEPTION_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,95}")
 LOCATION_PATTERN = re.compile(r"sglang(_simulator)?/[A-Za-z0-9_/.-]{1,150}[.]py:[0-9]{1,7}")
@@ -427,6 +470,17 @@ def valid_event(event: object) -> bool:
             event["error_class"] in ERROR_CLASSES
             and nullable(event["exception"], EXCEPTION_PATTERN)
             and nullable(event["location"], LOCATION_PATTERN)
+        )
+    if name == "model_verified":
+        return all(integer(event[key]) and event[key] >= 0 for key in ("files", "size_bytes", "duration_ms"))
+    if name == "model_check_failed":
+        file = event["file"]
+        return (
+            event["error_class"] in CHECK_ERROR_CLASSES
+            and (file is None or (nullable(file, MODEL_FILE_PATTERN) and ".." not in file.split("/")))
+            and all(event[key] is None or (integer(event[key]) and event[key] >= 0)
+                    for key in ("expected_size", "got_size"))
+            and nullable(event["expected_sha256"], SHA256_PATTERN) and nullable(event["got_sha256"], SHA256_PATTERN)
         )
     if name == "jit_compile":
         return (event["cache"] in COMPILE_CACHES and integer(event["files"]) and event["files"] >= 1
@@ -1179,12 +1233,30 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def start_failure() -> int:
-    """Report a supervisor exit before the server started, then return its code."""
+def write_event(event: dict) -> None:
+    """Write one contract event to stdout; an event outside the contract is not written."""
     try:
-        NonblockingStdout().write({"event": "worker_exit", "exit_code": 1, "signal": None})
+        if valid_event(event):
+            NonblockingStdout().write(event)
     except OSError:
         pass
+
+
+def check_failed(error_class: str, error: ModelMountError | None = None) -> None:
+    details = error.details if error is not None else {}
+    event = {"event": "model_check_failed", "error_class": error_class,
+             **{key: details.get(key) for key in ("file", "expected_size", "got_size", "expected_sha256",
+                                                  "got_sha256")}}
+    if not valid_event(event):
+        # A field that fails the contract is left out, the failure itself still reported.
+        event = {**event, **{key: None for key in ("file", "expected_size", "got_size", "expected_sha256",
+                                                   "got_sha256")}}
+    write_event(event)
+
+
+def start_failure() -> int:
+    """Report a supervisor exit before the server started, then return its code."""
+    write_event({"event": "worker_exit", "exit_code": 1, "signal": None})
     return 1
 
 
@@ -1193,23 +1265,31 @@ def main() -> int:
     args = parse_args()
     if os.geteuid() == 0:
         print("model-mount: the wrapper must run as a non-root user", file=sys.stderr)
+        check_failed("root")
         return start_failure()
     deadline = time.monotonic() + args.timeout_seconds
     last_error = "the model mount is unavailable"
     while True:
         try:
-            verify_once(args)
+            verified = verify_once(args)
             break
         except MountUnavailable as error:
             last_error = str(error)
-        except (ModelMountError, OSError, UnicodeError) as error:
+        except ModelMountError as error:
             print(f"model-mount: rejected: {error}", file=sys.stderr)
+            check_failed(error.error_class, error)
+            return start_failure()
+        except (OSError, UnicodeError) as error:
+            print(f"model-mount: rejected: {error}", file=sys.stderr)
+            check_failed("io")
             return start_failure()
         if time.monotonic() >= deadline:
             print(f"model-mount: timeout: {last_error}", file=sys.stderr)
+            check_failed("timeout")
             return start_failure()
         time.sleep(min(args.poll_seconds, max(0.0, deadline - time.monotonic())))
     print(f"model-mount: verified {args.path}", file=sys.stderr)
+    write_event({"event": "model_verified", **verified})
     if args.gpu_metrics_port is not None:
         try:
             # NVIDIA dcgm-exporter with an embedded DCGM host engine; it sees

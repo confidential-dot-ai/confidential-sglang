@@ -7,9 +7,17 @@ SHA-256, and hashes the small non-LFS files).
 
 fetch-model fetch: runs in the TEE before the worker. The manifest file comes
 from the release values and its SHA-256 is pinned in this argv. Every file
-whose bytes do not match is downloaded again, files the manifest does not
-list are deleted, and the manifest is written next to the files, where
-wait-for-model checks every file once more before the server starts.
+whose bytes do not match is downloaded again (up to ATTEMPTS times), files
+the manifest does not list are deleted, and the manifest is written next to
+the files, where wait-for-model checks every file once more before the server
+starts.
+
+fetch writes fixed JSON events to stdout, one per line, and nothing else
+there (EVENT_KEYS). They name only manifest files, the model server's host
+name, sizes, SHA-256 digests of model bytes, HTTP status codes and fixed error
+classes; never a URL, a header or a response body. sglang-pair forwards them
+(model_fetch_started, model_fetch_retry, model_fetch_complete,
+model_fetch_failed). The free-text error still goes to stderr.
 """
 
 from __future__ import annotations
@@ -17,10 +25,14 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import hashlib
+import http.client
 import json
 import os
 import re
 import sys
+import threading
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -28,10 +40,47 @@ from pathlib import Path
 BLOCK = 8 * 1024 * 1024
 WORKERS = 8
 SCHEMA = "confidential-benchmark/local-model-byte-manifest/v1"
+# Each file is downloaded at most this often; a retry waits RETRY_SECONDS x attempt.
+ATTEMPTS = 3
+RETRY_SECONDS = 2.0
+# The events of `fetch` and their exact keys (a value may be null).
+EVENT_KEYS = {
+    "model_fetch_started": frozenset({"event", "host", "files", "size_bytes"}),
+    "model_fetch_retry": frozenset({"event", "host", "file", "attempt", "error_class", "http_status"}),
+    "model_fetch_complete": frozenset({"event", "host", "downloaded", "kept", "size_bytes", "duration_ms"}),
+    "model_fetch_failed": frozenset({"event", "host", "file", "attempt", "error_class", "http_status",
+                                     "expected_size", "got_size", "expected_sha256", "got_sha256"}),
+}
+ERROR_CLASSES = frozenset({"http_error", "connection", "timeout", "size_mismatch", "digest_mismatch", "io",
+                           "manifest_digest", "manifest_invalid", "unsafe_path"})
+HOST = re.compile(r"[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?")
+_EVENT_LOCK = threading.Lock()
 
 
 class FetchError(ValueError):
-    pass
+    """`error_class` and the file fields describe the failure in model_fetch_failed."""
+
+    def __init__(self, message: str, error_class: str = "manifest_invalid", **details: object) -> None:
+        super().__init__(message)
+        self.error_class = error_class
+        self.details = details
+
+
+def emit(event: dict) -> None:
+    """Write one event of EVENT_KEYS to stdout. A value outside the contract is a bug: refuse it."""
+    if set(event) != EVENT_KEYS.get(event.get("event"), frozenset()):
+        raise ValueError("invalid fetch-model event")
+    if event.get("error_class") not in (None, *ERROR_CLASSES):
+        raise ValueError("invalid fetch-model error class")
+    line = json.dumps(event, separators=(",", ":"), sort_keys=True)
+    with _EVENT_LOCK:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+
+def endpoint_host(endpoint: str) -> str | None:
+    host = (urllib.parse.urlsplit(endpoint).hostname or "").lower()
+    return host if HOST.fullmatch(host) else None
 
 
 def canonical(value: object) -> bytes:
@@ -98,29 +147,78 @@ def build_manifest(endpoint: str, repository: str, revision: str) -> bytes:
 def download(url: str, target: Path, digest: str, size: int) -> None:
     partial = target.with_name(target.name + ".partial")
     hasher = hashlib.sha256()
-    with urllib.request.urlopen(url, timeout=60) as response, partial.open("wb") as stream:
-        for block in iter(lambda: response.read(BLOCK), b""):
-            hasher.update(block)
-            stream.write(block)
-    if hasher.hexdigest() != digest or partial.stat().st_size != size:
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response, partial.open("wb") as stream:
+            for block in iter(lambda: response.read(BLOCK), b""):
+                hasher.update(block)
+                stream.write(block)
+    except urllib.error.HTTPError as error:
+        partial.unlink(missing_ok=True)
+        raise FetchError(f"{target.name}: HTTP {error.code}", "http_error", http_status=error.code) from None
+    except TimeoutError:
+        partial.unlink(missing_ok=True)
+        raise FetchError(f"{target.name}: the download timed out", "timeout") from None
+    except http.client.HTTPException:
+        # IncompleteRead and other broken responses: the connection ended early.
+        partial.unlink(missing_ok=True)
+        raise FetchError(f"{target.name}: the response ended early", "connection") from None
+    except urllib.error.URLError as error:
+        partial.unlink(missing_ok=True)
+        kind = "timeout" if isinstance(error.reason, TimeoutError) else "connection"
+        raise FetchError(f"{target.name}: the model server is unreachable", kind) from None
+    except (ConnectionError, OSError) as error:
+        partial.unlink(missing_ok=True)
+        kind = "connection" if isinstance(error, ConnectionError) else "io"
+        raise FetchError(f"{target.name}: {kind} error during the download", kind) from None
+    got_size, got_digest = partial.stat().st_size, hasher.hexdigest()
+    if got_size != size or got_digest != digest:
         partial.unlink()
-        raise FetchError(f"{target.name}: the download does not match the manifest")
+        raise FetchError(f"{target.name}: the download does not match the manifest",
+                         "size_mismatch" if got_size != size else "digest_mismatch",
+                         expected_size=size, got_size=got_size, expected_sha256=digest, got_sha256=got_digest)
     partial.chmod(0o444)
     partial.replace(target)
 
 
+def download_with_retries(url: str, target: Path, digest: str, size: int, *, host: str | None, name: str,
+                          attempts: int = ATTEMPTS, wait: float = RETRY_SECONDS) -> None:
+    """download(), up to `attempts` times. Each failed attempt but the last is one model_fetch_retry."""
+    for attempt in range(1, attempts + 1):
+        try:
+            download(url, target, digest, size)
+            return
+        except FetchError as error:
+            # A 4xx other than 408 and 429 does not change on a retry.
+            status = error.details.get("http_status")
+            final = attempt == attempts or (isinstance(status, int) and 400 <= status < 500 and status not in (408, 429))
+            if final:
+                error.details.update(file=name, attempt=attempt)
+                raise
+            emit({"event": "model_fetch_retry", "host": host, "file": name, "attempt": attempt,
+                  "error_class": error.error_class, "http_status": status})
+            time.sleep(wait * attempt)
+
+
 def fetch(args: argparse.Namespace) -> None:
+    started = time.monotonic()
     raw = args.manifest.read_bytes()
     if hashlib.sha256(raw).hexdigest() != args.manifest_sha256:
-        raise FetchError("the manifest file does not match its pinned SHA-256")
+        raise FetchError("the manifest file does not match its pinned SHA-256", "manifest_digest")
     manifest = json.loads(raw)
     if manifest.get("schema") != SCHEMA:
         raise FetchError("the manifest has another schema")
     repository, revision = manifest["repository"], manifest["immutable_revision"]
-    files = {safe_name(item["path"]): (item["content_sha256"], item["size"]) for item in manifest["files"]}
+    try:
+        files = {safe_name(item["path"]): (item["content_sha256"], item["size"]) for item in manifest["files"]}
+    except FetchError as error:
+        error.error_class = "unsafe_path"
+        raise
     if args.revision_metadata in files:
         raise FetchError("the manifest lists itself")
     root = args.path
+    host = endpoint_host(args.endpoint)
+    emit({"event": "model_fetch_started", "host": host, "files": len(files),
+          "size_bytes": sum(size for _digest, size in files.values())})
 
     def ensure(name: str) -> str:
         digest, size = files[name]
@@ -130,11 +228,13 @@ def fetch(args: argparse.Namespace) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.is_symlink() or target.exists():
             target.unlink()
-        download(file_url(args.endpoint, repository, revision, name), target, digest, size)
+        download_with_retries(file_url(args.endpoint, repository, revision, name), target, digest, size,
+                              host=host, name=name)
         return "downloaded"
 
+    order = sorted(files, key=lambda name: files[name][1], reverse=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        results = list(pool.map(ensure, sorted(files, key=lambda name: files[name][1], reverse=True)))
+        results = list(pool.map(ensure, order))
     keep = set(files) | {args.revision_metadata}
     for directory, directories, names in os.walk(root, topdown=False):
         base = Path(directory)
@@ -152,6 +252,10 @@ def fetch(args: argparse.Namespace) -> None:
     partial.write_bytes(raw)
     partial.chmod(0o444)
     partial.replace(metadata)
+    downloaded = [name for name, result in zip(order, results) if result == "downloaded"]
+    emit({"event": "model_fetch_complete", "host": host, "downloaded": len(downloaded),
+          "kept": len(results) - len(downloaded), "size_bytes": sum(files[name][1] for name in downloaded),
+          "duration_ms": int((time.monotonic() - started) * 1000)})
     print(f"fetch-model: {results.count('downloaded')} downloaded, {results.count('kept')} kept, "
           f"{repository}@{revision}", file=sys.stderr)
 
@@ -175,6 +279,13 @@ def main() -> int:
         else:
             fetch(args)
     except (FetchError, OSError, KeyError, TypeError, ValueError) as error:
+        if args.step == "fetch":
+            details = error.details if isinstance(error, FetchError) else {}
+            kind = error.error_class if isinstance(error, FetchError) else (
+                "io" if isinstance(error, OSError) else "manifest_invalid")
+            emit({"event": "model_fetch_failed", "host": endpoint_host(args.endpoint), "error_class": kind,
+                  **{key: details.get(key) for key in ("file", "attempt", "http_status", "expected_size",
+                                                         "got_size", "expected_sha256", "got_sha256")}})
         print(f"fetch-model: {error}", file=sys.stderr)
         return 1
     return 0

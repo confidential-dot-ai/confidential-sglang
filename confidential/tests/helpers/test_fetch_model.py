@@ -28,9 +28,24 @@ LFS = {"model.safetensors"}
 class FakeHub(http.server.BaseHTTPRequestHandler):
     files: dict[str, bytes] = {}
     requests: list[str] = []
+    # The HTTP statuses the next downloads of a file get, before it is served.
+    failures: dict[str, list[int]] = {}
 
     def do_GET(self) -> None:  # noqa: N802
         self.requests.append(self.path)
+        name = self.path.rsplit("/resolve/" + REVISION + "/", 1)[-1]
+        if self.failures.get(name):
+            status = self.failures[name].pop(0)
+            if status == 0:
+                # A response that ends before its Content-Length (IncompleteRead).
+                self.send_response(200)
+                self.send_header("Content-Length", "1000000")
+                self.end_headers()
+                self.wfile.write(b"partial")
+                self.close_connection = True
+                return
+            self.send_error(status)
+            return
         tree = f"/api/models/{REPOSITORY}/tree/{REVISION}?recursive=true"
         prefix = f"/{REPOSITORY}/resolve/{REVISION}/"
         if self.path == tree:
@@ -59,6 +74,7 @@ class FetchModelTests(unittest.TestCase):
     def setUp(self) -> None:
         FakeHub.files = dict(FILES)
         FakeHub.requests = []
+        FakeHub.failures = {}
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeHub)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
@@ -120,8 +136,11 @@ class FetchModelTests(unittest.TestCase):
         self.assertIn("dm-verity mapping is not attached", refused.stderr)
         accepted = subprocess.run(gate + ["--plain-cache"] + command, text=True, capture_output=True, timeout=5)
         self.assertEqual(0, accepted.returncode, accepted.stderr)
-        # Server output is private: only the fixed exit event reaches stdout.
-        self.assertEqual('{"event":"worker_exit","exit_code":0,"signal":null}\n', accepted.stdout)
+        # Server output is private: only the fixed check and exit events reach stdout.
+        verified, exit_line = accepted.stdout.splitlines()
+        self.assertEqual(("model_verified", len(FILES), sum(map(len, FILES.values()))),
+                         tuple(json.loads(verified)[key] for key in ("event", "files", "size_bytes")))
+        self.assertEqual('{"event":"worker_exit","exit_code":0,"signal":null}', exit_line)
 
     def test_second_fetch_keeps_good_files_and_repairs_the_rest(self) -> None:
         self.assertEqual(0, self.fetch().returncode)
@@ -160,6 +179,102 @@ class FetchModelTests(unittest.TestCase):
         FakeHub.files["model.safetensors"] = body
         self.assertEqual(0, self.fetch().returncode)
         self.assertEqual(body, (self.cache / "model.safetensors").read_bytes())
+
+
+    def events(self, result: subprocess.CompletedProcess[bytes]) -> list[dict]:
+        """fetch's stdout: one fixed event per line, with no URL, path or response text in it."""
+        lines = result.stdout.decode().splitlines()
+        for line in lines:
+            self.assertNotIn("://", line)
+            self.assertNotIn(self.endpoint, line)
+            self.assertNotIn("/resolve/", line)
+            self.assertNotIn(str(self.base), line)
+        return [json.loads(line) for line in lines]
+
+    def test_fetch_reports_its_start_and_its_end(self) -> None:
+        result = self.fetch()
+        self.assertEqual(0, result.returncode, result.stderr)
+        started, complete = self.events(result)
+        self.assertEqual({"event": "model_fetch_started", "host": "127.0.0.1", "files": len(FILES),
+                          "size_bytes": sum(map(len, FILES.values()))}, started)
+        self.assertEqual(("model_fetch_complete", "127.0.0.1", len(FILES), 0, sum(map(len, FILES.values()))),
+                         tuple(complete[key] for key in ("event", "host", "downloaded", "kept", "size_bytes")))
+        self.assertIsInstance(complete["duration_ms"], int)
+        # A second fetch keeps every file.
+        again = self.events(self.fetch())[-1]
+        self.assertEqual((0, len(FILES), 0), (again["downloaded"], again["kept"], again["size_bytes"]))
+
+    def test_a_failed_download_is_retried_and_reported(self) -> None:
+        FakeHub.failures = {"config.json": [503]}
+        result = self.fetch()
+        self.assertEqual(0, result.returncode, result.stderr)
+        events = self.events(result)
+        self.assertEqual({"event": "model_fetch_retry", "host": "127.0.0.1", "file": "config.json", "attempt": 1,
+                          "error_class": "http_error", "http_status": 503},
+                         next(event for event in events if event["event"] == "model_fetch_retry"))
+        self.assertEqual("model_fetch_complete", events[-1]["event"])
+
+    def test_an_interrupted_response_is_retried(self) -> None:
+        FakeHub.failures = {"config.json": [0]}
+        result = self.fetch()
+        self.assertEqual(0, result.returncode, result.stderr)
+        retry = next(event for event in self.events(result) if event["event"] == "model_fetch_retry")
+        # A short body reads as a size mismatch; a read that raises is a connection error.
+        self.assertEqual("config.json", retry["file"])
+        self.assertIn(retry["error_class"], {"connection", "size_mismatch"})
+
+    def test_a_read_that_raises_incomplete_read_is_a_connection_error(self) -> None:
+        import http.client
+        import importlib.util
+        from unittest import mock
+
+        spec = importlib.util.spec_from_file_location("fetch_model_module", FETCH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        class Broken:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self, _amount):
+                raise http.client.IncompleteRead(b"partial", 10)
+        target = self.cache / "config.json"
+        with mock.patch.object(module.urllib.request, "urlopen", return_value=Broken()):
+            with self.assertRaises(module.FetchError) as caught:
+                module.download("http://unused", target, "0" * 64, 10)
+        self.assertEqual("connection", caught.exception.error_class)
+        self.assertFalse(target.with_name("config.json.partial").exists())
+
+    def test_a_changed_byte_is_reported_with_both_sizes_and_digests(self) -> None:
+        body = FILES["model.safetensors"]
+        FakeHub.files["model.safetensors"] = b"W" + body[1:] + b"!"
+        result = self.fetch()
+        self.assertNotEqual(0, result.returncode)
+        events = self.events(result)
+        self.assertEqual(["model_fetch_started", "model_fetch_retry", "model_fetch_retry", "model_fetch_failed"],
+                         [event["event"] for event in events])
+        self.assertEqual({"event": "model_fetch_failed", "host": "127.0.0.1", "file": "model.safetensors",
+                          "attempt": 3, "error_class": "size_mismatch", "http_status": None,
+                          "expected_size": len(body), "got_size": len(body) + 1,
+                          "expected_sha256": hashlib.sha256(body).hexdigest(),
+                          "got_sha256": hashlib.sha256(b"W" + body[1:] + b"!").hexdigest()}, events[-1])
+
+    def test_a_missing_file_is_not_retried(self) -> None:
+        FakeHub.failures = {"config.json": [404]}
+        result = self.fetch()
+        self.assertNotEqual(0, result.returncode)
+        failed = self.events(result)[-1]
+        self.assertEqual(("model_fetch_failed", "config.json", 1, "http_error", 404),
+                         tuple(failed[key] for key in ("event", "file", "attempt", "error_class", "http_status")))
+        self.assertEqual(1, sum(path.endswith("/config.json") for path in self.downloads()))
+
+    def test_an_unpinned_manifest_is_reported(self) -> None:
+        failed, = self.events(self.fetch("0" * 64))
+        self.assertEqual(("model_fetch_failed", "manifest_digest", None),
+                         (failed["event"], failed["error_class"], failed["file"]))
 
 
 if __name__ == "__main__":

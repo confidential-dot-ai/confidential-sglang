@@ -206,5 +206,73 @@ class ProgressTests(unittest.TestCase):
             self.assertEqual("failed", json.loads(raw)["state"])
 
 
+
+class CompileEventTests(unittest.TestCase):
+    """A Triton compile reaches the pair supervisor as a kernel name and a time, nothing else."""
+
+    def receive(self, call):
+        import os
+        import socket
+
+        with tempfile.TemporaryDirectory() as directory:
+            receiver = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            receiver.bind(str(Path(directory) / "events.sock"))
+            receiver.settimeout(0.5)
+            environment = {"SGLANG_PAIR_ROLE": "decode", "SGLANG_PAIR_RUN_DIR": directory}
+            try:
+                with patch.dict(os.environ, environment), patch.object(progress, "_reporter",
+                                                                        SimpleNamespace(rank=1)):
+                    call()
+                try:
+                    return json.loads(receiver.recv(4096))
+                except socket.timeout:
+                    return None
+            finally:
+                receiver.close()
+
+    def test_a_compile_sends_its_kernel_and_duration(self):
+        self.assertEqual({"event": "jit_compile", "role": "decode", "rank": 1, "kernel": "_fwd_kernel",
+                          "duration_ms": 1234},
+                         self.receive(lambda: progress.compile_event("_fwd_kernel", 1234)))
+
+    def test_a_name_that_is_not_an_identifier_is_not_sent(self):
+        for kernel in ("/tmp/PRIVATE.cubin", "a b", "x" * 65, None):
+            self.assertIsNone(self.receive(lambda: progress.compile_event(kernel, 1)))
+        self.assertIsNone(self.receive(lambda: progress.compile_event("_k", -1)))
+
+    def test_outside_a_pair_nothing_is_sent(self):
+        import os
+
+        with patch.dict(os.environ, {}, clear=True), patch.object(progress.socket, "socket",
+                                                                   side_effect=AssertionError("no socket")):
+            progress.compile_event("_k", 1)
+
+    def test_the_triton_listener_reports_only_real_compiles(self):
+        import sys
+        import types
+
+        calls = []
+        fake_progress = types.SimpleNamespace(compile_event=lambda kernel, ms: calls.append((kernel, ms)))
+        stubs = {"torch": types.ModuleType("torch"), "sglang": types.ModuleType("sglang"),
+                 "sglang.srt": types.ModuleType("sglang.srt"),
+                 "sglang.srt.environ": types.SimpleNamespace(envs=None),
+                 "sglang.srt.utils": types.SimpleNamespace(pair_progress=fake_progress),
+                 "sglang.srt.utils.device": types.SimpleNamespace(get_available_gpu_memory=None),
+                 "sglang.srt.utils.pair_progress": fake_progress}
+        with patch.dict(sys.modules, stubs):
+            spec = importlib.util.spec_from_file_location(
+                "triton_load_watch", ROOT / "python/sglang/srt/utils/triton_load_watch.py")
+            watch = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(watch)
+            times = SimpleNamespace(total=2_500_000)
+            src = SimpleNamespace(name="_from_src")
+            watch._on_compilation(src=src, metadata={"name": "_kernel"}, metadata_group={}, times=times,
+                                  cache_hit=False)
+            watch._on_compilation(src=src, metadata={}, metadata_group={}, times=times, cache_hit=False)
+            watch._on_compilation(src=src, metadata={"name": "_cached"}, metadata_group={}, times=times,
+                                  cache_hit=True)
+        self.assertEqual([("_kernel", 2500), ("_from_src", 2500)], calls)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -150,3 +150,32 @@ this checkout's `pair_progress` and `pair_nccl_diagnostics`).
 (was `51769868…40ddb80a5`): the optional config key `parallelStart` starts
 prefill and decode together. Without the key the behavior is unchanged. See
 `docs/confidential-changes.md`.
+
+## Pair events: the model gate, readiness and late compiles
+
+A failed pair candidate must be diagnosable from its telemetry alone.
+`sglang-pair` discarded the model gate's output and reported neither a
+worker's readiness nor a compile after it. Now:
+
+- `fetch_model.py` (`fetch`) writes fixed JSON events to stdout:
+  `model_fetch_started`, `model_fetch_retry`, `model_fetch_complete`,
+  `model_fetch_failed` (the manifest file, the model server's host name, the
+  attempt, a fixed error class, the HTTP status, and expected vs got size and
+  SHA-256). It retries a download up to 3 times (not a 4xx other than 408 and
+  429). Free text stays on stderr.
+- `wait_for_model.py` writes `model_verified` (files, bytes, time) and
+  `model_check_failed` (a fixed error class; the manifest or argv file name;
+  expected vs got size and SHA-256) before its `worker_exit`. A file found on
+  disk that the manifest does not list is reported without its name.
+- `pair_supervisor.py` reads the gate's stdout (stderr stays discarded) and
+  forwards only those six events, re-checked field by field, as role `pair`.
+  It emits `worker_ready` per role (`load_seconds` since the supervisor
+  started, `gpus`). It forwards a worker's `jit_compile` (`kernel`,
+  `duration_ms`) only once that role is ready, and never a worker's own
+  `worker_ready` or gate event.
+  With `parallelStart`, `monitor()` reports each worker's readiness.
+  `pair_supervisor.py` is now `0e87f5f6…550389b7`.
+- `sglang/srt/utils/pair_progress.py` `compile_event` sends one `jit_compile`
+  per Triton compile that is not a cache hit, from the existing Triton
+  listener (`triton_load_watch.py`): the kernel's function name and the
+  compile time only.

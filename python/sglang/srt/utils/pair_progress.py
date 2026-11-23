@@ -127,6 +127,41 @@ def error_event(event, *, rank=None, code=None, count=None, bytes_count=None):
         pass  # Diagnostics must not block or keep a failed process alive.
 
 
+_KERNEL_NAME = None
+
+
+def compile_event(kernel, duration_ms):
+    """Report one Triton compile (not a cache hit) to the pair supervisor.
+
+    Only the kernel's function name in code and the compile time leave the
+    process. The supervisor forwards it once this worker is ready (after its
+    warmup); before that a compile is part of the startup it already times.
+    Outside a pair this does nothing.
+    """
+    global _KERNEL_NAME
+    role = os.environ.get("SGLANG_PAIR_ROLE")
+    directory = os.environ.get("SGLANG_PAIR_RUN_DIR")
+    if role not in {"prefill", "decode"} or not directory:
+        return
+    if _KERNEL_NAME is None:
+        import re
+
+        _KERNEL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+    if type(kernel) is not str or _KERNEL_NAME.fullmatch(kernel) is None:
+        return
+    if type(duration_ms) is not int or not 0 <= duration_ms < 2**63:
+        return
+    value = {"event": "jit_compile", "role": role, "kernel": kernel, "duration_ms": duration_ms}
+    if _reporter is not None:
+        value["rank"] = _reporter.rank
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sender:
+            sender.setblocking(False)
+            sender.sendto(json.dumps(value).encode(), str(Path(directory) / "events.sock"))
+    except OSError:
+        pass  # Diagnostics must not block a compile.
+
+
 class Progress:
     def __init__(self, directory, role, rank, *, event_factory=None, clock=time.monotonic):
         self.path = Path(directory) / f"{role}-{rank}.json"
