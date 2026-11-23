@@ -387,3 +387,20 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
   target weight load 310 s -> 252 s (2 threads) -> 175 s (both); pair
   `/readyz` 10 min 47 s -> 9 min 32 s -> 8 min 20 s. Functional suite on the
   last boot: 167/168 (t_n2 known), needles to 253K all found.
+
+## Engram holder: populated mode sees reclaim through its own mapping (2026-11-23)
+
+- `recipes/deepseek-v41/launcher/hold_engram_cache.py` `Shard.resident()`
+  is the Rss of the holder's own mapping (`/proc/self/smaps`), not
+  `mincore()`. For a file the caller cannot write, the kernel reports every
+  page resident: as uid 1001 on the read-only model, mincore said 100% while
+  reclaim had dropped 43% of a shard, so the populated-mode refresh never
+  ran. Reclaim unmaps a page from every process, so the holder's own Rss is
+  what is still cached.
+- Measured (4x B200, uid 1001, memlock 8 MiB, no capabilities, 30 s
+  refresh): a 720 GiB anonymous allocation evicted 40 GiB of the 189 GiB
+  Engram. Before: it stayed at 148.9 GiB after the pressure ended. After:
+  "refreshed, 43225370952 bytes had been reclaimed" and back to 189.2 GiB.
+- Also measured: the old holder fails at once under these limits
+  (`OSError: [Errno 12] Cannot allocate memory`), and a declared `IPC_LOCK`
+  does not help at uid 1001 (bounding set only; CapEff 0, mlock ENOMEM).
