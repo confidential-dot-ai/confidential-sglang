@@ -28,6 +28,7 @@ from pathlib import Path
 BLOCK = 8 * 1024 * 1024
 WORKERS = 8
 SCHEMA = "confidential-benchmark/local-model-byte-manifest/v1"
+GENERIC_SCHEMA = "confidential.ai/model-manifest/v1"
 
 
 class FetchError(ValueError):
@@ -44,6 +45,25 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(BLOCK), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def local_manifest(root: Path) -> bytes:
+    """Describe a local model independently of its provider and weight format."""
+    files = []
+    for directory, directories, names in os.walk(root, followlinks=False):
+        base = Path(directory)
+        for name in directories + names:
+            if (base / name).is_symlink():
+                raise FetchError("the model contains a symbolic link")
+        for name in names:
+            path = base / name
+            if not path.is_file():
+                raise FetchError("the model contains a non-regular file")
+            files.append({"path": path.relative_to(root).as_posix(),
+                          "size": path.stat().st_size, "content_sha256": sha256_file(path)})
+    if not files:
+        raise FetchError("the model has no files")
+    return canonical({"schema": GENERIC_SCHEMA, "files": sorted(files, key=lambda item: item["path"])}) + b"\n"
 
 
 def safe_name(name: object) -> str:
@@ -114,9 +134,12 @@ def fetch(args: argparse.Namespace) -> None:
     if hashlib.sha256(raw).hexdigest() != args.manifest_sha256:
         raise FetchError("the manifest file does not match its pinned SHA-256")
     manifest = json.loads(raw)
-    if manifest.get("schema") != SCHEMA:
+    if manifest.get("schema") not in (SCHEMA, GENERIC_SCHEMA):
         raise FetchError("the manifest has another schema")
-    repository, revision = manifest["repository"], manifest["immutable_revision"]
+    repository = manifest.get("repository") or args.repository
+    revision = manifest.get("immutable_revision") or args.revision
+    if not repository or not revision:
+        raise FetchError("a generic manifest needs --repository and --revision for the download source")
     files = {safe_name(item["path"]): (item["content_sha256"], item["size"]) for item in manifest["files"]}
     if args.revision_metadata in files:
         raise FetchError("the manifest lists itself")
@@ -163,15 +186,21 @@ def main() -> int:
     manifest = steps.add_parser("manifest")
     manifest.add_argument("--repository", required=True)
     manifest.add_argument("--revision", required=True)
+    local = steps.add_parser("local-manifest", help="hash local model files; write the output outside that directory")
+    local.add_argument("--path", required=True, type=Path)
     run = steps.add_parser("fetch")
     run.add_argument("--path", required=True, type=Path)
     run.add_argument("--manifest", required=True, type=Path)
     run.add_argument("--manifest-sha256", required=True)
     run.add_argument("--revision-metadata", required=True)
+    run.add_argument("--repository", help="download source for a generic manifest")
+    run.add_argument("--revision", help="download source for a generic manifest")
     args = parser.parse_args()
     try:
         if args.step == "manifest":
             sys.stdout.buffer.write(build_manifest(args.endpoint, args.repository, args.revision))
+        elif args.step == "local-manifest":
+            sys.stdout.buffer.write(local_manifest(args.path))
         else:
             fetch(args)
     except (FetchError, OSError, KeyError, TypeError, ValueError) as error:
