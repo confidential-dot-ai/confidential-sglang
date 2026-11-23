@@ -73,7 +73,7 @@ STRING_FIELDS = {
     "host": re.compile(r"[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?"),
     "error_class": re.compile(r"http_error|connection|timeout|size_mismatch|digest_mismatch|io|manifest_digest"
                               r"|manifest_invalid|unsafe_path|unavailable|writable|missing|extra|unexpected_file"
-                              r"|index_invalid|root"),
+                              r"|index_invalid|root|range_unsupported"),
     "expected_sha256": re.compile(r"[0-9a-f]{64}"),
     "got_sha256": re.compile(r"[0-9a-f]{64}"),
 }

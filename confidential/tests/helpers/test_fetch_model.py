@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.server
+import importlib.util
+import io
 import json
+import re
+import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -30,6 +36,8 @@ class FakeHub(http.server.BaseHTTPRequestHandler):
     requests: list[str] = []
     # The HTTP statuses the next downloads of a file get, before it is served.
     failures: dict[str, list[int]] = {}
+    ranged: list[tuple[str, int, int]] = []
+    ranges = True
 
     def do_GET(self) -> None:  # noqa: N802
         self.requests.append(self.path)
@@ -58,6 +66,17 @@ class FakeHub(http.server.BaseHTTPRequestHandler):
             body = json.dumps(entries).encode()
         elif self.path.startswith(prefix) and self.path[len(prefix):] in self.files:
             body = self.files[self.path[len(prefix):]]
+            match = re.fullmatch(r"bytes=(\d+)-(\d+)", self.headers.get("Range", ""))
+            if match and self.ranges:
+                start, end = int(match.group(1)), int(match.group(2))
+                self.ranged.append((self.path[len(prefix):], start, end))
+                part = body[start:end + 1]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{start + len(part) - 1}/{len(body)}")
+                self.send_header("Content-Length", str(len(part)))
+                self.end_headers()
+                self.wfile.write(part)
+                return
         else:
             self.send_error(404)
             return
@@ -75,6 +94,8 @@ class FetchModelTests(unittest.TestCase):
         FakeHub.files = dict(FILES)
         FakeHub.requests = []
         FakeHub.failures = {}
+        FakeHub.ranged = []
+        FakeHub.ranges = True
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeHub)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
@@ -223,30 +244,98 @@ class FetchModelTests(unittest.TestCase):
         self.assertEqual("config.json", retry["file"])
         self.assertIn(retry["error_class"], {"connection", "size_mismatch"})
 
-    def test_a_read_that_raises_incomplete_read_is_a_connection_error(self) -> None:
-        import http.client
-        import importlib.util
-        from unittest import mock
-
-        spec = importlib.util.spec_from_file_location("fetch_model_module", FETCH)
+    def module(self, chunk: int = 1000):
+        spec = importlib.util.spec_from_file_location("fetch_model_under_test", FETCH)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        module.CHUNK, module.ATTEMPTS = chunk, 2
+        module.time.sleep = lambda _seconds: None
+        return module
+
+    def fetch_in_process(self, *endpoints: str, chunk: int = 1000) -> tuple[int, list[dict]]:
+        # Small chunks make the test files span several byte ranges.
+        module = self.module(chunk)
+        argv = ["fetch-model", *[f"--endpoint={endpoint}" for endpoint in endpoints], "fetch",
+                "--path", str(self.cache), "--manifest", str(self.manifest),
+                "--manifest-sha256", self.digest, "--revision-metadata", METADATA]
+        saved, sys.argv = sys.argv, argv
+        output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                code = module.main()
+        finally:
+            sys.argv = saved
+        return code, [json.loads(line) for line in output.getvalue().splitlines()]
+
+    def test_a_read_that_raises_incomplete_read_is_a_connection_error(self) -> None:
+        import http.client
+        from unittest import mock
+
+        module = self.module()
 
         class Broken:
+            status = 200
+
             def __enter__(self):
                 return self
 
             def __exit__(self, *_):
                 return False
 
-            def read(self, _amount):
+            def readinto(self, _buffer):
                 raise http.client.IncompleteRead(b"partial", 10)
-        target = self.cache / "config.json"
-        with mock.patch.object(module.urllib.request, "urlopen", return_value=Broken()):
+        endpoints = module.Endpoints(["http://unused"])
+        output = io.StringIO()
+        with mock.patch.object(module.urllib.request, "urlopen", return_value=Broken()), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(module.FetchError) as caught:
-                module.download("http://unused", target, "0" * 64, 10)
+                module.fetch_range(endpoints, "config.json", "/x", 0, 0, 9, True)
         self.assertEqual("connection", caught.exception.error_class)
-        self.assertFalse(target.with_name("config.json.partial").exists())
+        self.assertEqual(["model_fetch_retry"], [json.loads(line)["event"] for line in output.getvalue().splitlines()])
+
+    def test_large_files_download_as_byte_ranges(self) -> None:
+        code, events = self.fetch_in_process(self.endpoint)
+        self.assertEqual(0, code)
+        body = FILES["model.safetensors"]
+        self.assertEqual(body, (self.cache / "model.safetensors").read_bytes())
+        spans = sorted((start, end) for name, start, end in FakeHub.ranged if name == "model.safetensors")
+        self.assertEqual([(start, min(len(body), start + 1000) - 1) for start in range(0, len(body), 1000)], spans)
+        self.assertEqual(["model_fetch_started", "model_fetch_complete"], [event["event"] for event in events])
+
+    def test_a_dead_first_endpoint_falls_back_to_the_next(self) -> None:
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            dead = f"http://127.0.0.1:{closed.getsockname()[1]}"
+        code, events = self.fetch_in_process(dead, self.endpoint)
+        self.assertEqual(0, code)
+        for name, body in FILES.items():
+            self.assertEqual(body, (self.cache / name).read_bytes())
+        retries = [event for event in events if event["event"] == "model_fetch_retry"]
+        self.assertTrue(retries)
+        self.assertTrue(all(event["error_class"] == "connection" and event["host"] == "127.0.0.1"
+                            for event in retries))
+        self.assertEqual("model_fetch_complete", events[-1]["event"])
+
+    def test_a_file_the_mirror_does_not_have_comes_from_the_next_server(self) -> None:
+        mirror = http.server.ThreadingHTTPServer(("127.0.0.1", 0), type("Empty", (FakeHub,), {"files": {}}))
+        threading.Thread(target=mirror.serve_forever, daemon=True).start()
+        self.addCleanup(mirror.server_close)
+        self.addCleanup(mirror.shutdown)
+        code, events = self.fetch_in_process(f"http://127.0.0.1:{mirror.server_address[1]}", self.endpoint)
+        self.assertEqual(0, code)
+        self.assertTrue(all(event["http_status"] == 404 for event in events if event["event"] == "model_fetch_retry"))
+        for name, body in FILES.items():
+            self.assertEqual(body, (self.cache / name).read_bytes())
+
+    def test_a_server_that_ignores_ranges_is_refused(self) -> None:
+        FakeHub.ranges = False
+        code, events = self.fetch_in_process(self.endpoint)
+        self.assertEqual(1, code)
+        self.assertEqual(("model_fetch_failed", "range_unsupported", "model.safetensors"),
+                         tuple(events[-1][key] for key in ("event", "error_class", "file")))
+        self.assertFalse((self.cache / "model.safetensors").exists())
+        self.assertFalse((self.cache / "model.safetensors.partial").exists())
+        self.assertFalse((self.cache / METADATA).exists())
 
     def test_a_changed_byte_is_reported_with_both_sizes_and_digests(self) -> None:
         body = FILES["model.safetensors"]
@@ -254,13 +343,14 @@ class FetchModelTests(unittest.TestCase):
         result = self.fetch()
         self.assertNotEqual(0, result.returncode)
         events = self.events(result)
-        self.assertEqual(["model_fetch_started", "model_fetch_retry", "model_fetch_retry", "model_fetch_failed"],
-                         [event["event"] for event in events])
+        # The whole file is checked once all its bytes are written: a changed byte is not retried.
+        self.assertEqual(["model_fetch_started", "model_fetch_failed"], [event["event"] for event in events])
+        # fetch-model reads exactly the manifest's size, so the extra byte is not read.
         self.assertEqual({"event": "model_fetch_failed", "host": "127.0.0.1", "file": "model.safetensors",
-                          "attempt": 3, "error_class": "size_mismatch", "http_status": None,
-                          "expected_size": len(body), "got_size": len(body) + 1,
+                          "attempt": None, "error_class": "digest_mismatch", "http_status": None,
+                          "expected_size": len(body), "got_size": len(body),
                           "expected_sha256": hashlib.sha256(body).hexdigest(),
-                          "got_sha256": hashlib.sha256(b"W" + body[1:] + b"!").hexdigest()}, events[-1])
+                          "got_sha256": hashlib.sha256(b"W" + body[1:]).hexdigest()}, events[-1])
 
     def test_a_missing_file_is_not_retried(self) -> None:
         FakeHub.failures = {"config.json": [404]}
