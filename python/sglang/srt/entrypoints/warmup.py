@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List
+import os
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import tqdm
@@ -25,7 +26,70 @@ def warmup(name: str):
     return decorator
 
 
+def _warmup_lock_dir() -> str:
+    import tempfile
+
+    return "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else tempfile.gettempdir()
+
+
+def _multi_tokenizer_server_key() -> Optional[str]:
+    from sglang.srt.runtime_context import get_serving
+
+    if (get_serving().tokenizer_worker_num or 1) <= 1:
+        return None
+    from sglang.srt.managers.multi_tokenizer_mixin import get_main_process_id
+
+    return str(get_main_process_id())
+
+
 async def execute_warmups(
+    disaggregation_mode: str,
+    warmup_names: List[str],
+    tokenizer_manager: TokenizerManager,
+    server_key: Optional[str] = "auto",
+) -> bool:
+    """confidential-sglang: run the custom warmups once per server.
+
+    With --tokenizer-worker-num N, every tokenizer process runs the lifespan, so
+    each ran the whole warmup: N times the requests (dsv41-262k, N=4: +3.5 min
+    on a 4x B200). The processes of one server (server_key: the main process
+    ID) elect one with flock. It runs the warmups and marks them done; the
+    others wait on the lock, so none of them finishes startup (and answers
+    /health) before the warmup ends, then skip. A warmup that raises fails its
+    process, and the server exits, as before. Returns whether this process ran
+    them. server_key "auto": the main process ID with --tokenizer-worker-num > 1,
+    else None (one tokenizer process), which runs them directly. This lives
+    here, not in http_server.py, whose source hash harden_http.py pins."""
+    if server_key == "auto":
+        server_key = _multi_tokenizer_server_key()
+    if server_key is None:
+        await _run_warmups(disaggregation_mode, warmup_names, tokenizer_manager)
+        return True
+    import asyncio
+    import fcntl
+
+    # The PID alone repeats after a container restart, and /dev/shm (a pod
+    # emptyDir) can outlive the container: add the process start time.
+    try:
+        started = open(f"/proc/{server_key}/stat").read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        started = "0"
+    base = os.path.join(_warmup_lock_dir(), f"sglang-warmup-{server_key}-{started}")
+    fd = os.open(base + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
+        if os.path.exists(base + ".done"):
+            logger.info("Warmups already ran in another tokenizer process of this server")
+            return False
+        await _run_warmups(disaggregation_mode, warmup_names, tokenizer_manager)
+        with open(base + ".done", "w") as marker:
+            marker.write(f"{os.getpid()}\n")
+        return True
+    finally:
+        os.close(fd)  # releases the lock
+
+
+async def _run_warmups(
     disaggregation_mode: str,
     warmup_names: List[str],
     tokenizer_manager: TokenizerManager,
@@ -183,16 +247,25 @@ _GRAMMAR_KEYS = ("json_schema", "regex", "ebnf", "structural_tag")
 _PENALTY_KEYS = ("repetition_penalty", "frequency_penalty", "presence_penalty", "min_new_tokens")
 
 
-def cold_path_plan(spec_algorithm) -> tuple[tuple[dict, ...], bool]:
+def cold_path_plan(spec_algorithm, disaggregation_mode: str = "null") -> tuple[tuple[dict, ...], bool]:
     """The cold-path sampling paths and whether to ask for logprobs, minus what
     the scheduler refuses under the server's speculative algorithm. A refused
     request aborts, the warmup raises, and the server never listens: DSpark
     (dsv41 layouts) aborts min_p (scheduler.py, any speculative algorithm) and
     return_logprob (validate_dflash_request). The paths follow the scheduler's
     admission checks; a stripped path still runs its other parameters."""
-    if not spec_algorithm.is_some():
+    drop = set()
+    if disaggregation_mode == "decode":
+        # A PD decode warmup request takes the fake bootstrap: no prefill
+        # samples its first token under the grammar, so the grammar refuses it
+        # ("Grammar accept_token failed", HTTP 500) and the warmup raises
+        # (4x B200 dsv41-262k, 2026-11-23). Real PD requests get that token
+        # from prefill, which runs the grammar paths in its own warmup.
+        drop.update(_GRAMMAR_KEYS)
+    if not spec_algorithm.is_some() and not drop:
         return COLD_PATH_SAMPLING, True
-    drop = {"min_p"}
+    if spec_algorithm.is_some():
+        drop.add("min_p")
     if spec_algorithm.is_uno():
         drop.update(_PENALTY_KEYS)
     if spec_algorithm.is_uno() or (spec_algorithm.is_dflash_family() and not spec_algorithm.is_dspark()):
@@ -217,7 +290,7 @@ async def confidential_cold_path(disaggregation_mode: str, tokenizer_manager: To
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     spec_algorithm = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
-    sampling_paths, with_logprobs = cold_path_plan(spec_algorithm)
+    sampling_paths, with_logprobs = cold_path_plan(spec_algorithm, disaggregation_mode)
     logger.info("confidential_cold_path: %d sampling paths, logprobs %s (speculative %s)",
                 len(sampling_paths), "on" if with_logprobs else "off", spec_algorithm.name)
 

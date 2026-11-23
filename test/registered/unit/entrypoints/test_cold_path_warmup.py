@@ -1,5 +1,12 @@
+import asyncio
+import multiprocessing
+import os
+import tempfile
+import time
 import unittest
+from unittest import mock
 
+from sglang.srt.entrypoints import warmup
 from sglang.srt.entrypoints.warmup import COLD_PATH_SAMPLING, cold_path_plan
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -44,6 +51,62 @@ class TestColdPathPlan(unittest.TestCase):
                              for k in GRAMMAR + ("min_p", "repetition_penalty",
                                                  "frequency_penalty", "presence_penalty")))
         self.assertEqual(len(sampling), len({repr(sorted(s.items())) for s in sampling}))
+
+    def test_pd_decode_drops_grammar_paths(self):
+        # A decode warmup request's first token comes from the fake bootstrap,
+        # not from a grammar-constrained prefill.
+        sampling, logprobs = cold_path_plan(SpeculativeAlgorithm.DSPARK, "decode")
+        self.assertFalse(any(k in s for s in sampling for k in GRAMMAR + ("min_p",)))
+        self.assertFalse(logprobs)
+        prefill, _ = cold_path_plan(SpeculativeAlgorithm.DSPARK, "prefill")
+        self.assertTrue(any("json_schema" in s for s in prefill))
+        plain, logprobs = cold_path_plan(SpeculativeAlgorithm.NONE, "decode")
+        self.assertTrue(logprobs)
+        self.assertFalse(any("json_schema" in s for s in plain))
+
+
+def _tokenizer_process(server_key, log, ready):
+    async def fake(*_):
+        with open(log, "a") as f:
+            f.write(f"start {os.getpid()} {time.time()}\n")
+        await asyncio.sleep(0.5)
+        with open(log, "a") as f:
+            f.write(f"end {os.getpid()} {time.time()}\n")
+
+    with mock.patch.object(warmup, "_run_warmups", fake), \
+            mock.patch.object(warmup, "_warmup_lock_dir", lambda: os.path.dirname(log)):
+        asyncio.run(warmup.execute_warmups("decode", ["x"], None, server_key=server_key))
+    with open(ready, "a") as f:
+        f.write(f"{time.time()}\n")  # this process would now finish startup
+
+
+class TestWarmupsOnce(unittest.TestCase):
+    def test_four_tokenizer_processes_warm_up_once_and_none_starts_early(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log, ready = os.path.join(tmp, "log"), os.path.join(tmp, "ready")
+            ctx = multiprocessing.get_context("fork")
+            procs = [ctx.Process(target=_tokenizer_process, args=(str(os.getpid()), log, ready)) for _ in range(4)]
+            for p in procs:
+                p.start()
+            for p in procs:
+                p.join(30)
+                self.assertEqual(p.exitcode, 0)
+            lines = open(log).read().split()
+            self.assertEqual(lines.count("start"), 1)
+            end = float(lines[lines.index("end") + 2])
+            readies = [float(x) for x in open(ready).read().split()]
+            self.assertEqual(len(readies), 4)
+            self.assertTrue(all(t >= end for t in readies))
+
+    def test_single_tokenizer_runs_directly(self):
+        calls = []
+
+        async def fake(*args):
+            calls.append(args)
+
+        with mock.patch.object(warmup, "_run_warmups", fake):
+            self.assertTrue(asyncio.run(warmup.execute_warmups("null", ["x"], None, server_key=None)))
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

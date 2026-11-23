@@ -282,3 +282,22 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
 - `recipes/deepseek-v41/container/entrypoint.sh` passes `--lock required`:
   the docker recipe's launcher credits only locked pages.
 - Tests: `recipes/deepseek-v41/launcher/test_hold_engram_cache.py`.
+
+## The PD decode warmup skips grammars; warmups run once per server (2026-11-23)
+
+- `python/sglang/srt/entrypoints/warmup.py` `cold_path_plan(spec, mode)`: on a
+  PD decode server the cold path leaves out the grammar paths (`json_schema`,
+  `regex`, `ebnf`, `structural_tag`). A decode warmup request takes the fake
+  bootstrap, so no prefill samples its first token under the grammar; the
+  grammar refused it ("Grammar accept_token failed ... Tokens not accepted",
+  HTTP 500), the warmup raised and decode exited (4x B200, `dsv41-262k`, run
+  R1, 10:21 UTC). Prefill still warms the grammar paths.
+- `execute_warmups`: with `--tokenizer-worker-num N` every tokenizer process
+  runs the lifespan, so each ran the whole warmup (N=4 on `dsv41-262k`). The
+  processes of one server (main process ID and start time) now elect one
+  with `flock` on a file in `/dev/shm`; it runs the warmups and writes a done
+  marker, and the others wait on the lock (none answers `/health` before the
+  warmup ends), then skip. `http_server.py` is unchanged, so
+  `harden_http.py`'s pinned hash still matches.
+- Tests: `test_cold_path_warmup.py` (decode plan; four forked processes warm
+  up once and none finishes before the warmup ends).
