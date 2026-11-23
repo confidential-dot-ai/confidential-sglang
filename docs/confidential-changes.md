@@ -246,3 +246,25 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
 - `recipes/deepseek-v41/loadtest/soak.py`: `--max-bad` allows answers judged
   bad (no tool call, malformed) apart from failed requests (`--max-failures`).
   A small model can miss a tool call at temperature 1.0.
+
+## Stress suite: declared parameters, capacity sheds, metrics and the suite commit (2026-11-23)
+
+- `func_tests.py`: `t_logprobs_rejected` is replaced by `t_logprobs`,
+  `t_logprobs_stream` and `t_min_p`, which check the behavior declared with
+  the new `--unsupported-params`: a listed parameter must get a clean client
+  error (4xx other than 408/429 with an error body, or a 200 stream holding
+  only a 4xx error event; never a 5xx, a dropped connection or a timeout) and
+  the server must answer the next request; an unlisted one must work.
+  `cluster_stress.py` passes `--unsupported-params` to func too. Why: staging
+  listed `t_logprobs_rejected` as a known failure because Qwen serves
+  logprobs, so the case could not catch a 5xx under DSpark either.
+- `overload.py`: `--shed-codes` names the 429 error codes of a capacity shed;
+  `--require-shed` then counts only those. Each step records `codes_429`.
+  Why: a 429 of a per-address cap or of the key's limit is not a capacity shed.
+- `cluster_stress.py`: with `--prom-url` (or direct `--metrics-*` URLs) each
+  phase result holds the server's metrics window over that phase
+  (`live_metrics.window`), read after the run at the phase boundaries
+  (`prom_metrics.PromScraper.snapshot_at`); `--require-metrics` fails the run
+  if a window could not be read. `report.json` records `suite.commit`.
+- The `qwen-short` profile drops its known failure; `dsv41-full` declares
+  `logprobs,min_p` unsupported.

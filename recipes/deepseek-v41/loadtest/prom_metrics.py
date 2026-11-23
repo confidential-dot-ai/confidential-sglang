@@ -69,6 +69,10 @@ class PromScraper:
     def snapshot(self) -> lm.Snapshot:
         t = time.time()
         time.sleep(self.lag_s)
+        return self.snapshot_at(t)
+
+    def snapshot_at(self, t: float) -> lm.Snapshot:
+        """The series at a past time t (the caller has waited the lag since t)."""
         p = self._query(self.prefill, t)
         d = p if self.colocated else self._query(self.decode, t)
         r = self._query(self.router, t) if self.router else None
