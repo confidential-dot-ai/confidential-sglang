@@ -266,5 +266,9 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
   (`live_metrics.window`), read after the run at the phase boundaries
   (`prom_metrics.PromScraper.snapshot_at`); `--require-metrics` fails the run
   if a window could not be read. `report.json` records `suite.commit`.
+- `prom_metrics.py` names each series exactly and joins them with `or`, each
+  tagged with `label_replace`. Why: Azure Monitor managed Prometheus refuses a
+  regex on `__name__`, so the scorecard's `--prom-url` never worked against
+  it, and `or` drops series whose labels are equal apart from the name.
 - The `qwen-short` profile drops its known failure; `dsv41-full` declares
   `logprobs,min_p` unsupported.

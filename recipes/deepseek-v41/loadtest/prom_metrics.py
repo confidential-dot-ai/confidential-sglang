@@ -8,7 +8,9 @@ Each role is a PromQL label matcher list that selects its pods, for example
   --prom-prefill 'environment="candidate",job="inference-workers",role="prefill"'
 
 A snapshot taken at time T waits --prom-lag-s (remote write and scrape delay),
-then queries every sglang:* and smg_* series of each role at T, and builds the
+then queries each sglang:* and smg_* series that live_metrics reads (by exact
+name, joined with `or`: managed Prometheus allows no regex on __name__) of each
+role at T, and builds the
 same Snapshot live_metrics builds from /metrics text, so the window and gate
 logic are unchanged. A window must not span a worker restart: the old pod's
 series stay visible for Prometheus's lookback (5 min) and would be summed.
@@ -18,13 +20,39 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.parse
 import urllib.request
 
 import live_metrics as lm
 
-SERIES = "sglang:.*|smg_.*"
+# The series live_metrics reads, by exact name: Azure Monitor managed Prometheus refuses a regex on
+# __name__ ("Metric name only support equality(=) filter"), so a query names each series and joins them
+# with `or`. Histograms are read as their _bucket series.
+HISTOGRAMS = ("sglang:time_to_first_token_seconds", "sglang:inter_token_latency_seconds",
+              "sglang:queue_time_seconds", "smg_http_request_duration_seconds")
+
+
+def series_names() -> list[str]:
+    """Every sglang:* and smg_* name that live_metrics reads (taken from its source, so they cannot drift)."""
+    with open(lm.__file__, encoding="utf-8") as f:
+        names = set(re.findall(r'"((?:sglang:|smg_)[A-Za-z0-9_:]+)"', f.read()))
+    return sorted((names - set(HISTOGRAMS)) | {f"{h}_bucket" for h in HISTOGRAMS})
+
+
+SERIES = series_names()
+TAG = "series_name"   # added by union(); live_metrics.parse ignores it (it sums over labels)
+
+
+def union(matchers: str) -> str:
+    """One PromQL query for every SERIES name. `or` matches label sets without the metric name, so two
+    series with the same labels (prompt and generation tokens of one worker) would drop each other: each
+    name gets its own TAG label first."""
+    def one(name: str) -> str:
+        selector = f"{name}{{{matchers}}}" if matchers else name
+        return f'label_replace({selector}, "{TAG}", "{name}", "", "")'
+    return " or ".join(one(name) for name in SERIES)
 
 
 def _escape(v: str) -> str:
@@ -36,6 +64,7 @@ def exposition(result: list) -> str:
     lines = []
     for item in result:
         labels = dict(item["metric"])
+        labels.pop(TAG, None)
         name = labels.pop("__name__")
         body = ",".join(f'{k}="{_escape(v)}"' for k, v in sorted(labels.items()))
         lines.append(f"{name}{{{body}}} {item['value'][1]}")
@@ -55,7 +84,7 @@ class PromScraper:
         self.token = os.environ.get(token_env, "") if token_env else ""
 
     def _query(self, matchers: str, at: float) -> lm.Scrape:
-        sel = f'{{__name__=~"{SERIES}"' + (f",{matchers}" if matchers else "") + "}"
+        sel = union(matchers)
         q = urllib.parse.urlencode({"query": sel, "time": f"{at:.3f}"})
         req = urllib.request.Request(f"{self.url}/api/v1/query?{q}")
         if self.token:

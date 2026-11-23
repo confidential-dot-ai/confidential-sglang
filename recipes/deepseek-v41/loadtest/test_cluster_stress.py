@@ -425,6 +425,21 @@ class ClusterStressTest(unittest.TestCase):
         self.assertEqual(snap.prefill.values["sglang:cached_tokens_total"], 400.0)
         self.assertEqual(snap.decode.values["sglang:generation_tokens_total"], 50.0)
 
+    def test_the_prometheus_query_names_each_series_and_keeps_them_apart(self):
+        # Azure Monitor managed Prometheus refuses a regex on __name__, and `or` matches label sets without
+        # the name: each series is named exactly and tagged (seen on ci-admin-next-amw, 2026-11-23).
+        sys.path.insert(0, HERE)
+        import prom_metrics
+
+        q = prom_metrics.union('environment="staging"')
+        self.assertNotIn("__name__", q)
+        for name in ("sglang:prompt_tokens_total", "sglang:generation_tokens_total",
+                     "sglang:time_to_first_token_seconds_bucket"):
+            self.assertIn(f'label_replace({name}{{environment="staging"}}, "series_name", "{name}", "", "")', q)
+        text = prom_metrics.exposition([{"metric": {"__name__": "sglang:token_usage", "series_name": "x"},
+                                         "value": [0, "0.5"]}])
+        self.assertNotIn("series_name", text)
+
     def test_exposition_escapes_label_values(self):
         sys.path.insert(0, HERE)
         import live_metrics
