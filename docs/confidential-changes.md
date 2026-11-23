@@ -246,3 +246,27 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
 - `recipes/deepseek-v41/loadtest/soak.py`: `--max-bad` allows answers judged
   bad (no tool call, malformed) apart from failed requests (`--max-failures`).
   A small model can miss a tool call at temperature 1.0.
+
+## DeepSeek-V4.1-Flash-1017 with MXFP4 Engram tables (2026-11-22)
+
+- `recipes/deepseek-v41/launcher/prepare_checkpoint.py`: spec
+  `1017-mxfp4-engram` = `deepseek-ai/DeepSeek-V4.1-Flash-1017` at `1bae0e10`
+  plus only the two Engram shards (`model-00047/48-of-00048`) of
+  `nvidia/DeepSeek-V4.1-Flash-1017-NVFP4` at `3ae9c0d3fbbe`. Those shards
+  differ from DeepSeek's only in `embed.weight` (FP8 `[N,256]` to MXFP4 as
+  `U8 [N,128]`). The config's `engram_embed_*` fields follow the Engram
+  source, and `check_engram_tables` checks the `embed.weight` dtype before
+  the config is written. The existing spec is unchanged.
+- The container env files carry the spec commented out. MXFP4 stays opt-in.
+- GPU A/B on 4x B200 (1P1D TP2 with `dsv41.env` flags, engine
+  `images-6451872f8845`), FP8 Engram vs MXFP4 Engram:
+  - Engram locked in host RAM: 203 GB vs 105 GB.
+  - func 159/160 both (`t_n2`), needles 64/64 both, 0 errors or retractions.
+  - realmix C=32, 600 s: 2.83M TPM/GPU both, prefix hit 94.6% both, TTFT
+    p50 0.39 vs 0.38 s, p99 0.87 vs 3.44 s (one run each), ITL p50 5.0 vs
+    4.9 ms.
+  - GSM8K (sgl-eval 0.1.3, 1319, temperature 0, no thinking, max 4096):
+    96.82% and 96.74% (two FP8 runs) vs 96.13%; paired sign test p=0.08 and
+    0.13.
+- Before making it the default: rerun the load test for the p99, and a
+  harder accuracy eval than GSM8K.
