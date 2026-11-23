@@ -67,9 +67,14 @@ class SignalTests(ModelMountGateTests):
         return process
 
     def child_that_exits_on_sigterm(self, exit_code: int) -> list[str]:
+        # The child writes a marker once its handlers are installed, so the
+        # test never signals a child that would still die of the default action.
+        self.child_ready = self.base / "child.ready"
         script = (
-            "import signal, sys, time\n"
+            "import pathlib, signal, sys, time\n"
             f"signal.signal(signal.SIGTERM, lambda *a: sys.exit({exit_code}))\n"
+            f"signal.signal(signal.SIGINT, lambda *a: sys.exit({exit_code}))\n"
+            f"pathlib.Path({str(self.child_ready)!r}).write_text('ready')\n"
             "time.sleep(30)\n"
         )
         return [sys.executable, "-c", script]
@@ -77,10 +82,16 @@ class SignalTests(ModelMountGateTests):
     def wait_for_gate_ready(self, reader: StderrReader) -> None:
         # The wrapper prints "verified" to stderr right before it spawns the
         # child, then installs its signal handlers immediately after.
-        self.assertTrue(reader.wait_for("model-mount: verified", 5), reader.text())
-        # Give the freshly spawned child a moment to install its own SIGTERM
-        # handler before the test sends a signal to the wrapper.
-        time.sleep(0.2)
+        self.assertTrue(reader.wait_for("model-mount: verified", 30), reader.text())
+        # Wait for the child's own handlers (a loaded runner can take seconds to start Python).
+        marker = getattr(self, "child_ready", None)
+        deadline = time.monotonic() + 30
+        while marker is not None and not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if marker is not None:
+            self.assertTrue(marker.exists(), reader.text())
+        # The wrapper installs its handlers right after it spawns the child.
+        time.sleep(0.1)
 
     def test_sigterm_is_forwarded_at_once(self) -> None:
         digests = self.create_model()
