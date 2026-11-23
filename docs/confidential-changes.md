@@ -351,3 +351,20 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
   it for `dsv41-262k`. Measured times and peak host RAM: see the PR.
 - Tests: `test_pair_supervisor.py` (the key is an optional boolean; decode
   runs while prefill still loads, and the pair is ready only once both are).
+
+## A stream refused before any output gets its HTTP status (2026-11-23)
+
+- `python/sglang/srt/entrypoints/openai/serving_base.py`
+  `error_response_for_first_chunk`, used by the chat and completions
+  streaming handlers: when the stream's first chunk is an error event (an
+  admission abort, such as DSpark refusing `min_p` or `logprobs`), the
+  request is answered with that error's status, as the non-streaming request
+  is, instead of HTTP 200 and `data: {"error": ...}`.
+- Measured through the PD router on DeepSeek-V4.1 `dsv41-262k` (4x B200):
+  before, chat `min_p` / chat `logprobs` / completions `logprobs` with
+  `stream: true` returned 200 with an SSE error; after, 400. Non-streaming
+  was already 400. A burst of 64 refused and 32 normal requests: 64x 400,
+  32/32 normal 200, both workers healthy, all queues back to 0.
+- `test_stream_first_chunk_refusal.py`; `test_serving_chat_stream_errors.py`
+  `test_explicit_abort_keeps_status_and_closes_source` now expects the HTTP
+  error (that file fails to set up on this fork today, independently).

@@ -261,6 +261,26 @@ class OpenAIServingBase(ABC):
         )
         return ORJSONResponse(content=error.model_dump(), status_code=status_code)
 
+    def error_response_for_first_chunk(self, chunk: Any) -> Optional[ORJSONResponse]:
+        """confidential-sglang: a stream whose first chunk is an error event was
+        refused before any output (an admission abort, such as DSpark refusing
+        min_p or logprobs). Answer it with the error's status, as the
+        non-streaming request gets, instead of HTTP 200 and an SSE error
+        event. Measured through the PD router on DeepSeek-V4.1 (dsv41-262k):
+        non-streaming 400, streaming 200 + `data: {"error": ...}`."""
+        if not isinstance(chunk, str) or not chunk.startswith('data: {"error"'):
+            return None
+        try:
+            error = json.loads(chunk[len("data: "):])["error"]
+            code = int(error["code"])
+        except (ValueError, KeyError, TypeError):
+            return None
+        if not 400 <= code < 600:
+            return None
+        return self.create_error_response(
+            str(error.get("message", "")), str(error.get("type", "BadRequestError")), code
+        )
+
     def create_streaming_error_response(
         self,
         message: str,

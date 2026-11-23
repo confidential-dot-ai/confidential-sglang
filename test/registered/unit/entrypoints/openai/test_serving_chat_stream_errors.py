@@ -134,14 +134,19 @@ class TestChatStreamErrors(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(self.closed)
 
     async def test_explicit_abort_keeps_status_and_closes_source(self):
-        self._source(
-            finish_reason={
-                "type": "abort",
-                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                "message": "worker unavailable",
-            }
-        )
-        self._assert_error(await self._chunks(), 503)
+        # An abort that is the stream's first event is refused before any
+        # output: an HTTP error with its status, not HTTP 200 + an SSE error.
+        for status, message in ((HTTPStatus.SERVICE_UNAVAILABLE, "worker unavailable"),
+                                (HTTPStatus.BAD_REQUEST, "min_p is not supported with DSPARK speculative decoding")):
+            with self.subTest(status=status):
+                self.closed = False
+                self._source(finish_reason={"type": "abort", "status_code": status, "message": message})
+                response = await self._response()
+                self.assertEqual(response.status_code, status.value)
+                body = json.loads(response.body)
+                self.assertEqual(body["code"], status.value)
+                self.assertIn(message, body["message"])
+                self.assertTrue(self.closed)
 
     async def test_cancellation_propagates_without_error_or_done(self):
         self._source(asyncio.CancelledError())
