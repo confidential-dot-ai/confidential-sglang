@@ -567,44 +567,44 @@ impl Tree {
 
         // Try cached tenant first (O(1)) before falling back to O(shards) DashMap iteration.
         // The cache is valid if the tenant still exists in tenant_last_access_time.
-        let tenant: TenantId = {
+        // `None` means the node has no tenants (an empty tree, or a node whose last
+        // tenant is being removed by eviction or remove_tenant).
+        let found: Option<TenantId> = {
             let cached = curr.last_tenant.read();
-            if let Some(ref t) = *cached {
-                if curr.tenant_last_access_time.contains_key(t.as_ref()) {
-                    Arc::clone(t)
-                } else {
+            match *cached {
+                Some(ref t) if curr.tenant_last_access_time.contains_key(t.as_ref()) => {
+                    Some(Arc::clone(t))
+                }
+                _ => {
                     drop(cached);
-                    // Cache stale, fall back to iteration and update cache
+                    // Cache stale or empty, fall back to iteration and update cache
                     let t = curr
                         .tenant_last_access_time
                         .iter()
                         .next()
-                        .map(|kv| Arc::clone(kv.key()))
-                        .unwrap_or_else(|| Arc::from("empty"));
-                    *curr.last_tenant.write() = Some(Arc::clone(&t));
+                        .map(|kv| Arc::clone(kv.key()));
+                    if let Some(ref t) = t {
+                        *curr.last_tenant.write() = Some(Arc::clone(t));
+                    }
                     t
                 }
-            } else {
-                drop(cached);
-                // No cache, iterate and populate cache
-                let t = curr
-                    .tenant_last_access_time
-                    .iter()
-                    .next()
-                    .map(|kv| Arc::clone(kv.key()))
-                    .unwrap_or_else(|| Arc::from("empty"));
-                *curr.last_tenant.write() = Some(Arc::clone(&t));
-                t
             }
         };
 
         // Update timestamp probabilistically (1 in 8 matches) to reduce DashMap contention.
         // LRU eviction doesn't need perfect accuracy - approximate timestamps suffice.
-        let epoch = get_epoch();
-        if epoch & 0x7 == 0 {
-            curr.tenant_last_access_time
-                .insert(Arc::clone(&tenant), epoch);
+        // Only refresh an existing entry: an insert here would add a tenant that has no
+        // char count (the "empty" placeholder, or a tenant that eviction/remove_tenant
+        // removed since the lookup above).
+        if let Some(ref t) = found {
+            let epoch = get_epoch();
+            if epoch & 0x7 == 0 {
+                if let Some(mut ts) = curr.tenant_last_access_time.get_mut(t.as_ref()) {
+                    *ts = epoch;
+                }
+            }
         }
+        let tenant = found.unwrap_or_else(|| Arc::from("empty"));
 
         // Compute input char count directly from input text.
         // This is equivalent to matched_chars + remaining.chars().count() but avoids
@@ -2186,6 +2186,28 @@ mod tests {
         // Tenant removal
         tree.remove_tenant("tenant1");
         verify_consistency(&tree);
+    }
+
+    #[test]
+    fn test_match_on_empty_tree_adds_no_tenant() {
+        // A match on an empty tree returns the "empty" placeholder. It must not
+        // record that placeholder in the tree (it used to, on 1 in 8 matches).
+        let tree = Tree::new();
+        for _ in 0..64 {
+            assert_eq!(
+                tree.prefix_match_with_counts("key1").tenant.as_ref(),
+                "empty"
+            );
+        }
+        assert!(tree.root.tenant_last_access_time.is_empty());
+        assert!(tree.get_used_size_per_tenant().is_empty());
+
+        tree.insert("key1", "tenant1");
+        assert_eq!(tree.prefix_match("key1").1, "tenant1");
+        assert_eq!(
+            get_maintained_counts(&tree),
+            tree.get_used_size_per_tenant()
+        );
     }
 
     #[test]
