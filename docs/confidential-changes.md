@@ -246,3 +246,16 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
 - `recipes/deepseek-v41/loadtest/soak.py`: `--max-bad` allows answers judged
   bad (no tool call, malformed) apart from failed requests (`--max-failures`).
   A small model can miss a tool call at temperature 1.0.
+
+## Stress suite: the load phase takes the reasoning switch (2026-11-22)
+
+- `recipes/deepseek-v41/loadtest/oracle_replay.py` takes its endpoint options
+  from `endpoint.add_endpoint_args` (model default still `dsv41`) and applies
+  `endpoint.with_thinking` to every request. `oracle_scorecard.py` builds on
+  that parser, now a function of its own (`parser()`).
+- Why: since `--thinking-kwarg`/`--thinking-default` (2026-11-21),
+  `cluster_stress.py` passes both to every phase, but the scorecard declared
+  its own endpoint options and exited 2 on them. Every run with the load
+  phase failed there (seen on a 4x B200 run of the `dsv41-full` profile).
+- `test_cluster_stress.py` parses the load phase's command line with the
+  scorecard's parser.
