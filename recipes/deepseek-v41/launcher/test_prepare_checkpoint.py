@@ -72,11 +72,61 @@ class TestPlan(unittest.TestCase):
                 engram_index=index({"layers.1.engram.embed.scale": "s2"}),
             )
 
-    def test_config_drops_only_the_named_quant_fields(self):
-        config = {"a": 1, "quantization_config": {"quant_method": "fp8", "engram_embed_quant": "mxfp4"}}
-        out = prep.derived_config(config, ("engram_embed_quant",))
+    MXFP4_FIELDS = {
+        "engram_embed_quant": "mxfp4",
+        "engram_embed_block_size": 32,
+        "engram_embed_scale_dtype": "ue8m0",
+        "engram_embed_layers": [1, 14],
+    }
+
+    def test_config_drops_the_base_engram_fields_for_fp8_tables(self):
+        # 1017-nvfp4-fp8-engram: an MXFP4-table base, FP8 tables from the official repo.
+        base = {"a": 1, "quantization_config": {"quant_method": "fp8", **self.MXFP4_FIELDS}}
+        official = {"quantization_config": {"quant_method": "fp8", "expert_dtype": "fp4"}}
+        out = prep.derived_config(base, official)
         self.assertEqual(out, {"a": 1, "quantization_config": {"quant_method": "fp8"}})
-        self.assertIn("engram_embed_quant", config["quantization_config"])
+        self.assertIn("engram_embed_quant", base["quantization_config"])
+
+    def test_config_takes_the_engram_fields_of_mxfp4_tables(self):
+        # 1017-mxfp4-engram: the official base, MXFP4 tables from NVIDIA's repo.
+        base = {"a": 1, "quantization_config": {"quant_method": "fp8", "expert_dtype": "fp4"}}
+        nvidia = {"quantization_config": {"quant_method": "fp8", "moe_quant_algo": "NVFP4", **self.MXFP4_FIELDS}}
+        out = prep.derived_config(base, nvidia)
+        self.assertEqual(
+            out,
+            {"a": 1, "quantization_config": {"quant_method": "fp8", "expert_dtype": "fp4", **self.MXFP4_FIELDS}},
+        )
+        self.assertNotIn("engram_embed_quant", base["quantization_config"])
+
+    def test_engram_table_dtype_must_match_the_config(self):
+        def header(dtype):
+            return {"s47": {"layers.1.engram.embed.weight": {"dtype": dtype},
+                            "layers.1.engram.embed.scale": {"dtype": "F8_E8M0"}},
+                    "s48": {"layers.14.engram.embed.weight": {"dtype": dtype}}}
+        fp8 = {"quantization_config": {"quant_method": "fp8"}}
+        mxfp4 = {"quantization_config": {"engram_embed_quant": "mxfp4"}}
+        prep.check_engram_tables(fp8, header("F8_E4M3"))
+        prep.check_engram_tables(mxfp4, header("U8"))
+        with self.assertRaisesRegex(ValueError, "declares mxfp4"):
+            prep.check_engram_tables(mxfp4, header("F8_E4M3"))
+        with self.assertRaisesRegex(ValueError, "declares fp8"):
+            prep.check_engram_tables(fp8, header("U8"))
+        with self.assertRaisesRegex(ValueError, "no engram.embed.weight"):
+            prep.check_engram_tables(fp8, {"s47": {"layers.1.engram.q_weight": {"dtype": "BF16"}}})
+
+    def test_1017_mxfp4_engram_pins_the_official_weights_and_nvidia_tables(self):
+        spec_ = prep.SPECS["1017-mxfp4-engram"]
+        self.assertEqual(
+            spec_.base,
+            ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "1bae0e1088993b9b82de08f59de5be5a34e42170"),
+        )
+        self.assertEqual(
+            spec_.engram,
+            ("nvidia/DeepSeek-V4.1-Flash-1017-NVFP4", "3ae9c0d3fbbea5370bd06e679d22044db15883f1"),
+        )
+        for source in prep.SPECS.values():
+            for repo, revision in source:
+                self.assertRegex(revision, "^[0-9a-f]{40}$", repo)
 
 
 class TestFiles(unittest.TestCase):
