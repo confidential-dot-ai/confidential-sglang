@@ -12,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import types
+import time
 import unittest
 from pathlib import Path
 
@@ -249,6 +251,12 @@ class FetchModelTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         module.CHUNK, module.ATTEMPTS = chunk, 2
+        # The module's own copy of time, with sleep a no-op. Patching
+        # module.time.sleep patched the process-wide time module: every later
+        # test in the run had no time.sleep, and test_pair_diagnostics' snapshot
+        # tests failed after this file (CI python tests, main since #32).
+        module.time = types.ModuleType("time")
+        module.time.__dict__.update(time.__dict__)
         module.time.sleep = lambda _seconds: None
         return module
 
