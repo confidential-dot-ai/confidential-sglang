@@ -22,15 +22,13 @@ class TestColdPathPlan(unittest.TestCase):
         self.assertEqual(sampling, COLD_PATH_SAMPLING)
         self.assertTrue(logprobs)
 
-    def test_dspark_drops_min_p_keeps_logprobs_and_the_rest(self):
-        # The scheduler aborts min_p under any speculative algorithm; DSpark
-        # serves logprobs (compute_spec_logprobs), so the warmup runs that path
-        # and a first logprob request does not compile it; DSpark masks
-        # grammars in verify.
+    def test_dspark_keeps_min_p_logprobs_and_the_rest(self):
+        # DSpark serves min_p (its sampled verify filters the target) and
+        # logprobs (compute_spec_logprobs), so the warmup runs both paths and a
+        # first such request does not compile them; DSpark masks grammars in verify.
         sampling, logprobs = cold_path_plan(SpeculativeAlgorithm.DSPARK)
         self.assertTrue(logprobs)
-        self.assertFalse(any("min_p" in s for s in sampling))
-        self.assertIn({"temperature": 0.7, "top_p": 0.9}, sampling)
+        self.assertIn({"temperature": 0.7, "top_p": 0.9, "min_p": 0.05}, sampling)
         # Joint top-k/top-p runs a torch.compile'd top-p rescale in DSpark verify.
         self.assertIn({"temperature": 0.7, "top_k": 40, "top_p": 0.9}, sampling)
         self.assertIn({"temperature": 0.7, "top_k": 1, "top_p": 0.9}, sampling)
@@ -61,7 +59,7 @@ class TestColdPathPlan(unittest.TestCase):
         # A decode warmup request's first token comes from the fake bootstrap,
         # not from a grammar-constrained prefill.
         sampling, logprobs = cold_path_plan(SpeculativeAlgorithm.DSPARK, "decode")
-        self.assertFalse(any(k in s for s in sampling for k in GRAMMAR + ("min_p",)))
+        self.assertFalse(any(k in s for s in sampling for k in GRAMMAR))
         self.assertTrue(logprobs)
         prefill, _ = cold_path_plan(SpeculativeAlgorithm.DSPARK, "prefill")
         self.assertTrue(any("json_schema" in s for s in prefill))

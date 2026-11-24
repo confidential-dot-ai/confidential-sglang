@@ -44,7 +44,7 @@ python cluster_stress.py --url https://GATEWAY --context-length 131072 --session
     --prom-prefill 'environment="candidate",role="prefill"' --prom-decode 'environment="candidate",role="decode"' \
     --fault-cmd 'kubectl -n inference delete pod inference-pair-0 --wait=false' \
     --check-cmd './check-node-gpus.sh' \
-    --unsupported-params min_p --require-metrics \
+    --require-metrics \
     --soak-minutes 240 --out-dir stress-candidate
 ```
 
@@ -80,7 +80,7 @@ command line still wins over the profile.
 |---|---|---|---|---|
 | (none) | the tools' own defaults | all | 131072 context, 32 sessions, 60-minute soak | hours |
 | `qwen-short` | a 1-GPU Qwen3.5-0.8B staging deployment (`recipes/qwen35-0.8b`) | func, needles, overload, soak | 262144 context; func with 4 trials, needles up to 253952 tokens (context - 8192); needles phase at 16K-240K tokens, calibrated on the served tokenizer; overload at 16-128 clients (30 s steps), burst 500; 8 sessions, 5-minute soak, prompts up to 48K | about 15-20 minutes (estimate; not yet run on staging) |
-| `dsv41-full` | DeepSeek-V4.1 PD with DSpark | all (load needs `--dataset`, fault needs `--fault-cmd`) | 131072 context, 32 sessions, `--unsupported-params min_p`, 240-minute soak | about 5 hours |
+| `dsv41-full` | DeepSeek-V4.1 PD with DSpark | all (load needs `--dataset`, fault needs `--fault-cmd`) | 131072 context, 32 sessions, 240-minute soak | about 5 hours |
 
 `qwen-short` leaves out the load phase: its realmix dataset and bands are
 DeepSeek-V4.1 traces. Qwen3.5-0.8B has no speculative decoding, so it serves
@@ -197,10 +197,9 @@ Mount a CA bundle and pass `--ca-cert` for a private CA, and use
   warmup copy, shared one room): behind a gateway that refuses it
   (confidential-inference #369), pass `n` in `--unsupported-params` and `t_n2`
   requires a clean client error; straight to such a router, `--known-failures
-  t_n2`. DSpark rejects `min_p`: pass `--unsupported-params min_p`. DSpark
-  serves logprobs since the engine dropped its return_logprob refusal; against
-  an older engine, or a gateway whose recipe still declares them unsupported,
-  add `logprobs` there too. A listed parameter's case then requires a clean
+  t_n2`. DSpark serves `min_p` and logprobs; against an older engine (it
+  refused both), or a gateway whose recipe still declares them unsupported,
+  pass them in `--unsupported-params`. A listed parameter's case then requires a clean
   client error, and the soak and fault mixes leave min_p out instead of
   failing on it.
 - **Errors inside a stream.** A streamed request refused after the 200 header

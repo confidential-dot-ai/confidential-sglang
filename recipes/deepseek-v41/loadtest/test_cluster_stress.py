@@ -226,7 +226,7 @@ class ProfileTest(unittest.TestCase):
         args = self.cs.parse_args(self.argv("--profile", "dsv41-full"))
         self.assertEqual(args.phases, ",".join(self.cs.PHASES))
         self.assertEqual((args.context_length, args.sessions), (131072, 32))
-        self.assertEqual((args.known_failures, args.unsupported_params), ("", "min_p"))
+        self.assertEqual((args.known_failures, args.unsupported_params), ("", ""))
         self.assertEqual(args.soak_minutes, 240)
 
     def test_explicit_options_override_the_profile(self):

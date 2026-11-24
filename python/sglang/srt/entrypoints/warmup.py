@@ -266,8 +266,8 @@ _PENALTY_KEYS = ("repetition_penalty", "frequency_penalty", "presence_penalty", 
 def cold_path_plan(spec_algorithm, disaggregation_mode: str = "null") -> tuple[tuple[dict, ...], bool]:
     """The cold-path sampling paths and whether to ask for logprobs, minus what
     the scheduler refuses under the server's speculative algorithm. A refused
-    request aborts, the warmup raises, and the server never listens: DSpark
-    (dsv41 layouts) aborts min_p (scheduler.py, any speculative algorithm);
+    request aborts, the warmup raises, and the server never listens: every
+    speculative algorithm but DSpark aborts min_p (scheduler.py);
     UNO aborts return_logprob (validate_uno_request). The paths follow the
     scheduler's admission checks; a stripped path still runs its other
     parameters."""
@@ -281,7 +281,7 @@ def cold_path_plan(spec_algorithm, disaggregation_mode: str = "null") -> tuple[t
         drop.update(_GRAMMAR_KEYS)
     if not spec_algorithm.is_some() and not drop:
         return COLD_PATH_SAMPLING, True
-    if spec_algorithm.is_some():
+    if spec_algorithm.is_some() and not spec_algorithm.is_dspark():
         drop.add("min_p")
     if spec_algorithm.is_uno():
         drop.update(_PENALTY_KEYS)
