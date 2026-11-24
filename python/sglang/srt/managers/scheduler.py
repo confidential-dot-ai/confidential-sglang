@@ -1887,6 +1887,12 @@ class Scheduler(
         ``SchedulerBatchResultProcessor._wait_result_copy``).
         """
         if self.enable_cc_async_copy:
+            # Snapshot before src_ready: the copies are ordered behind the producing
+            # forward and ahead of the next one, whatever the worker's latency.
+            if isinstance(result, GenerationBatchResult):
+                result.own_device_outputs(
+                    producer_stream or self.device_module.current_stream()
+                )
             src_ready = self.device_module.Event()
             src_ready.record(stream=producer_stream)
             result.copy_ready_cpu = self.d2h_worker.submit(src_ready, copy_fn)
