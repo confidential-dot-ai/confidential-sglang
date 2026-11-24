@@ -120,6 +120,14 @@ def _dflash_top_p_renorm_prob(
     return top_p_normalize_probs_torch(probs, top_ps)
 
 
+def min_p_renorm_prob(probs: torch.Tensor, min_ps: torch.Tensor) -> torch.Tensor:
+    # The sampler's min-p rule, applied after top-k/top-p renormalization;
+    # renormalizing keeps ratios, so the kept set is the same.
+    thresholds = probs.amax(dim=-1, keepdim=True) * min_ps.to(probs.dtype).unsqueeze(-1)
+    kept = probs.masked_fill(probs < thresholds, 0.0)
+    return kept / kept.sum(dim=-1, keepdim=True)
+
+
 def dflash_draft_cell_size_per_token(
     *,
     draft_model_config: Any,
@@ -1156,6 +1164,7 @@ def build_speculative_verify_target_probs(
     device = next_token_logits.device
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
+    need_min_p = bool(getattr(sampling_info, "need_min_p_sampling", False))
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, draft_token_num, dim=0
     )
@@ -1221,6 +1230,11 @@ def build_speculative_verify_target_probs(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
             )
+    if need_min_p:
+        target_probs = min_p_renorm_prob(
+            target_probs,
+            torch.repeat_interleave(sampling_info.min_ps, draft_token_num, dim=0),
+        )
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 

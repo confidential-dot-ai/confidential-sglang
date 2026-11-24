@@ -3549,6 +3549,8 @@ class Scheduler(
         if (
             isinstance(self.spec_algorithm, SpeculativeAlgorithm)
             and self.spec_algorithm.is_some()
+            # DSpark's sampled verify applies min-p to the target distribution.
+            and not self.spec_algorithm.is_dspark()
             and req.sampling_params.min_p > 0
         ):
             error_msg = (

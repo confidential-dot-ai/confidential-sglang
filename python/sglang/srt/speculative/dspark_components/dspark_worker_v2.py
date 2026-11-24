@@ -1427,6 +1427,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not sampling_info.is_any_greedy
             and not sampling_info.need_top_k_sampling
             and not sampling_info.need_top_p_sampling
+            and not sampling_info.need_min_p_sampling
             and verify_logits_adjustments_are_noop(sampling_info)
             # A simulated bonus is drawn in the region from this batch's temperatures.
             and (
