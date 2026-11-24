@@ -3700,9 +3700,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         several_windows or req.decode_batch_idx >= retain_window
                     ):
                         self.tree_cache.release_swa_prefix_lock(req)
-                elif (
-                    self.forward_mode.is_extend()
-                    and not self.tree_cache.supports_prefix_sharing()
+                elif self.forward_mode.is_extend() and (
+                    not self.tree_cache.supports_prefix_sharing()
+                    # Its chunks never enter the tree (warmup and other fake-
+                    # bootstrap requests, embed overrides), so the tree can never
+                    # evict their window rows: retire them here, per chunk.
+                    or getattr(req, "skip_radix_cache_insert", False)
                 ):
                     pre_len = self.prefix_lens[idx]
                     if self.enable_overlap:

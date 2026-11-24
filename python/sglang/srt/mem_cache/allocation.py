@@ -176,13 +176,17 @@ def retire_window(
     """Retire the window rows of a running request behind ``frontier``,
     keeping what the prefix tree still needs of the window."""
     storage = _storage(tree_cache)
+    # A request barred from the tree keeps nothing for it: the window alone.
+    shares_prefixes = tree_cache.supports_prefix_sharing() and not getattr(
+        req, "skip_radix_cache_insert", False
+    )
     for sub_pool, window, floor in tree_cache.window_retention(req):
         storage.advance(
             req,
             frontier,
             window=window,
             retain_floor=floor,
-            shares_prefixes=tree_cache.supports_prefix_sharing(),
+            shares_prefixes=shares_prefixes,
             eviction_interval=eviction_interval,
             window_sub_pool=sub_pool,
         )
