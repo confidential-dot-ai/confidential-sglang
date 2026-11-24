@@ -300,13 +300,22 @@ def prepare(
         engram_index=fetch_json(spec.engram, INDEX),
     )
     local_dir.mkdir(parents=True, exist_ok=True)
-    # Conservative: a seeded file is a copy unless it can be hard-linked.
-    missing = sum(
-        f.size
-        for f in files.values()
-        if not (local_dir / f.path).is_file()
-        or (local_dir / f.path).stat().st_size != f.size
-    )
+    # Conservative: a seeded file is a copy unless it can be hard-linked
+    # (same filesystem as the checkpoint), which takes no space.
+    local_dev = local_dir.stat().st_dev
+
+    def needs_space(f) -> bool:
+        target = local_dir / f.path
+        if target.is_file() and target.stat().st_size == f.size:
+            return False
+        seed = seed_dir / f.path if seed_dir is not None else None
+        if seed is not None and seed.is_file():
+            st = seed.stat()
+            if st.st_size == f.size and st.st_dev == local_dev:
+                return False
+        return True
+
+    missing = sum(f.size for f in files.values() if needs_space(f))
     free = shutil.disk_usage(local_dir).free
     print(
         f"{spec_name}: {len(files)} files, up to {missing / 2**30:.1f} GiB to "
