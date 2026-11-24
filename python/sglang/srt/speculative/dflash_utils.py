@@ -1230,9 +1230,8 @@ def validate_dflash_request(
     grammar_backend: Optional[str] = None,
     masks_grammar_in_verify: bool = False,
 ) -> Optional[str]:
-    if req.return_logprob:
-        return "DFLASH speculative decoding does not support return_logprob yet."
-
+    # Logprobs are served: the verify step computes them for every committed
+    # token (compute_spec_logprobs), as upstream since #33459.
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 

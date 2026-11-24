@@ -25,7 +25,7 @@ and faults go through the control plane.
 
 | Phase | Tool | Passes when |
 |---|---|---|
-| func | `func_tests.py` | Tool calls (11 cases x 10), API features (JSON schema, stop, max tokens, thinking, unicode, history), needles up to the context length, over-context prompt gets a 4xx, a storm of client disconnects leaves the server healthy. `t_logprobs`, `t_logprobs_stream` and `t_min_p` check the declared behavior: a parameter in `--unsupported-params` must get a clean client error (4xx other than 408/429 with an error body, or a 200 stream that holds only a 4xx error event), never a 5xx, a dropped connection or a timeout, and the server must answer the next request; any other parameter must work (logprobs with 3 alternatives). Only `--known-failures` may fail. |
+| func | `func_tests.py` | Tool calls (11 cases x 10), API features (JSON schema, stop, max tokens, thinking, unicode, history), needles up to the context length, over-context prompt gets a 4xx, a storm of client disconnects leaves the server healthy. `t_logprobs`, `t_logprobs_stream` and `t_min_p` check the declared behavior: a parameter in `--unsupported-params` must get a clean client error (4xx other than 408/429 with an error body, or a 200 stream that holds only a 4xx error event), never a 5xx, a dropped connection or a timeout, and the server must answer the next request; any other parameter must work. Served logprobs must be well formed: one entry per completion token (a stream may carry fewer), each a finite logprob <= 0 with 3 alternatives in descending order and none above the chosen token's, and under greedy decoding the chosen token is the best alternative. Only `--known-failures` may fail. |
 | needles | `needles.py` | Every one of the fixed long-prompt recall cases (default: the 64 cases that caught the CED tail-graph bug, 14K-60K tokens) returns its code. |
 | load | `oracle_scorecard.py` | Realmix agent traces at `--sessions` in flight; in the measured window: 0 failed requests and KV-transfer failures, prefix hit and output share inside the dataset's bands, TTFT p50 at most 3 s, 0 retractions. Reports served TPM per GPU. |
 | overload | `overload.py` | 64 to 512 clients of short requests, then a burst: only 429s refuse the excess (no 5xx, connection errors or wrong answers), and a request succeeds within 2 minutes afterwards. The report says whether any step was refused at all (`shed`); if none was, the levels never reached capacity and the refusal path is untested (`--require-shed` makes that a failure). `--shed-codes` names the error codes of a capacity shed (the gateway's `inference_capacity`): then only those count, so a 429 of a per-address cap or of the key's own limit does not prove a shed. Each step lists its 429 codes (`codes_429`). |
@@ -44,7 +44,7 @@ python cluster_stress.py --url https://GATEWAY --context-length 131072 --session
     --prom-prefill 'environment="candidate",role="prefill"' --prom-decode 'environment="candidate",role="decode"' \
     --fault-cmd 'kubectl -n inference delete pod inference-pair-0 --wait=false' \
     --check-cmd './check-node-gpus.sh' \
-    --known-failures t_n2 --unsupported-params logprobs,min_p --require-metrics \
+    --unsupported-params min_p --require-metrics \
     --soak-minutes 240 --out-dir stress-candidate
 ```
 
@@ -80,7 +80,7 @@ command line still wins over the profile.
 |---|---|---|---|---|
 | (none) | the tools' own defaults | all | 131072 context, 32 sessions, 60-minute soak | hours |
 | `qwen-short` | a 1-GPU Qwen3.5-0.8B staging deployment (`recipes/qwen35-0.8b`) | func, needles, overload, soak | 262144 context; func with 4 trials, needles up to 253952 tokens (context - 8192); needles phase at 16K-240K tokens, calibrated on the served tokenizer; overload at 16-128 clients (30 s steps), burst 500; 8 sessions, 5-minute soak, prompts up to 48K | about 15-20 minutes (estimate; not yet run on staging) |
-| `dsv41-full` | DeepSeek-V4.1 PD with DSpark | all (load needs `--dataset`, fault needs `--fault-cmd`) | 131072 context, 32 sessions, `--known-failures t_n2 --unsupported-params logprobs,min_p`, 240-minute soak | about 5 hours |
+| `dsv41-full` | DeepSeek-V4.1 PD with DSpark | all (load needs `--dataset`, fault needs `--fault-cmd`) | 131072 context, 32 sessions, `--unsupported-params min_p`, 240-minute soak | about 5 hours |
 
 `qwen-short` leaves out the load phase: its realmix dataset and bands are
 DeepSeek-V4.1 traces. Qwen3.5-0.8B has no speculative decoding, so it serves
@@ -191,13 +191,18 @@ Mount a CA bundle and pass `--ca-cert` for a private CA, and use
   `--oracle-decode` and with the realmix bands (hit 0.93-0.96, output share
   0.030-0.035). `--oracle-decode` lets a request dictate the output, so it must
   never be in a production allowlist.
-- **Known failures and rejected parameters.** PD deployments do not support
-  `n > 1`: behind a gateway that refuses it (confidential-inference #369),
-  pass `n` in `--unsupported-params` and `t_n2` requires a clean client error;
-  straight to the router, `--known-failures t_n2`. Speculative decoding returns
-  no logprobs, and DSpark also rejects `min_p`: pass `--unsupported-params
-  logprobs,min_p`. `t_logprobs` and `t_min_p` then require a clean client error for them, and
-  the soak and fault mixes leave min_p out instead of failing on it.
+- **Known failures and rejected parameters.** `t_n2` requires two choices
+  (indexes 0 and 1, both finished, streamed and not). PD engines before
+  per-sample bootstrap rooms hang on `n > 1` (every sample, plus a prefix
+  warmup copy, shared one room): behind a gateway that refuses it
+  (confidential-inference #369), pass `n` in `--unsupported-params` and `t_n2`
+  requires a clean client error; straight to such a router, `--known-failures
+  t_n2`. DSpark rejects `min_p`: pass `--unsupported-params min_p`. DSpark
+  serves logprobs since the engine dropped its return_logprob refusal; against
+  an older engine, or a gateway whose recipe still declares them unsupported,
+  add `logprobs` there too. A listed parameter's case then requires a clean
+  client error, and the soak and fault mixes leave min_p out instead of
+  failing on it.
 - **Errors inside a stream.** A streamed request refused after the 200 header
   arrives as an error event in the stream. Every tool here counts that, and a
   stream that ends without `[DONE]`, as a failed request.

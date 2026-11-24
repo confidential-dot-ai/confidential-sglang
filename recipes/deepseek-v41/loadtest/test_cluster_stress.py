@@ -41,6 +41,9 @@ class FakeGateway:
         self.unauthorized = 0
         self.port = free_port()
         self.counters = {"prompt": 0.0, "cached": 0.0, "generated": 0.0}
+        # Served logprobs: "ok", "short" (one fewer than completion_tokens) or
+        # "not_top" (a token's logprob below its best alternative).
+        self.logprobs_mode = "ok"
 
     def app(self):
         app = web.Application()
@@ -104,20 +107,27 @@ class FakeGateway:
             await resp.prepare(request)
             for word in ("one", "two", "three"):
                 chunk = {"choices": [{"index": 0, "delta": {"content": word}}]}
+                if body.get("logprobs"):
+                    chunk["choices"][0]["logprobs"] = {"content": self._logprobs(body, 1, whole=False)}
                 await resp.write(f"data: {json.dumps(chunk)}\n\n".encode())
             await resp.write(f"data: {json.dumps({'choices': [], 'usage': usage})}\n\ndata: [DONE]\n\n".encode())
             return resp
         msg = {"role": "assistant", "content": text}
         choice = {"index": 0, "message": msg, "finish_reason": "stop"}
         if body.get("logprobs"):
-            n = body.get("top_logprobs") or 0
-            choice["logprobs"] = {"content": [{"token": "fine", "logprob": -0.1,
-                                               "top_logprobs": [{"token": "fine", "logprob": -0.1}] * n}]}
+            choice["logprobs"] = {"content": self._logprobs(body, usage["completion_tokens"])}
         if body.get("tools") and body.get("tool_choice") != "none":
             msg = {"role": "assistant", "content": None, "tool_calls": [
                 {"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Oslo"}'}}]}
         choice["message"] = msg
         return web.json_response({"choices": [choice], "usage": usage})
+
+    def _logprobs(self, body, n, whole=True):
+        k = body.get("top_logprobs") or 0
+        top = [{"token": "fine", "logprob": -0.1}] + [{"token": f"t{i}", "logprob": -1.0 - i} for i in range(k - 1)]
+        chosen = -0.5 if self.logprobs_mode == "not_top" else -0.1
+        n -= whole and self.logprobs_mode == "short"
+        return [{"token": "fine", "logprob": chosen, "bytes": [102], "top_logprobs": top}] * n
 
     async def prom_query(self, request):
         q = request.query["query"]
@@ -216,7 +226,7 @@ class ProfileTest(unittest.TestCase):
         args = self.cs.parse_args(self.argv("--profile", "dsv41-full"))
         self.assertEqual(args.phases, ",".join(self.cs.PHASES))
         self.assertEqual((args.context_length, args.sessions), (131072, 32))
-        self.assertEqual((args.known_failures, args.unsupported_params), ("t_n2", "logprobs,min_p"))
+        self.assertEqual((args.known_failures, args.unsupported_params), ("", "min_p"))
         self.assertEqual(args.soak_minutes, 240)
 
     def test_explicit_options_override_the_profile(self):
@@ -242,6 +252,7 @@ class ClusterStressTest(unittest.TestCase):
         self.fake.down_until = 0.0
         self.fake.refused, self.fake.refuse_status, self.fake.query_times = {"min_p"}, 400, []
         self.fake.busy_code = "inference_capacity"
+        self.fake.logprobs_mode = "ok"
         self.tmp = tempfile.mkdtemp()
 
     def out(self, name):
@@ -483,6 +494,21 @@ class ClusterStressTest(unittest.TestCase):
         _, tests = self.func()
         for name in ("t_logprobs", "t_logprobs_stream", "t_min_p"):
             self.assertEqual(tests[name]["passed"], tests[name]["runs"], tests[name])
+
+    def test_served_logprobs_must_be_well_formed(self):
+        self.fake.refused = set()
+        for mode, failing in (("short", {"t_logprobs"}), ("not_top", {"t_logprobs", "t_logprobs_stream"})):
+            self.fake.logprobs_mode = mode
+            _, tests = self.func()
+            for name in ("t_logprobs", "t_logprobs_stream"):
+                runs, passed = tests[name]["runs"], tests[name]["passed"]
+                if name not in failing:
+                    self.assertEqual(passed, runs, (mode, tests[name]))
+                elif mode == "not_top":
+                    # Only the greedy runs require the token to be the best one.
+                    self.assertEqual(passed, runs // 2, (mode, tests[name]))
+                else:
+                    self.assertEqual(passed, 0, (mode, tests[name]))
 
     def test_a_parameter_refused_without_the_declaration_fails(self):
         self.fake.refused = {"logprobs"}

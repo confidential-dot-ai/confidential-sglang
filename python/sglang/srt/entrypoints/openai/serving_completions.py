@@ -36,7 +36,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
 )
-from sglang.srt.runtime_context import get_serving
+from sglang.srt.runtime_context import get_disagg, get_serving
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 
 if TYPE_CHECKING:
@@ -65,6 +65,23 @@ class OpenAIServingCompletion(OpenAIServingBase):
         prompt = request.prompt
         if not prompt or (isinstance(prompt, list) and all(not p for p in prompt)):
             return "Prompt cannot be empty"
+        # best_of needs server-side ranking by logprob, which is not
+        # implemented; refuse it rather than silently return n samples.
+        if request.best_of is not None and request.best_of != 1:
+            return "best_of is not supported; use n for multiple samples"
+
+        if (
+            request.echo
+            and request.logprobs
+            and get_disagg().disaggregation_mode != "null"
+        ):
+            # Under PD the prompt logprobs are computed on prefill, but the
+            # decode server answers and never has them: the choice would carry
+            # the echoed prompt with output-only logprobs.
+            return (
+                "echo with logprobs (prompt logprobs) is not supported with "
+                "prefill-decode disaggregation."
+            )
 
         return None
 

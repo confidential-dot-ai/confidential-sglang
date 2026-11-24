@@ -8,11 +8,11 @@ client disconnects must leave the server healthy).
 
 Writes one JSON line per case to --out-jsonl and a summary to --out. Exits 1 if
 any case failed that is not listed in --known-failures (for example t_n2 on a
-PD deployment, where n>1 is not supported).
+PD deployment whose engine predates per-sample bootstrap rooms, where n>1 hangs).
 
   python func_tests.py --url https://GATEWAY --context-length 131072
 """
-import argparse, asyncio, json, random, re, sys, time
+import argparse, asyncio, json, math, random, re, sys, time
 import aiohttp
 
 import endpoint
@@ -93,7 +93,7 @@ async def chat_stream(s, body, timeout=600):
     body = endpoint.with_thinking(args, {"model": args.model, "stream": True,
                                          "stream_options": {"include_usage": True}, **body})
     t, ttft = time.time(), None
-    content, reasoning, tcs, usage, finish = "", "", {}, None, None
+    content, reasoning, tcs, usage, finish, logprobs = "", "", {}, None, None, []
     async with s.post(URL, json=body, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
         assert r.status == 200, f"HTTP {r.status}: {(await r.text())[:300]}"
         async for raw in r.content:
@@ -112,6 +112,7 @@ async def chat_stream(s, body, timeout=600):
                     ttft = time.time() - t
                 content += d.get("content") or ""
                 reasoning += d.get("reasoning_content") or ""
+                logprobs += (ch.get("logprobs") or {}).get("content") or []
                 for tc in d.get("tool_calls") or []:
                     e = tcs.setdefault(tc.get("index", 0), {"name": "", "arguments": ""})
                     f = tc.get("function") or {}
@@ -119,7 +120,7 @@ async def chat_stream(s, body, timeout=600):
                     e["arguments"] += f.get("arguments") or ""
                 finish = ch.get("finish_reason") or finish
     return {"content": content, "reasoning": reasoning, "tool_calls": tcs,
-            "usage": usage, "finish": finish, "ttft": ttft}, time.time() - t
+            "usage": usage, "finish": finish, "ttft": ttft, "logprobs": logprobs}, time.time() - t
 
 
 # ---------------------------------------------------------------- test cases
@@ -310,9 +311,33 @@ async def t_n2(s, sp):
     """n=2: two choices, or, if declared unsupported (--unsupported-params n), a clean 4xx."""
     if "n" in unsupported():
         return await param_case(s, sp, "n")
-    r, dt = await chat(s, {"messages": [{"role": "user", "content": "Name a random fruit."}],
-                           "n": 2, "max_tokens": 64, **sp}, timeout=60)
-    assert len(r["choices"]) == 2, len(r["choices"])
+    body = {"messages": [{"role": "user", "content": "Name a random fruit."}],
+            "n": 2, "max_tokens": 64, **sp}
+    r, dt = await chat(s, body, timeout=60)
+    assert sorted(c["index"] for c in r["choices"]) == [0, 1], r["choices"]
+    assert all(c.get("finish_reason") for c in r["choices"]), r["choices"]
+    # Streamed: chunks carry the choice index; both choices must finish.
+    body = endpoint.with_thinking(args, {"model": args.model, "stream": True, **body})
+    finished = {}
+    async with s.post(URL, json=body, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+        assert resp.status == 200, f"HTTP {resp.status}: {(await resp.text())[:300]}"
+        done = False
+        async for raw in resp.content:
+            line = raw.decode().strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                done = True
+                break
+            ev = json.loads(data)
+            assert "error" not in ev, f"error event in stream: {data[:300]}"
+            for ch in ev.get("choices", []):
+                assert ch["index"] in (0, 1), ch
+                if ch.get("finish_reason"):
+                    finished[ch["index"]] = ch["finish_reason"]
+    assert done, "stream ended without [DONE]"
+    assert sorted(finished) == [0, 1], f"finished choices {finished}"
     return dt
 
 
@@ -322,7 +347,7 @@ async def t_n2(s, sp):
 PARAM_BODIES = {
     "logprobs": {"logprobs": True, "top_logprobs": 3},
     "min_p": {"temperature": 1.0, "min_p": 0.05},
-    # A PD pair has no n>1: the gateway refuses it (confidential-inference #369).
+    # Older PD engines hang on n>1, so a gateway may refuse it (confidential-inference #369).
     "n": {"n": 2},
 }
 # A client error that says the request is wrong. 408 and 429 are not answers
@@ -388,19 +413,51 @@ async def param_case(s, sp, param, stream=False):
         dt = await refused_cleanly(s, {"messages": msgs, "max_tokens": 16, **sp, **extra}, stream)
         await healthy_after(s)
         return dt
+    greedy = sp.get("temperature") == 0
     if stream:
         out, dt = await chat_stream(s, {"messages": msgs, "max_tokens": 16, **sp, **extra})
         assert out["content"] or out["reasoning"], "served stream without tokens"
+        if param == "logprobs":
+            # A stream may carry no logprobs on a step with no text to attach
+            # them to (serving_chat's plain path), so at most one per token.
+            n = (out["usage"] or {}).get("completion_tokens")
+            check_logprobs(out["logprobs"], extra["top_logprobs"], greedy)
+            assert n is None or len(out["logprobs"]) <= n, f"{len(out['logprobs'])} logprobs for {n} tokens"
         return dt
     r, dt = await chat(s, {"messages": msgs, "max_tokens": 16, **sp, **extra})
     if param == "logprobs":
         lp = (r["choices"][0].get("logprobs") or {}).get("content") or []
-        assert lp and len(lp[0].get("top_logprobs") or []) == 3, f"logprobs served without top_logprobs: {str(lp)[:200]}"
+        check_logprobs(lp, extra["top_logprobs"], greedy)
+        n = r["usage"]["completion_tokens"]
+        assert len(lp) == n, f"{len(lp)} logprobs for {n} completion tokens"
     return dt
 
 
+def check_logprobs(lp, k, greedy):
+    """Served logprobs are well formed: one entry per token, each a finite
+    logprob <= 0 with k alternatives in descending order, none above the
+    best alternative; under greedy decoding every token is its row's best (a
+    speculative row/token misalignment shows up here)."""
+    assert lp, "logprobs requested but none returned"
+    eps = 1e-3
+    for i, e in enumerate(lp):
+        where = f"token {i} {e.get('token')!r}"
+        v = e.get("logprob")
+        assert isinstance(e.get("token"), str), f"{where}: no token text"
+        assert isinstance(v, (int, float)) and math.isfinite(v) and v <= eps, f"{where}: logprob {v!r}"
+        top = e.get("top_logprobs") or []
+        assert len(top) == k, f"{where}: {len(top)} top_logprobs, asked {k}"
+        vals = [t.get("logprob") for t in top]
+        assert all(isinstance(x, (int, float)) and math.isfinite(x) and x <= eps for x in vals), f"{where}: {vals}"
+        assert all(a >= b - eps for a, b in zip(vals, vals[1:])), f"{where}: top_logprobs not descending {vals}"
+        assert v <= vals[0] + eps, f"{where}: logprob {v} above the best alternative {vals[0]}"
+        if greedy:
+            assert v >= vals[0] - eps, f"{where}: greedy token is not the best alternative ({v} < {vals[0]})"
+
+
 async def t_logprobs(s, sp):
-    """logprobs: served (logprobs with 3 alternatives) or, if declared unsupported, a clean 4xx."""
+    """logprobs: served and well formed (check_logprobs, one per completion
+    token) or, if declared unsupported, a clean 4xx."""
     return await param_case(s, sp, "logprobs")
 
 

@@ -3561,6 +3561,24 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if (
+            self.disaggregation_mode != DisaggregationMode.NULL
+            and req.return_logprob
+            and req.logprob.top_logprobs_num
+            > self.disagg_metadata_buffers.max_top_logprobs_num
+        ):
+            # Prefill sends the first token's top logprobs in a fixed-width
+            # metadata row; a wider request would raise in set_buf and take
+            # the prefill scheduler down (upstream #49686 rejects it the same way).
+            self._reject_sampling_mask_request(
+                req,
+                f"top_logprobs_num {req.logprob.top_logprobs_num} exceeds the "
+                "disaggregation metadata capacity "
+                f"{self.disagg_metadata_buffers.max_top_logprobs_num}. Lower "
+                "top_logprobs.",
+            )
+            return
+
         if req.return_sampling_mask:
             if (
                 self.disaggregation_mode != DisaggregationMode.NULL
@@ -3919,7 +3937,8 @@ class Scheduler(
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
     def _reject_sampling_mask_request(self, req: Req, error_msg: str) -> None:
-        """Return a sampling-mask validation error without running the model."""
+        """Return a validation error (sampling mask, PD top_logprobs width) as a
+        400 without running the model."""
         logger.error(f"{error_msg}, {req.rid=}")
         prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
         self.request_retirer.retire_unadmitted(req)

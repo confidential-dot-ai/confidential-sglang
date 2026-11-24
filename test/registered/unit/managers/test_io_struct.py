@@ -754,6 +754,42 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             [False, "last", False, "last"],
         )
 
+    def test_bootstrap_rooms_one_per_parallel_sample(self):
+        """Under PD each of the n samples is its own handoff and needs its own room.
+
+        Expanded request j is sample j // batch_size of prompt j % batch_size.
+        """
+        cases = [
+            # The PD router sends n rooms for a chat request with n > 1.
+            ("per sample", "p", 3, [11, 22, 33], [11, 22, 33]),
+            # One room per prompt: sample k of prompt i gets room[i] + k.
+            ("per prompt", ["a", "b"], 2, [100, 200], [100, 200, 101, 201]),
+            ("scalar", ["a", "b"], 2, 7, [7, 8, 9, 10]),
+            ("wraps at 2**63", "p", 2, [2**63 - 1], [2**63 - 1, 0]),
+            ("none", "p", 2, None, [None, None]),
+            ("n == 1 keeps the list", ["a", "b"], 1, [5, 6], [5, 6]),
+        ]
+        for name, text, n, rooms, expected in cases:
+            with self.subTest(name):
+                req = GenerateReqInput(
+                    text=text, sampling_params={"n": n}, bootstrap_room=rooms
+                )
+                req.normalize_batch_and_arguments()
+                self.assertEqual(req.bootstrap_room, expected)
+
+    def test_bootstrap_hosts_follow_the_sample_layout(self):
+        req = GenerateReqInput(
+            text="p",
+            sampling_params={"n": 2},
+            bootstrap_host=["h", "h"],
+            bootstrap_port=[9, 9],
+            bootstrap_room=[1, 2],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.bootstrap_host[:2], ["h", "h"])
+        self.assertEqual(req.bootstrap_port[:2], [9, 9])
+        self.assertEqual(req[0].bootstrap_room, 1)
+
     def test_return_hidden_states_batch_length_is_validated(self):
         req = GenerateReqInput(
             text=["Prompt 1", "Prompt 2"],

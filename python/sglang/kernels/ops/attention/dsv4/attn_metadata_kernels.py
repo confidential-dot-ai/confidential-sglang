@@ -643,7 +643,9 @@ def build_causal_swa_page_indices_triton(
     return out
 
 
-@triton.jit
+# NUM_PAGES follows the batch's longest sequence on an eager step: as a constexpr
+# each page count (up to 4096 at 1M context) would compile another variant.
+@triton.jit(do_not_specialize=["NUM_PAGES"])
 def _small_page_table(
     REQ_TO_TOKEN,
     REQS,
@@ -653,7 +655,7 @@ def _small_page_table(
     PAGES,
     SWA,
     STRIDE: tl.constexpr,
-    NUM_PAGES: tl.constexpr,
+    NUM_PAGES,
     PAGE_SIZE: tl.constexpr,
     WINDOW: tl.constexpr,
     BLOCK: tl.constexpr,

@@ -7,7 +7,9 @@ import fcntl
 import logging
 import os
 import pathlib
+import re
 import shutil
+import time
 import uuid
 from typing import TYPE_CHECKING, List, Tuple
 
@@ -197,8 +199,10 @@ def load_jit(
         # The staging name is random rather than pid-based: the cache root is
         # meant to be a shared mount, where two machines can hold the same pid.
         staging = scope / f".staging-{uuid.uuid4().hex}"
+        started = time.monotonic()
         try:
             library = ninja.build(spec=spec, build_dir=staging, build_file=build_file)
+            _report_build(module_args, time.monotonic() - started)
             # Loaded before publishing, so a broken artifact never becomes a
             # leaf that later runs have to discover and discard.
             module = _load(library)
@@ -211,6 +215,40 @@ def load_jit(
             return module
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+
+
+# confidential-sglang: a pair supervisor learns of Triton compiles from Triton's
+# compile listener (utils/triton_load_watch.py), but nothing told it about a
+# JIT module that ninja built. Only the module's family (its first arg, a name
+# in code) leaves the process: the other args are template values and could
+# carry shapes. Like a Triton compile, the supervisor forwards it only after the
+# worker is ready, so a build during startup or warmup is not reported.
+_FAMILY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def build_event_name(module_args: Tuple[str, ...]) -> str:
+    family = module_args[0] if module_args else ""
+    if not _FAMILY.fullmatch(family):
+        family = "module"
+    return ("sgl_jit_" + family)[:64]
+
+
+def _report_build(module_args: Tuple[str, ...], seconds: float) -> None:
+    try:
+        from sglang.srt.utils import pair_progress, triton_load_watch
+
+        name = build_event_name(module_args)
+        pair_progress.compile_event(name, int(seconds * 1000))
+        if triton_load_watch.serving_started():
+            logger.warning(
+                "JIT module '%s' took %.2f s to build after serving started. "
+                "Serving-time compilation can stall the engine; build it during "
+                "engine init.",
+                name,
+                seconds,
+            )
+    except Exception:
+        pass  # Diagnostics must not fail a build.
 
 
 def _find_prebuilt(*, spec: BuildSpec, scope: pathlib.Path) -> pathlib.Path | None:

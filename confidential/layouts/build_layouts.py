@@ -53,9 +53,13 @@ RESIDENT_ENGRAM_PID = "1"
 # /proc/meminfo at build time. The B200 target host is 8x B200 with 1 TiB, where
 # the holder pins the one shared ~198 GiB copy of the Engram tables: 768 GiB
 # remain, enough that auto lands on its cap (dsv41.env). The B300 layouts size
-# HiCache in GiB (--prefill-hicache-size-gib) and never use auto.
+# HiCache in GiB (--prefill-hicache-size-gib) and never use auto. dsv41-1m's
+# target is a 4x B200 with ~880 GiB (g1m-b200.4x): less the ~98 GiB MXFP4 Engram
+# copy and ~14 GiB for the guest, 768 GiB again (with FP8 Engram, ~677 GiB; auto
+# reaches its cap of 8 either way).
 HOST_AVAILABLE_GIB = {
     "dsv41": 768,
+    "dsv41-1m": 768,
     "dsv41-262k": 768,
     "dsv41-b200-1m": 768,
 }

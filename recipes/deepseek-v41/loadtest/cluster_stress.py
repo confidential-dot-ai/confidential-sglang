@@ -30,7 +30,7 @@ given on the command line still wins:
                to 262144 - 8192 tokens), needles to 240K, overload at 16-128
                clients, a 5-minute soak. No load or fault phase.
   dsv41-full   DeepSeek-V4.1 PD: every phase, 131072 context, n=2 known to
-               fail on PD, logprobs and min_p rejected by DSpark, a 4-hour soak.
+               fail on PD, min_p rejected by DSpark (logprobs served), a 4-hour soak.
 
 The profiles are shortcuts for a run by hand. A validation passes every model
 option explicitly (bin/validate-deployment: from the release recipe and the
@@ -94,8 +94,7 @@ PROFILES = {
         "phases": ",".join(PHASES),
         "context_length": 131072,
         "sessions": 32,
-        "known_failures": "t_n2",
-        "unsupported_params": "logprobs,min_p",
+        "unsupported_params": "min_p",
         "soak_minutes": 240,
     },
 }

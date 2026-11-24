@@ -238,11 +238,27 @@ COLD_PATH_SAMPLING = (
     {},                                                      # the model's defaults
     {"temperature": 0.7, "top_k": 40},
     {"temperature": 0.7, "top_p": 0.9, "min_p": 0.05},
+    # top_k and top_p together: DSpark verify then rescales top-p in a
+    # torch.compile'd function (dflash_utils._adjust_top_p_for_top_k), which
+    # compiles apart for a top-k of 1.
+    {"temperature": 0.7, "top_k": 40, "top_p": 0.9},
+    {"temperature": 0.7, "top_k": 1, "top_p": 0.9},
     {"temperature": 0.7, "repetition_penalty": 1.1, "frequency_penalty": 0.5, "presence_penalty": 0.5},
     {"temperature": 0.7, "stop": ["\n\n", "END"]},
     {"temperature": 0.0, "json_schema": '{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}'},
 )
 COLD_PATH_BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64)
+# Ten 8K chunks, past the dsv41 plans' prefill graph cap (65536; every layer eager
+# above it) and the 64K prefix where a short extend takes the paged mega prefill,
+# then an eager 200-token tail: the 128 M bucket of the FlashInfer MXFP8 GEMM
+# tactics, and an M below 1024 that is not a multiple of 16.
+LONG_PROMPT_TOKENS = 10 * 8192 + 200
+# The longest prompt ends in a 5003-token eager chunk: an M from 1024 to 8191
+# that is not a multiple of 16 (Triton integer classes, MHC split counts).
+LONG_PROMPT_TAIL = 5003
+# Room for the follow-up's extra tokens, 16 new tokens and a DSpark verify block.
+LONG_PROMPT_MARGIN = 1024
+LONG_PROMPT_FOLLOW_UP = 64
 _GRAMMAR_KEYS = ("json_schema", "regex", "ebnf", "structural_tag")
 _PENALTY_KEYS = ("repetition_penalty", "frequency_penalty", "presence_penalty", "min_new_tokens")
 
@@ -251,9 +267,10 @@ def cold_path_plan(spec_algorithm, disaggregation_mode: str = "null") -> tuple[t
     """The cold-path sampling paths and whether to ask for logprobs, minus what
     the scheduler refuses under the server's speculative algorithm. A refused
     request aborts, the warmup raises, and the server never listens: DSpark
-    (dsv41 layouts) aborts min_p (scheduler.py, any speculative algorithm) and
-    return_logprob (validate_dflash_request). The paths follow the scheduler's
-    admission checks; a stripped path still runs its other parameters."""
+    (dsv41 layouts) aborts min_p (scheduler.py, any speculative algorithm);
+    UNO aborts return_logprob (validate_uno_request). The paths follow the
+    scheduler's admission checks; a stripped path still runs its other
+    parameters."""
     drop = set()
     if disaggregation_mode == "decode":
         # A PD decode warmup request takes the fake bootstrap: no prefill
@@ -275,8 +292,23 @@ def cold_path_plan(spec_algorithm, disaggregation_mode: str = "null") -> tuple[t
         kept = {k: v for k, v in path.items() if k not in drop}
         if (kept or not path) and kept not in sampling:
             sampling.append(kept)
-    logprobs = not (spec_algorithm.is_dflash_family() or spec_algorithm.is_uno())
+    logprobs = not spec_algorithm.is_uno()
     return tuple(sampling), logprobs
+
+
+def long_prompt_lengths(max_input_len: Optional[int], chunk: int = 8192) -> tuple[int, ...]:
+    """Prompt lengths for the long-context step of the cold path: about 80K
+    tokens, and nearly the longest prompt the worker admits, so kernels keyed on
+    sequence or page counts, the eager prefill path past the prefill graph cap,
+    8K chunks on a near-full prefix and decode at that length all run before the
+    server listens. Empty when the worker admits no prompt that long."""
+    if not max_input_len:
+        return ()
+    room = max_input_len - LONG_PROMPT_MARGIN
+    longest = (room - LONG_PROMPT_TAIL) // chunk * chunk + LONG_PROMPT_TAIL
+    if longest <= LONG_PROMPT_TOKENS:
+        return ()
+    return (LONG_PROMPT_TOKENS, longest)
 
 
 @warmup("confidential_cold_path")
@@ -294,9 +326,10 @@ async def confidential_cold_path(disaggregation_mode: str, tokenizer_manager: To
     logger.info("confidential_cold_path: %d sampling paths, logprobs %s (speculative %s)",
                 len(sampling_paths), "on" if with_logprobs else "off", spec_algorithm.name)
 
-    def request(size: int, sampling: dict, max_new_tokens: int, logprobs: bool = False) -> GenerateReqInput:
+    def request(size: int, sampling: dict, max_new_tokens: int, logprobs: bool = False,
+                input_ids: Optional[List[int]] = None) -> GenerateReqInput:
         req = GenerateReqInput(
-            input_ids=np.random.randint(2**16, size=[size]).tolist(),
+            input_ids=input_ids if input_ids is not None else np.random.randint(2**16, size=[size]).tolist(),
             sampling_params={"max_new_tokens": max_new_tokens, **sampling},
             return_logprob=logprobs,
             top_logprobs_num=2 if logprobs else 0,
@@ -334,4 +367,14 @@ async def confidential_cold_path(disaggregation_mode: str, tokenizer_manager: To
     for batch in COLD_PATH_BATCH_SIZES:
         await asyncio.gather(*(run(request(1 + (7 * i) % 63, sampling_paths[i % len(sampling_paths)], 16))
                                for i in range(batch)))
+    # Long prompts, then the same prompt plus a few tokens: a short extend on a
+    # long cached prefix (the turn after a long one). Alone, so the prefill pool
+    # holds the whole prompt.
+    max_input_len = tokenizer_manager.max_req_input_len or tokenizer_manager.context_len
+    for size in long_prompt_lengths(max_input_len):
+        logger.info("confidential_cold_path: %d-token prompt", size)
+        ids = np.random.randint(2**16, size=[size]).tolist()
+        await run(request(size, {"temperature": 0.0}, 16, input_ids=ids))
+        follow_up = ids + np.random.randint(2**16, size=[LONG_PROMPT_FOLLOW_UP]).tolist()
+        await run(request(len(follow_up), {"temperature": 0.7, "top_k": 40}, 16, input_ids=follow_up))
     logger.info("confidential_cold_path warmup ended")

@@ -428,3 +428,77 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
     0.13.
 - Before making it the default: rerun the load test for the p99, and a
   harder accuracy eval than GSM8K.
+
+
+## Run-time compiles at 1M context: warmup, reporting and the seed tree (2026-11-23, uncommitted)
+
+- `python/sglang/srt/entrypoints/warmup.py` `confidential_cold_path`: after
+  the short paths, a long-context step prefills an 82,120-token prompt and
+  nearly the longest prompt the worker admits (`max_req_input_len` less 1024,
+  ending in a 5,003-token chunk), each followed by the same prompt plus 64
+  tokens (a short extend on a long cached prefix). The odd tails make the
+  last 8K chunk an eager step at M values the 32K warmup never gave (200 and
+  5,003: an MXFP8 GEMM tactic bucket, Triton integer classes, MHC splits). Boot never ran a prompt past 32K, so the eager
+  prefill above the prefill graph cap (65536), 8K chunks on a near-full
+  prefix, the paged mega prefill and decode at long lengths ran first in
+  service. Skipped when the worker admits no prompt past about 88K. Two sampling
+  paths join the cold path: top_k with top_p (and top_k 1 with top_p); under
+  DSpark that combination runs `dflash_utils._adjust_top_p_for_top_k`, a
+  `torch.compile` function that no other warmup request reached.
+- `kernels/ops/attention/dsv4/attn_metadata_kernels.py` `_small_page_table`:
+  `NUM_PAGES` is a runtime argument, not a constexpr. An eager decode or
+  verify step passes the batch's live page count, so each length would have
+  compiled another variant (up to 4096 at 1M).
+- `kernels/jit/utils/compile/loader.py`: a JIT module that ninja builds
+  sends `jit_compile` (kernel `sgl_jit_<family>`, the first module arg only)
+  to the pair supervisor, like a Triton compile; after serving started it
+  also logs a warning. Before, a pair reported only Triton compiles.
+- `recipes/deepseek-v41/launcher/launch.py`: workers also get
+  `SGLANG_JIT_CACHE_DIR`, `TORCH_EXTENSIONS_DIR` and `CUTE_DSL_CACHE_DIR`
+  below the kernel cache dir. Their defaults are under HOME, outside the tree
+  that a kernel-cache seed copies.
+- `dsv41-b200-1m.env` passes `--warmups confidential_cold_path` like
+  `dsv41-262k.env`.
+- `srt/mem_cache/memory_pool_host.py` `DeepSeekV4PagedHostPool`: a pool
+  with token-granular transfers builds the `transfer_cache_dsv4_mla` JIT
+  module at construction (`hisparse.prepare_transfer_cache_dsv4_mla`). Its
+  first call was the first HiCache backup or load of a partial page, after
+  ready, and no warmup step is sure to evict.
+- Tests: `test_cold_path_warmup.py` (long prompt plan and follow-up),
+  `test_jit_build_event.py`, `test_dsv4_small_page_table.py` (compile key;
+  values under `TRITON_INTERPRET=1`), `test_build_layouts.py` (every compiler
+  cache under the kernel cache dir), `test_dsv4_host_pool_transfer_jit.py`. Not GPU-run.
+
+
+## Logprobs under DSpark and PD (2026-11-23)
+
+- `python/sglang/srt/speculative/dflash_utils.py`: `validate_dflash_request`
+  no longer refuses `return_logprob` (upstream dropped that check in #33459;
+  our Trim commit bcfc732851 had put it back). The DSpark verify step already
+  returns the target's logprobs for every committed token
+  (`compute_spec_logprobs`, chain layout: out token (b, j) from logits row
+  b * width + j): `log_softmax(logits / temperature)` after penalties,
+  logit_bias and the grammar mask, before top-p/top-k and the watermark, which
+  is what the non-speculative sampler returns. A PD decode server takes the
+  first token's logprob and top logprobs from prefill's metadata row.
+- `python/sglang/srt/managers/scheduler.py`: under PD a request whose
+  `top_logprobs` exceeds the metadata row width (128) gets a 400 at admission;
+  before, prefill's `set_buf` raised and took the prefill scheduler down
+  (upstream #49686 adds the same check behind a server argument).
+- `python/sglang/srt/entrypoints/openai/serving_completions.py`: under PD,
+  completions `echo` with `logprobs` (prompt logprobs) gets a 400. The decode
+  server answers and never has the prompt logprobs prefill computed; the
+  router merges them only into `/generate` meta_info.
+- `python/sglang/srt/entrypoints/warmup.py`: the cold-path warmup runs its
+  logprob paths (top_logprobs 2) under DSpark and DFlash too; only UNO skips
+  them.
+- `recipes/deepseek-v41/loadtest/func_tests.py`: a served `t_logprobs` /
+  `t_logprobs_stream` checks that logprobs are well formed (one per completion
+  token, finite, <= 0, k descending alternatives, under greedy the chosen token
+  is the best one). `dsv41-full` declares only `min_p` unsupported; add
+  `logprobs` to `--unsupported-params` for a gateway that still refuses them.
+- Tests: `test/registered/unit/spec/test_dspark_spec_logprobs.py` (greedy
+  accept + chain logprobs, non-spec semantics before top-p, per-token
+  assembly, PD first token + stop inside an accepted run),
+  `test_serving_completions.py::test_pd_refuses_echo_with_logprobs`,
+  `test_cold_path_warmup.py`, `test_cluster_stress.py`. Not GPU-run.

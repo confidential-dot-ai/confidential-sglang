@@ -659,6 +659,9 @@ class MetadataBuffers:
         ced_boundary_layout: Optional["CedBoundaryLayout"] = None,
     ):
         self.custom_mem_pool = custom_mem_pool
+        # The widest top_logprobs a PD request can carry for its first token;
+        # the scheduler refuses wider ones at admission (set_buf would raise).
+        self.max_top_logprobs_num = max_top_logprobs_num
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
         self.enable_sampling_mask = envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.get()
         customized_info_capacity_env = envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES
@@ -691,8 +694,6 @@ class MetadataBuffers:
             if self.custom_mem_pool
             else nullcontext()
         ):
-            # TODO: abort top_logprobs_num > 128 in PD
-
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
             self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
