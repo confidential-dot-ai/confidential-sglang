@@ -19,7 +19,11 @@ from sglang.srt.entrypoints.openai.protocol import (
     SglExt,
     convert_json_schema_to_str,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_base import (
+    KeepaliveStreamingResponse,
+    OpenAIServingBase,
+    prefetch_first_chunk,
+)
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     cached_tokens_details_from_dict,
@@ -224,8 +228,22 @@ class OpenAIServingCompletion(OpenAIServingBase):
         )
 
         # Kick-start the generator to trigger validation before HTTP 200 is sent.
+        # confidential-sglang: at most SGLANG_STREAM_KEEPALIVE_AFTER_S, then 200
+        # and keep-alive comments until output starts (see serving_chat).
+        first = await prefetch_first_chunk(
+            generator, envs.SGLANG_STREAM_KEEPALIVE_AFTER_S.get()
+        )
+        if not first.done():
+            return KeepaliveStreamingResponse(
+                first,
+                generator,
+                interval_s=envs.SGLANG_STREAM_KEEPALIVE_INTERVAL_S.get(),
+                error_chunk=self.create_streaming_error_response,
+                media_type="text/event-stream",
+                background=self.tokenizer_manager.create_abort_task(adapted_request),
+            )
         try:
-            first_chunk = await generator.__anext__()
+            first_chunk = first.result()
         except ValueError as e:
             return self.create_error_response(str(e))
         refused = self.error_response_for_first_chunk(first_chunk)

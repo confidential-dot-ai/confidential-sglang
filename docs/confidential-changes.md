@@ -502,3 +502,31 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
   assembly, PD first token + stop inside an accepted run),
   `test_serving_completions.py::test_pd_refuses_echo_with_logprobs`,
   `test_cold_path_warmup.py`, `test_cluster_stress.py`. Not GPU-run.
+
+## SSE keep-alives while a stream waits for its first token (2026-11-25)
+
+- `python/sglang/srt/entrypoints/openai/serving_base.py` `prefetch_first_chunk`
+  and `KeepaliveStreamingResponse`, used by the chat and completions streaming
+  handlers. The handlers held the HTTP response until the first output token,
+  so a long prompt left the connection silent for the whole prefill: on 4x
+  B200 DeepSeek-V4.1 (`dsv41-1m`, idle server) 871K tokens gave 36.6 s and
+  885K tokens 51.1 s with no byte sent, not even the headers. OpenRouter asks
+  providers to send SSE comments as keep-alives or it may time the request out
+  and fall back to another provider.
+- Now the handler waits for the first chunk at most
+  `SGLANG_STREAM_KEEPALIVE_AFTER_S` (5 s). If it is not there, the response
+  starts with HTTP 200 and sends `: keep-alive` every
+  `SGLANG_STREAM_KEEPALIVE_INTERVAL_S` (10 s) until output starts. Errors that
+  show up within the 5 s (tokenization, context length, admission refusals)
+  keep their HTTP status; a later one goes in-stream as `data: {"error": ...}`
+  then `data: [DONE]`, as mid-stream errors already do.
+  `SGLANG_STREAM_KEEPALIVE_AFTER_S=0` restores the old behavior.
+- Chat applies it only on the OpenAI wire (DeepSeek's recipe uses it); the
+  Kimi K3 wire builds its headers from the first engine event and keeps
+  waiting.
+- The response owns the pending first-chunk task: a client that leaves before
+  output, or a failed send, cancels it and closes the engine stream.
+- Tests: `test_stream_first_chunk_refusal.py` `TestStreamKeepalive` (fast
+  stream unchanged, keep-alives then output, late validation error in-stream,
+  headers before the first chunk over ASGI, disconnect and send failure
+  cancel the request).

@@ -5,7 +5,16 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncGenerator,
+    Callable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import orjson
 from fastapi import HTTPException, Request
@@ -22,6 +31,95 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+SSE_KEEPALIVE = ": keep-alive\n\n"
+
+
+async def prefetch_first_chunk(
+    generator: AsyncGenerator[Any, None], wait_s: float
+) -> asyncio.Task:
+    """confidential-sglang: start a stream and wait for its first chunk, at most
+    ``wait_s`` seconds (forever when ``wait_s`` <= 0). The returned task is done
+    when the chunk (or the validation error) came in time; otherwise the caller
+    streams keep-alives with KeepaliveStreamingResponse while it finishes.
+
+    The first chunk only comes with the first output token, so a long prompt
+    held the connection silent for the whole prefill: 37 s for 870K tokens on
+    4x B200 DeepSeek-V4.1, with not even the HTTP headers sent."""
+    first = asyncio.ensure_future(generator.__anext__())
+    try:
+        await asyncio.wait({first}, timeout=wait_s if wait_s > 0 else None)
+    except BaseException:
+        first.cancel()
+        raise
+    return first
+
+
+class KeepaliveStreamingResponse(StreamingResponse):
+    """confidential-sglang: the body of a stream whose first chunk is late. Sends
+    an SSE comment every ``interval_s`` until the chunk lands, then the stream.
+    A validation error raised by then goes in-stream, as a later error would.
+    Owns the pending first-chunk task and the generator however streaming ends
+    (client gone, send failure), so the request is never left running."""
+
+    def __init__(
+        self,
+        first: asyncio.Task,
+        generator: AsyncGenerator[Any, None],
+        *,
+        interval_s: float,
+        error_chunk: Callable[[str], str],
+        **kwargs,
+    ):
+        self._first = first
+        self._generator = generator
+        self._interval_s = interval_s if interval_s > 0 else 10.0
+        self._error_chunk = error_chunk
+        super().__init__(self._body(), **kwargs)
+
+    async def _body(self):
+        try:
+            while not self._first.done():
+                done, _ = await asyncio.wait({self._first}, timeout=self._interval_s)
+                if not done:
+                    yield SSE_KEEPALIVE
+            try:
+                chunk = self._first.result()
+            except StopAsyncIteration:
+                return
+            except ValueError as e:
+                yield f"data: {self._error_chunk(str(e))}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            yield chunk
+            async for chunk in self._generator:
+                yield chunk
+        finally:
+            await self._close()
+
+    async def _close(self):
+        if not self._first.done():
+            self._first.cancel()
+        # The generator is running inside the task until it settles; closing it
+        # before then raises "asynchronous generator is already running".
+        await asyncio.wait({self._first})
+        if not self._first.cancelled():
+            self._first.exception()  # retrieved, so asyncio does not log it
+        await self._generator.aclose()
+
+    async def stream_response(self, send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            await self.body_iterator.aclose()
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # The body may never have started (header send failed).
+            await self.body_iterator.aclose()
+            await self._close()
 
 
 # Base class for specific endpoint handlers

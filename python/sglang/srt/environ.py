@@ -337,6 +337,12 @@ class Envs:
     # ===================================================================
     # Decompress request bodies tagged with `x-body-compressed`.
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
+    # confidential-sglang: a stream whose first chunk takes longer than this (a long
+    # prefill, a queue) gets its HTTP 200 right away and an SSE keep-alive comment
+    # every _INTERVAL_S until output starts, so proxies and OpenRouter do not time
+    # out a silent connection. Errors after that go in-stream. 0 disables.
+    SGLANG_STREAM_KEEPALIVE_AFTER_S = EnvFloat(5.0)
+    SGLANG_STREAM_KEEPALIVE_INTERVAL_S = EnvFloat(10.0)
     # Override parsed request fields from headers.
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
     # Name prefix of the usage accounting response headers on the kimi_k3 chat
