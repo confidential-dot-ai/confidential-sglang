@@ -566,3 +566,15 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
   `shortest-prefill-first` is unchanged.
 - Tests: `test_schedule_policy.py`
   `test_hrrn_reserves_for_short_requests_and_keeps_a_floor`.
+- 2026-11-25, second half: the penalizers themselves never saw DSpark's
+  tokens. `prepare_for_decode` returns early for speculative decoding before
+  `cumulate_penalty_output_tokens`, and EAGLE feeds them in its own prep but
+  DFlash/DSpark (`dflash_info_v2.py` `prepare_for_decode`) did not, so the
+  counts stayed at zero (and `min_tokens` would never have released EOS once
+  verify applied it). Each request now tracks `penalty_fed_output_len`
+  (reset when an orchestrator starts its penalty state) and DSpark's decode
+  prep feeds every committed token not yet seen, as one padded block
+  (`cumulate_output_token_block` on the four penalizers). Measured on 4x B200
+  before: greedy "banana" x299 with presence 2, frequency 2 or repetition 1.5,
+  identical to no penalty. Tests: `test_penaltylib.py`
+  `TestSpeculativeTokenBlock`.

@@ -146,6 +146,8 @@ class DFlashDraftInputV2(SpecInput):
             return
 
         batch.maybe_evict_swa()
+        if batch.sampling_info.penalizer_orchestrator.is_required:
+            batch.cumulate_penalty_new_output_tokens()
 
         self._ensure_prepare_length_buffers(bs, batch.device)
         assert self._prepare_batch_seq_lens_cpu_buf is not None

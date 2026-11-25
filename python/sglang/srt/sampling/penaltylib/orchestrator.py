@@ -21,6 +21,9 @@ class BatchedPenalizerOrchestrator:
         self._batch_ref = weakref.ref(batch)
         self.device = batch.device
         self.penalizers = {Penalizer: Penalizer(self) for Penalizer in penalizers}
+        # The penalizers start empty for these requests.
+        for req in batch.reqs:
+            req.penalty_fed_output_len = 0
 
         is_required = False
         for penalizer in self.penalizers.values():
@@ -51,6 +54,12 @@ class BatchedPenalizerOrchestrator:
         """
         for penalizer in self.penalizers.values():
             penalizer.cumulate_output_tokens(output_ids=output_ids)
+
+    def cumulate_output_token_block(self, output_ids: torch.Tensor):
+        """Feed several output tokens per request, [bs, width]; -1 pads a row."""
+        valid = output_ids >= 0
+        for penalizer in self.penalizers.values():
+            penalizer.cumulate_output_token_block(output_ids, valid)
 
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
@@ -214,6 +223,15 @@ class _BatchedPenalizer(abc.ABC):
             return
 
         self._cumulate_output_tokens(output_ids=output_ids)
+
+    def cumulate_output_token_block(self, output_ids: torch.Tensor, valid: torch.Tensor):
+        if not self._is_prepared:
+            return
+
+        self._cumulate_output_token_block(output_ids=output_ids, valid=valid)
+
+    def _cumulate_output_token_block(self, output_ids: torch.Tensor, valid: torch.Tensor):
+        raise NotImplementedError(f"{type(self).__name__} takes one token per request")
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:
