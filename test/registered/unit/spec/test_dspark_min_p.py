@@ -1,5 +1,6 @@
-"""min_p under DSpark: the sampled verify filters the target distribution the
-way the sampler does, and every temperature-only fast path steps aside."""
+"""Sampling parameters under DSpark: min_p filters the verify distribution the way
+the sampler does, every temperature-only fast path steps aside, and the
+frequency/presence/repetition penalties reach the verify logits."""
 
 import unittest
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ import torch
 from sglang.kernels.ops.speculative.dspark import dspark_accept
 from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
 from sglang.srt.speculative.dflash_utils import (
+    apply_dflash_verify_logits_adjustments,
     build_speculative_verify_target_probs,
     min_p_renorm_prob,
 )
@@ -171,6 +173,52 @@ class TestSampledAcceptHonorsMinPOnGpu(unittest.TestCase):
         counts = torch.bincount(first, minlength=vocab).float() / n
         self.assertEqual(int(counts[target == 0].sum().item() * n), 0)
         torch.testing.assert_close(counts, target, atol=0.015, rtol=0)
+
+
+class _PenaltyInfo:
+    """What verify receives under overlap scheduling: accumulated penalties, no
+    live penalizer (SamplingBatchInfo.copy_for_forward)."""
+
+    def __init__(self, bs, *, additive=None, scaling=None):
+        self.acc_additive_penalties = additive
+        self.acc_scaling_penalties = scaling
+        self.penalizer_orchestrator = None
+        self.grammar_mask = None
+        self.logit_bias = None
+        self.has_custom_logit_processor = False
+        self._bs = bs
+
+    def __len__(self):
+        return self._bs
+
+
+class TestPenaltiesReachVerify(unittest.TestCase):
+    # Verify read a field that no longer exists, so penalties shaped only the
+    # prefill-sampled first token and greedy steps took the penalty-free graph accept.
+    def test_accumulated_penalties_are_applied_like_the_sampler(self):
+        torch.manual_seed(4)
+        bs, rows, vocab = 2, 3, 16
+        logits = torch.randn(bs * rows, vocab) * 3
+        additive = torch.zeros(bs, vocab)
+        additive[0, 3] = -2.0
+        scaling = torch.ones(bs, vocab)
+        scaling[1, 5] = 1.5
+        out = logits.clone()
+        apply_dflash_verify_logits_adjustments(
+            next_token_logits=out,
+            sampling_info=_PenaltyInfo(bs, additive=additive, scaling=scaling),
+            draft_token_num=rows,
+        )
+        # The sampler's order: add, then scale (_apply_pre_grammar_logits_transforms).
+        ref = logits.view(bs, rows, vocab) + additive[:, None]
+        ref = torch.where(ref < 0, ref * scaling[:, None], ref / scaling[:, None])
+        torch.testing.assert_close(out.view(bs, rows, vocab), ref)
+
+    def test_penalties_keep_verify_off_the_noop_paths(self):
+        noop = dspark_verify.verify_logits_adjustments_are_noop
+        self.assertFalse(noop(_PenaltyInfo(1, additive=torch.zeros(1, 8))))
+        self.assertFalse(noop(_PenaltyInfo(1, scaling=torch.ones(1, 8))))
+        self.assertTrue(noop(_PenaltyInfo(1)))
 
 
 if __name__ == "__main__":
