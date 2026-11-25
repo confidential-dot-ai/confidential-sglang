@@ -722,6 +722,10 @@ class Envs:
     # classic HRRN; above 1 leans toward shortest-first (warm turns ahead of cold
     # prompts) while still aging every request.
     SGLANG_HRRN_SIZE_EXPONENT = EnvFloat(1.0)
+    # Under HRRN, a long prompt's next chunk leaves room for shorter waiting
+    # requests but keeps at least this share of the chunk budget; 1 disables the
+    # reservation. 0.25 is a judgment call, not measured.
+    SGLANG_HRRN_CHUNK_MIN_SHARE = EnvFloat(0.25)
     # Window for the token-weighted recent cache-hit rate used to estimate
     # waiting-queue prefill load.
     SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS = EnvFloat(15.0)

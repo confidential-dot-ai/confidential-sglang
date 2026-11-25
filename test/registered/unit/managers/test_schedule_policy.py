@@ -4,7 +4,11 @@ from unittest.mock import patch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
+from sglang.srt.managers.schedule_policy import (
+    CacheAgnosticPolicy,
+    CacheAwarePolicy,
+    SchedulePolicy,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -250,7 +254,7 @@ class TestShortestPrefillFirst(CustomTestCase):
                 )
 
     def test_other_policy_keeps_normal_chunk_limit(self):
-        self.policy.policy = CacheAwarePolicy.HRRN
+        self.policy.policy = CacheAgnosticPolicy.FCFS
         self.assertIsNone(
             self.policy.shortest_prefill_chunk_limit(
                 self.make_req("continuation", 8192),
@@ -259,6 +263,35 @@ class TestShortestPrefillFirst(CustomTestCase):
                 256,
             )
         )
+
+    def test_hrrn_reserves_for_short_requests_and_keeps_a_floor(self):
+        # A 1M prompt held the prefill server for its whole prefill under HRRN.
+        self.policy.policy = CacheAwarePolicy.HRRN
+        continuation = self.make_req("continuation", 870000)
+        with envs.SGLANG_HRRN_CHUNK_MIN_SHARE.override(0.25):
+            self.assertEqual(
+                self.policy.shortest_prefill_chunk_limit(
+                    continuation, [self.make_req("short", 1500)], 8192, 256
+                ),
+                6656,
+            )
+            # Many short requests cannot take the chunk below a quarter.
+            many = [self.make_req(f"s{i}", 1000) for i in range(20)]
+            self.assertEqual(
+                self.policy.shortest_prefill_chunk_limit(continuation, many, 8192, 256),
+                2048,
+            )
+            # Queue order is priority order: a long head reserves nothing.
+            head = [self.make_req("big", 900000), self.make_req("short", 512)]
+            self.assertIsNone(
+                self.policy.shortest_prefill_chunk_limit(continuation, head, 8192, 256)
+            )
+        with envs.SGLANG_HRRN_CHUNK_MIN_SHARE.override(1.0):
+            self.assertIsNone(
+                self.policy.shortest_prefill_chunk_limit(
+                    continuation, [self.make_req("short", 1500)], 8192, 256
+                )
+            )
 
 
 if __name__ == "__main__":

@@ -425,18 +425,27 @@ class SchedulePolicy:
     def shortest_prefill_chunk_limit(
         self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
     ) -> Optional[int]:
-        """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
-        if (
-            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
-            or budget < 2 * page_size
-        ):
+        """Cap the active prefill chunk to reserve tokens for shorter waiting requests,
+        taken from the head of the queue in priority order. HRRN keeps at least
+        SGLANG_HRRN_CHUNK_MIN_SHARE of the budget for the chunk, so a long prompt
+        still progresses under a steady stream of short ones."""
+        if budget < 2 * page_size:
+            return None
+        if self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+            floor = page_size
+        elif self.policy == CacheAwarePolicy.HRRN:
+            share = envs.SGLANG_HRRN_CHUNK_MIN_SHARE.get()
+            if share >= 1:
+                return None
+            floor = max(page_size, _ceil_div(int(budget * share), page_size) * page_size)
+        else:
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
         reserved = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
-            if work >= remaining or reserved + charge > budget - page_size:
+            if work >= remaining or reserved + charge > budget - floor:
                 break
             reserved += charge
         if not reserved:

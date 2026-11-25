@@ -530,3 +530,39 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
   stream unchanged, keep-alives then output, late validation error in-stream,
   headers before the first chunk over ASGI, disconnect and send failure
   cancel the request).
+
+## Penalties reach the DSpark verify logits (2026-11-25)
+
+- `python/sglang/srt/speculative/dflash_utils.py`
+  `apply_dflash_verify_logits_adjustments`, `dspark_verify.py`
+  `verify_logits_adjustments_are_noop` and `dflash_worker_v2.py` read
+  `sampling_info.acc_linear_penalties`, a field that no longer exists. Under
+  overlap scheduling `SamplingBatchInfo.copy_for_forward` folds the
+  penalizers into `acc_additive_penalties` (frequency, presence) and
+  `acc_scaling_penalties` (repetition) and drops the orchestrator, so verify
+  saw no penalties at all: they shaped only the prefill-sampled first token,
+  and greedy steps took the graph accept that skips adjustments.
+- Verify now adds the additive penalties and then applies the scaling ones to
+  every verify row, in the sampler's order. Penalized steps leave the
+  adjustment-free fast paths (graph accept, simulated greedy); the
+  vocab-sharded accept already declined them. With a grammar mask as well,
+  the scaling goes on the logits before the folded additive/mask/bias buffer
+  (the sampler scales after adding; only a request with both a repetition
+  and a frequency/presence penalty and a grammar sees the difference).
+- Tests: `test_dspark_min_p.py` `TestPenaltiesReachVerify` (fail on the old
+  code).
+
+## A long prefill no longer blocks short requests under HRRN (2026-11-25)
+
+- `python/sglang/srt/managers/schedule_policy.py`
+  `shortest_prefill_chunk_limit` now also runs under `hrrn`, the prefill
+  policy every DeepSeek-V4.1 env uses. While a long prompt is mid-prefill,
+  its next chunk leaves room in the chunk budget for the shorter requests at
+  the head of the waiting queue (priority order), so they prefill in the same
+  step instead of waiting for the whole long prompt (37 to 51 s for 870K to
+  885K tokens on 4x B200). The chunk keeps at least
+  `SGLANG_HRRN_CHUNK_MIN_SHARE` (0.25) of the budget, so a long prompt still
+  progresses under a steady stream of short ones; 1 turns the reservation off.
+  `shortest-prefill-first` is unchanged.
+- Tests: `test_schedule_policy.py`
+  `test_hrrn_reserves_for_short_requests_and_keeps_a_floor`.
