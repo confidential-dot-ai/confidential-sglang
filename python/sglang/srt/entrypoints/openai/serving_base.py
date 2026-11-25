@@ -79,6 +79,8 @@ class KeepaliveStreamingResponse(StreamingResponse):
 
     async def _body(self):
         try:
+            # Body bytes with the headers: some proxies time out on body silence.
+            yield SSE_KEEPALIVE
             while not self._first.done():
                 done, _ = await asyncio.wait({self._first}, timeout=self._interval_s)
                 if not done:
