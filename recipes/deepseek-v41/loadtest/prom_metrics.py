@@ -85,8 +85,12 @@ class PromScraper:
 
     def _query(self, matchers: str, at: float) -> lm.Scrape:
         sel = union(matchers)
-        q = urllib.parse.urlencode({"query": sel, "time": f"{at:.3f}"})
-        req = urllib.request.Request(f"{self.url}/api/v1/query?{q}")
+        # A form POST, not a GET: the union of every series with the deployment's matchers is about 8 KB,
+        # and Azure Monitor managed Prometheus answers a GET that long with 414 URI Too Long (candidate
+        # validation, 2026-11-26). The query API takes the same parameters as a form body.
+        q = urllib.parse.urlencode({"query": sel, "time": f"{at:.3f}"}).encode()
+        req = urllib.request.Request(f"{self.url}/api/v1/query", data=q, method="POST",
+                                     headers={"content-type": "application/x-www-form-urlencoded"})
         if self.token:
             req.add_header("authorization", f"Bearer {self.token}")
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
