@@ -37,6 +37,7 @@ class FakeGateway:
         self.capacity, self.inflight = 1000, 0
         self.down_until, self.wrong_needles, self.over_capacity_status = 0.0, False, 429
         self.refused, self.refuse_status, self.query_times = {"min_p"}, 400, []
+        self.prom_methods = []
         self.busy_code = "inference_capacity"
         self.unauthorized = 0
         self.port = free_port()
@@ -48,6 +49,7 @@ class FakeGateway:
         app.router.add_post("/v1/chat/completions", self.chat)
         app.router.add_get("/_down", self.down)
         app.router.add_get("/api/v1/query", self.prom_query)
+        app.router.add_post("/api/v1/query", self.prom_query)
         return app
 
     async def models(self, request):
@@ -120,8 +122,12 @@ class FakeGateway:
         return web.json_response({"choices": [choice], "usage": usage})
 
     async def prom_query(self, request):
-        q = request.query["query"]
-        self.query_times.append(float(request.query.get("time") or 0))
+        params = dict(request.query) if request.method == "GET" else dict(await request.post())
+        if request.method == "GET" and len(str(request.rel_url)) > 4096:
+            raise web.HTTPRequestURITooLong()
+        self.prom_methods.append(request.method)
+        q = params["query"]
+        self.query_times.append(float(params.get("time") or 0))
         role = "prefill" if 'role="prefill"' in q else "decode" if 'role="decode"' in q else "router"
         series = []
         if role == "prefill":
@@ -425,6 +431,19 @@ class ClusterStressTest(unittest.TestCase):
         self.assertEqual(snap.prefill.values["sglang:prompt_tokens_total"], 1000.0)
         self.assertEqual(snap.prefill.values["sglang:cached_tokens_total"], 400.0)
         self.assertEqual(snap.decode.values["sglang:generation_tokens_total"], 50.0)
+
+    def test_a_long_prometheus_query_is_a_form_post(self):
+        # The union with a deployment's matchers is longer than a GET may be (414 on Azure Monitor).
+        sys.path.insert(0, HERE)
+        import prom_metrics
+
+        long = 'role="prefill",deployment_name="' + "x" * 200 + '"'
+        self.assertGreater(len(prom_metrics.union(long)), 4096)
+        self.fake.counters = {"prompt": 1000.0, "cached": 400.0, "generated": 50.0}
+        s = prom_metrics.PromScraper(self.url, prefill=long, decode='role="decode"', lag_s=0)
+        snap = s.snapshot()
+        self.assertEqual(self.fake.prom_methods[-2:], ["POST", "POST"])
+        self.assertEqual(snap.prefill.values["sglang:prompt_tokens_total"], 1000.0)
 
     def test_the_prometheus_query_names_each_series_and_keeps_them_apart(self):
         # Azure Monitor managed Prometheus refuses a regex on __name__, and `or` matches label sets without
