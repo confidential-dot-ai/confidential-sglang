@@ -30,7 +30,7 @@ given on the command line still wins:
                to 262144 - 8192 tokens), needles to 240K, overload at 16-128
                clients, a 5-minute soak. No load or fault phase.
   dsv41-full   DeepSeek-V4.1 PD: every phase, 131072 context, n=2 known to
-               fail on PD, logprobs and min_p rejected by DSpark, a 4-hour soak.
+               fail on PD, min_p and logprobs served, a 4-hour soak.
 
 The profiles are shortcuts for a run by hand. A validation passes every model
 option explicitly (bin/validate-deployment: from the release recipe and the
@@ -94,8 +94,7 @@ PROFILES = {
         "phases": ",".join(PHASES),
         "context_length": 131072,
         "sessions": 32,
-        "known_failures": "t_n2",
-        "unsupported_params": "logprobs,min_p",
+        "unsupported_params": "",
         "soak_minutes": 240,
     },
 }
@@ -313,7 +312,7 @@ def parser(profile=None):
     p.add_argument("--context-length", type=int, default=131072)
     p.add_argument("--sessions", type=int, default=32, help="load and soak concurrency (the operating point)")
     p.add_argument("--known-failures", default="", help="func cases allowed to fail, e.g. t_n2 on PD")
-    p.add_argument("--unsupported-params", default="", help="sampling parameters the deployment rejects (min_p with DSpark)")
+    p.add_argument("--unsupported-params", default="", help="sampling parameters the deployment rejects (e.g. min_p before engines served it with DSpark)")
     p.add_argument("--dataset", default=os.environ.get("STRESS_DATASET", ""),
                    help="Oracle dataset for the load phase (default $STRESS_DATASET)")
     p.add_argument("--oracle", action="store_true", help="force completions (workers must run --oracle-decode)")

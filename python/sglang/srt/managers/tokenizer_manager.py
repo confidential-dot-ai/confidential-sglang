@@ -2300,6 +2300,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "many threads to send them one by one with parallel sampling (n > 1)."
                 )
 
+            # Under PD every sample is its own prefill->decode handoff: give each
+            # its own bootstrap room (the same on both servers) and skip the
+            # prefix-caching warmup, which would be one more handoff on a room
+            # that no peer request claims.
+            is_pd = self.disaggregation_mode in (
+                DisaggregationMode.PREFILL,
+                DisaggregationMode.DECODE,
+            )
+            sample_rooms = self._parallel_sample_bootstrap_rooms(obj) if is_pd else None
+
             # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
             tokenized_objs = await asyncio.gather(
@@ -2307,7 +2317,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
             # Cache the common prefix for parallel sampling
-            for i in range(batch_size):
+            for i in range(0 if is_pd else batch_size):
                 tmp_obj = copy.copy(objs[i])
                 # Warmup borrows the samples' LoRA references; only samples release
                 # them. Keep LoRA on tokenized_obj for the correct prefix-cache key.
@@ -2341,9 +2351,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+                for sample_index in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
+                    if sample_rooms is not None:
+                        tokenized_obj.bootstrap_room = sample_rooms[
+                            sample_index * batch_size + i
+                        ]
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
                     if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
                         tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
@@ -2372,6 +2386,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             async for response in self._stream_batch_responses(generators, rids):
                 yield response
+
+    def _parallel_sample_bootstrap_rooms(self, obj) -> List[Optional[int]]:
+        """One bootstrap room per expanded sample (PD, parallel_sample_num > 1).
+
+        Sample k of prompt i is at k * batch_size + i, the layout
+        GenerateReqInput._expand_bootstrap_rooms gives. Rooms must be unique:
+        a shared room makes the decode side wait for KV that never arrives.
+        """
+        num = obj.batch_size * obj.parallel_sample_num
+        rooms = getattr(obj, "bootstrap_room", None)
+        if not isinstance(rooms, list) or len(rooms) < num:
+            rooms = [None] * num
+        rooms = list(rooms[:num])
+        for j, room in enumerate(rooms):
+            if room is None and get_disagg().disaggregation_transfer_backend == "fake":
+                rooms[j] = self.fake_bootstrap_room_counter
+                self.fake_bootstrap_room_counter += 1
+        given = [room for room in rooms if room is not None]
+        if len(set(given)) != len(given):
+            raise ValueError(
+                "Parallel sampling (n > 1) under PD disaggregation needs one "
+                "bootstrap_room per sample or per prompt; got duplicate rooms."
+            )
+        return rooms
 
     async def _collect_batch_responses(self, generators):
         tasks = [asyncio.create_task(gen.__anext__()) for gen in generators]

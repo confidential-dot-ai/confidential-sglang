@@ -19,7 +19,11 @@ from sglang.srt.entrypoints.openai.protocol import (
     SglExt,
     convert_json_schema_to_str,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_base import (
+    KeepaliveStreamingResponse,
+    OpenAIServingBase,
+    prefetch_first_chunk,
+)
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     cached_tokens_details_from_dict,
@@ -36,7 +40,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
 )
-from sglang.srt.runtime_context import get_serving
+from sglang.srt.runtime_context import get_disagg, get_serving
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 
 if TYPE_CHECKING:
@@ -65,6 +69,23 @@ class OpenAIServingCompletion(OpenAIServingBase):
         prompt = request.prompt
         if not prompt or (isinstance(prompt, list) and all(not p for p in prompt)):
             return "Prompt cannot be empty"
+        # best_of needs server-side ranking by logprob, which is not
+        # implemented; refuse it rather than silently return n samples.
+        if request.best_of is not None and request.best_of != 1:
+            return "best_of is not supported; use n for multiple samples"
+
+        if (
+            request.echo
+            and request.logprobs
+            and get_disagg().disaggregation_mode != "null"
+        ):
+            # Under PD the prompt logprobs are computed on prefill, but the
+            # decode server answers and never has them: the choice would carry
+            # the echoed prompt with output-only logprobs.
+            return (
+                "echo with logprobs (prompt logprobs) is not supported with "
+                "prefill-decode disaggregation."
+            )
 
         return None
 
@@ -207,8 +228,22 @@ class OpenAIServingCompletion(OpenAIServingBase):
         )
 
         # Kick-start the generator to trigger validation before HTTP 200 is sent.
+        # confidential-sglang: at most SGLANG_STREAM_KEEPALIVE_AFTER_S, then 200
+        # and keep-alive comments until output starts (see serving_chat).
+        first = await prefetch_first_chunk(
+            generator, envs.SGLANG_STREAM_KEEPALIVE_AFTER_S.get()
+        )
+        if not first.done():
+            return KeepaliveStreamingResponse(
+                first,
+                generator,
+                interval_s=envs.SGLANG_STREAM_KEEPALIVE_INTERVAL_S.get(),
+                error_chunk=self.create_streaming_error_response,
+                media_type="text/event-stream",
+                background=self.tokenizer_manager.create_abort_task(adapted_request),
+            )
         try:
-            first_chunk = await generator.__anext__()
+            first_chunk = first.result()
         except ValueError as e:
             return self.create_error_response(str(e))
         refused = self.error_response_for_first_chunk(first_chunk)

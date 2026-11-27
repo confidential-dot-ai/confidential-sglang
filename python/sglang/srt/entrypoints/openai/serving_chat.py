@@ -79,7 +79,11 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     TopLogprob,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_base import (
+    KeepaliveStreamingResponse,
+    OpenAIServingBase,
+    prefetch_first_chunk,
+)
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
@@ -2474,8 +2478,26 @@ class OpenAIServingChat(OpenAIServingBase):
         # Kick-start the generator to trigger validation before HTTP 200 is sent.
         # If validation fails (e.g., context length exceeded), we can still return
         # a proper HTTP 400 error response instead of streaming it as SSE payload.
+        # confidential-sglang: wait at most SGLANG_STREAM_KEEPALIVE_AFTER_S, then
+        # answer 200 and keep the connection alive until output starts. Only the
+        # OpenAI wire: another wire's headers depend on the first engine event.
+        keepalive = wire_response is chat_encoding_adapters.OPENAI_CHAT_WIRE
+        first = await prefetch_first_chunk(
+            generator,
+            envs.SGLANG_STREAM_KEEPALIVE_AFTER_S.get() if keepalive else 0,
+        )
+        if not first.done():
+            return KeepaliveStreamingResponse(
+                first,
+                generator,
+                interval_s=envs.SGLANG_STREAM_KEEPALIVE_INTERVAL_S.get(),
+                error_chunk=self.create_streaming_error_response,
+                media_type="text/event-stream",
+                headers=wire_response.headers() or None,
+                background=self.tokenizer_manager.create_abort_task(adapted_request),
+            )
         try:
-            first_chunk = await generator.__anext__()
+            first_chunk = first.result()
         except ValueError as e:
             return self.create_error_response(str(e))
         refused = self.error_response_for_first_chunk(first_chunk)

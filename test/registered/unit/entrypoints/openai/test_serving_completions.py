@@ -95,6 +95,22 @@ class ServingCompletionTestCase(unittest.TestCase):
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.input_ids, [1, 2, 3, 4])
 
+    def test_best_of_is_refused_not_ignored(self):
+        """best_of needs server-side ranking, which is not implemented."""
+        for best_of, n, refused in (
+            (None, 2, False),
+            (1, 1, False),
+            (3, 1, True),
+            (2, 2, True),
+        ):
+            with self.subTest(best_of=best_of, n=n):
+                req = CompletionRequest(model="x", prompt="hi", best_of=best_of, n=n)
+                error = self.sc._validate_request(req)
+                if refused:
+                    self.assertIn("best_of is not supported", error)
+                else:
+                    self.assertIsNone(error)
+
     def test_cache_salt_and_extra_key_remain_distinct(self):
         req = CompletionRequest(
             model="x",
@@ -117,6 +133,17 @@ class ServingCompletionTestCase(unittest.TestCase):
         internal, _ = self.sc._convert_to_internal_request(req)
         with self.assertRaisesRegex(ValueError, "single request"):
             internal.normalize_batch_and_arguments()
+
+    def test_pd_refuses_echo_with_logprobs(self):
+        """A PD decode server never has the prompt logprobs prefill computed, so
+        echo with logprobs must be refused, not answered with output-only ones."""
+        echo_lp = CompletionRequest(model="x", prompt="hi", echo=True, logprobs=2)
+        output_lp = CompletionRequest(model="x", prompt="hi", logprobs=2)
+        self.assertIsNone(self.sc._validate_request(echo_lp))
+        for mode in ("prefill", "decode"):
+            with get_context().override_server_args(disaggregation_mode=mode):
+                self.assertIn("echo", self.sc._validate_request(echo_lp))
+                self.assertIsNone(self.sc._validate_request(output_lp))
 
     # ---------- echo-handling ----------
     def test_echo_with_list_of_strings_streaming(self):

@@ -1698,6 +1698,131 @@ class TestLoRARequestLifecycle(CustomTestCase):
         asyncio.run(self._drive_parallel_request(fail_second_warmup=True))
 
 
+class TestParallelSamplingUnderPD(CustomTestCase):
+    """n > 1 under PD: one handoff per sample, each on its own room, no warmup.
+
+    Prefill and decode get the same body from the router, so both sides must
+    send the same rooms; a warmup copy or a shared room leaves the decode side
+    waiting for KV that never arrives.
+    """
+
+    async def _drive(self, mode, obj, complete=True):
+        tm = _make_tm_for_generate(self)
+        tm.disaggregation_mode = mode
+        tm._tokenize_one_request = AsyncMock(
+            side_effect=lambda req: SimpleNamespace(
+                rid=req.rid,
+                bootstrap_room=req.bootstrap_room,
+                input_ids=[1],
+                mm_inputs=None,
+                time_stats=tm.rid_to_state[req.rid].time_stats,
+                sampling_params=SimpleNamespace(max_new_tokens=4),
+            )
+        )
+        sent = []
+
+        async def send(tokenized):
+            tm._mark_state_dispatched(tokenized.rid)
+            sent.append(tokenized)
+
+        tm._send_one_request = send
+        generator = tm.generate_request(obj)
+        try:
+            response = asyncio.create_task(generator.__anext__())
+            if complete:
+                for _ in range(100):
+                    await asyncio.sleep(0)
+                    if len(sent) == obj.batch_size * obj.parallel_sample_num:
+                        break
+                for tokenized in list(sent):
+                    await tm._handle_batch_output(_make_batch_str_output(tokenized.rid))
+            outputs = await asyncio.wait_for(response, timeout=1)
+            self.assertFalse(tm.rid_to_state)
+            return sent, outputs
+        finally:
+            await generator.aclose()
+
+    def _rooms(self, mode, **kwargs):
+        sent, outputs = asyncio.run(self._drive(mode, GenerateReqInput(**kwargs)))
+        self.assertTrue(all(t.sampling_params.max_new_tokens == 4 for t in sent))
+        return [t.bootstrap_room for t in sent], outputs
+
+    def test_prefill_and_decode_send_the_same_distinct_rooms(self):
+        cases = [
+            # What the PD router injects for a chat request with n = 3.
+            (dict(text="p", bootstrap_room=[11, 22, 33]), 3, [11, 22, 33]),
+            # One room per prompt (router /generate, /v1/completions batches).
+            (dict(text=["a", "b"], bootstrap_room=[100, 200]), 2, [100, 101, 200, 201]),
+            # One scalar room (router /generate with a single prompt).
+            (dict(text="p", bootstrap_room=7), 2, [7, 8]),
+        ]
+        for kwargs, n, expected in cases:
+            for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
+                with self.subTest(kwargs=kwargs, mode=mode):
+                    rooms, outputs = self._rooms(
+                        mode, sampling_params={"n": n, "max_new_tokens": 4}, **kwargs
+                    )
+                    # No warmup copy: exactly one send per sample.
+                    self.assertEqual(rooms, expected)
+                    self.assertEqual(len(outputs), len(expected))
+
+    def test_duplicate_rooms_are_rejected_before_dispatch(self):
+        async def drive():
+            tm = _make_tm_for_generate(self)
+            tm.disaggregation_mode = DisaggregationMode.DECODE
+            tm._send_one_request = AsyncMock()
+            obj = GenerateReqInput(
+                text="p",
+                sampling_params={"n": 2, "max_new_tokens": 4},
+                bootstrap_room=[5, 5],
+            )
+            generator = tm.generate_request(obj)
+            with self.assertRaisesRegex(ValueError, "duplicate rooms"):
+                await generator.__anext__()
+            tm._send_one_request.assert_not_called()
+            self.assertFalse(tm.rid_to_state)
+
+        asyncio.run(drive())
+
+    def test_aggregated_serving_keeps_the_prefix_warmup(self):
+        async def drive():
+            tm = _make_tm_for_generate(self)
+            tm.disaggregation_mode = DisaggregationMode.NULL
+            tm._tokenize_one_request = AsyncMock(
+                side_effect=lambda req: SimpleNamespace(
+                    rid=req.rid,
+                    bootstrap_room=None,
+                    input_ids=[1],
+                    mm_inputs=None,
+                    time_stats=tm.rid_to_state[req.rid].time_stats,
+                    sampling_params=SimpleNamespace(max_new_tokens=4),
+                )
+            )
+            sent = asyncio.Queue()
+
+            async def send(tokenized):
+                tm._mark_state_dispatched(tokenized.rid)
+                sent.put_nowait(tokenized)
+
+            tm._send_one_request = send
+            obj = GenerateReqInput(
+                text="p", sampling_params={"n": 2, "max_new_tokens": 4}
+            )
+            generator = tm.generate_request(obj)
+            response = asyncio.create_task(generator.__anext__())
+            warmup = await asyncio.wait_for(sent.get(), timeout=1)
+            self.assertEqual(warmup.sampling_params.max_new_tokens, 0)
+            await tm._handle_batch_output(_make_batch_str_output(warmup.rid))
+            for _ in range(2):
+                sample = await asyncio.wait_for(sent.get(), timeout=1)
+                self.assertEqual(sample.sampling_params.max_new_tokens, 4)
+                await tm._handle_batch_output(_make_batch_str_output(sample.rid))
+            self.assertEqual(len(await response), 2)
+            await generator.aclose()
+
+        asyncio.run(drive())
+
+
 class TestPriorityRange(CustomTestCase):
     """Request priorities reach the radix cache as signed 64-bit integers, so an
     out-of-range value is rejected before dispatch instead of failing inside

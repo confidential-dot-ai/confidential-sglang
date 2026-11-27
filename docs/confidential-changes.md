@@ -404,3 +404,177 @@ commit, tagged `sha-<commit>`. See `confidential/engine/README.md`.
 - Also measured: the old holder fails at once under these limits
   (`OSError: [Errno 12] Cannot allocate memory`), and a declared `IPC_LOCK`
   does not help at uid 1001 (bounding set only; CapEff 0, mlock ENOMEM).
+
+## DeepSeek-V4.1-Flash-1017 with MXFP4 Engram tables (2026-11-22)
+
+- `recipes/deepseek-v41/launcher/prepare_checkpoint.py`: spec
+  `1017-mxfp4-engram` = `deepseek-ai/DeepSeek-V4.1-Flash-1017` at `1bae0e10`
+  plus only the two Engram shards (`model-00047/48-of-00048`) of
+  `nvidia/DeepSeek-V4.1-Flash-1017-NVFP4` at `3ae9c0d3fbbe`. Those shards
+  differ from DeepSeek's only in `embed.weight` (FP8 `[N,256]` to MXFP4 as
+  `U8 [N,128]`). The config's `engram_embed_*` fields follow the Engram
+  source, and `check_engram_tables` checks the `embed.weight` dtype before
+  the config is written. The existing spec is unchanged.
+- The container env files carry the spec commented out. MXFP4 stays opt-in.
+- GPU A/B on 4x B200 (1P1D TP2 with `dsv41.env` flags, engine
+  `images-6451872f8845`), FP8 Engram vs MXFP4 Engram:
+  - Engram locked in host RAM: 203 GB vs 105 GB.
+  - func 159/160 both (`t_n2`), needles 64/64 both, 0 errors or retractions.
+  - realmix C=32, 600 s: 2.83M TPM/GPU both, prefix hit 94.6% both, TTFT
+    p50 0.39 vs 0.38 s, p99 0.87 vs 3.44 s (one run each), ITL p50 5.0 vs
+    4.9 ms.
+  - GSM8K (sgl-eval 0.1.3, 1319, temperature 0, no thinking, max 4096):
+    96.82% and 96.74% (two FP8 runs) vs 96.13%; paired sign test p=0.08 and
+    0.13.
+- Before making it the default: rerun the load test for the p99, and a
+  harder accuracy eval than GSM8K.
+
+
+## Run-time compiles at 1M context: warmup, reporting and the seed tree (2026-11-23, uncommitted)
+
+- `python/sglang/srt/entrypoints/warmup.py` `confidential_cold_path`: after
+  the short paths, a long-context step prefills an 82,120-token prompt and
+  nearly the longest prompt the worker admits (`max_req_input_len` less 1024,
+  ending in a 5,003-token chunk), each followed by the same prompt plus 64
+  tokens (a short extend on a long cached prefix). The odd tails make the
+  last 8K chunk an eager step at M values the 32K warmup never gave (200 and
+  5,003: an MXFP8 GEMM tactic bucket, Triton integer classes, MHC splits). Boot never ran a prompt past 32K, so the eager
+  prefill above the prefill graph cap (65536), 8K chunks on a near-full
+  prefix, the paged mega prefill and decode at long lengths ran first in
+  service. Skipped when the worker admits no prompt past about 88K. Two sampling
+  paths join the cold path: top_k with top_p (and top_k 1 with top_p); under
+  DSpark that combination runs `dflash_utils._adjust_top_p_for_top_k`, a
+  `torch.compile` function that no other warmup request reached.
+- `kernels/ops/attention/dsv4/attn_metadata_kernels.py` `_small_page_table`:
+  `NUM_PAGES` is a runtime argument, not a constexpr. An eager decode or
+  verify step passes the batch's live page count, so each length would have
+  compiled another variant (up to 4096 at 1M).
+- `kernels/jit/utils/compile/loader.py`: a JIT module that ninja builds
+  sends `jit_compile` (kernel `sgl_jit_<family>`, the first module arg only)
+  to the pair supervisor, like a Triton compile; after serving started it
+  also logs a warning. Before, a pair reported only Triton compiles.
+- `recipes/deepseek-v41/launcher/launch.py`: workers also get
+  `SGLANG_JIT_CACHE_DIR`, `TORCH_EXTENSIONS_DIR` and `CUTE_DSL_CACHE_DIR`
+  below the kernel cache dir. Their defaults are under HOME, outside the tree
+  that a kernel-cache seed copies.
+- `dsv41-b200-1m.env` passes `--warmups confidential_cold_path` like
+  `dsv41-262k.env`.
+- `srt/mem_cache/memory_pool_host.py` `DeepSeekV4PagedHostPool`: a pool
+  with token-granular transfers builds the `transfer_cache_dsv4_mla` JIT
+  module at construction (`hisparse.prepare_transfer_cache_dsv4_mla`). Its
+  first call was the first HiCache backup or load of a partial page, after
+  ready, and no warmup step is sure to evict.
+- Tests: `test_cold_path_warmup.py` (long prompt plan and follow-up),
+  `test_jit_build_event.py`, `test_dsv4_small_page_table.py` (compile key;
+  values under `TRITON_INTERPRET=1`), `test_build_layouts.py` (every compiler
+  cache under the kernel cache dir), `test_dsv4_host_pool_transfer_jit.py`. Not GPU-run.
+
+
+## Logprobs under DSpark and PD (2026-11-23)
+
+- `python/sglang/srt/speculative/dflash_utils.py`: `validate_dflash_request`
+  no longer refuses `return_logprob` (upstream dropped that check in #33459;
+  our Trim commit bcfc732851 had put it back). The DSpark verify step already
+  returns the target's logprobs for every committed token
+  (`compute_spec_logprobs`, chain layout: out token (b, j) from logits row
+  b * width + j): `log_softmax(logits / temperature)` after penalties,
+  logit_bias and the grammar mask, before top-p/top-k and the watermark, which
+  is what the non-speculative sampler returns. A PD decode server takes the
+  first token's logprob and top logprobs from prefill's metadata row.
+- `python/sglang/srt/managers/scheduler.py`: under PD a request whose
+  `top_logprobs` exceeds the metadata row width (128) gets a 400 at admission;
+  before, prefill's `set_buf` raised and took the prefill scheduler down
+  (upstream #49686 adds the same check behind a server argument).
+- `python/sglang/srt/entrypoints/openai/serving_completions.py`: under PD,
+  completions `echo` with `logprobs` (prompt logprobs) gets a 400. The decode
+  server answers and never has the prompt logprobs prefill computed; the
+  router merges them only into `/generate` meta_info.
+- `python/sglang/srt/entrypoints/warmup.py`: the cold-path warmup runs its
+  logprob paths (top_logprobs 2) under DSpark and DFlash too; only UNO skips
+  them.
+- `recipes/deepseek-v41/loadtest/func_tests.py`: a served `t_logprobs` /
+  `t_logprobs_stream` checks that logprobs are well formed (one per completion
+  token, finite, <= 0, k descending alternatives, under greedy the chosen token
+  is the best one). `dsv41-full` declares only `min_p` unsupported; add
+  `logprobs` to `--unsupported-params` for a gateway that still refuses them.
+- Tests: `test/registered/unit/spec/test_dspark_spec_logprobs.py` (greedy
+  accept + chain logprobs, non-spec semantics before top-p, per-token
+  assembly, PD first token + stop inside an accepted run),
+  `test_serving_completions.py::test_pd_refuses_echo_with_logprobs`,
+  `test_cold_path_warmup.py`, `test_cluster_stress.py`. Not GPU-run.
+
+## SSE keep-alives while a stream waits for its first token (2026-11-25)
+
+- `python/sglang/srt/entrypoints/openai/serving_base.py` `prefetch_first_chunk`
+  and `KeepaliveStreamingResponse`, used by the chat and completions streaming
+  handlers. The handlers held the HTTP response until the first output token,
+  so a long prompt left the connection silent for the whole prefill: on 4x
+  B200 DeepSeek-V4.1 (`dsv41-1m`, idle server) 871K tokens gave 36.6 s and
+  885K tokens 51.1 s with no byte sent, not even the headers. OpenRouter asks
+  providers to send SSE comments as keep-alives or it may time the request out
+  and fall back to another provider.
+- Now the handler waits for the first chunk at most
+  `SGLANG_STREAM_KEEPALIVE_AFTER_S` (5 s). If it is not there, the response
+  starts with HTTP 200 and sends `: keep-alive` every
+  `SGLANG_STREAM_KEEPALIVE_INTERVAL_S` (10 s) until output starts. Errors that
+  show up within the 5 s (tokenization, context length, admission refusals)
+  keep their HTTP status; a later one goes in-stream as `data: {"error": ...}`
+  then `data: [DONE]`, as mid-stream errors already do.
+  `SGLANG_STREAM_KEEPALIVE_AFTER_S=0` restores the old behavior.
+- Chat applies it only on the OpenAI wire (DeepSeek's recipe uses it); the
+  Kimi K3 wire builds its headers from the first engine event and keeps
+  waiting.
+- The response owns the pending first-chunk task: a client that leaves before
+  output, or a failed send, cancels it and closes the engine stream.
+- Tests: `test_stream_first_chunk_refusal.py` `TestStreamKeepalive` (fast
+  stream unchanged, keep-alives then output, late validation error in-stream,
+  headers before the first chunk over ASGI, disconnect and send failure
+  cancel the request).
+
+## Penalties reach the DSpark verify logits (2026-11-25)
+
+- `python/sglang/srt/speculative/dflash_utils.py`
+  `apply_dflash_verify_logits_adjustments`, `dspark_verify.py`
+  `verify_logits_adjustments_are_noop` and `dflash_worker_v2.py` read
+  `sampling_info.acc_linear_penalties`, a field that no longer exists. Under
+  overlap scheduling `SamplingBatchInfo.copy_for_forward` folds the
+  penalizers into `acc_additive_penalties` (frequency, presence) and
+  `acc_scaling_penalties` (repetition) and drops the orchestrator, so verify
+  saw no penalties at all: they shaped only the prefill-sampled first token,
+  and greedy steps took the graph accept that skips adjustments.
+- Verify now adds the additive penalties and then applies the scaling ones to
+  every verify row, in the sampler's order. Penalized steps leave the
+  adjustment-free fast paths (graph accept, simulated greedy); the
+  vocab-sharded accept already declined them. With a grammar mask as well,
+  the scaling goes on the logits before the folded additive/mask/bias buffer
+  (the sampler scales after adding; only a request with both a repetition
+  and a frequency/presence penalty and a grammar sees the difference).
+- Tests: `test_dspark_min_p.py` `TestPenaltiesReachVerify` (fail on the old
+  code).
+
+## A long prefill no longer blocks short requests under HRRN (2026-11-25)
+
+- `python/sglang/srt/managers/schedule_policy.py`
+  `shortest_prefill_chunk_limit` now also runs under `hrrn`, the prefill
+  policy every DeepSeek-V4.1 env uses. While a long prompt is mid-prefill,
+  its next chunk leaves room in the chunk budget for the shorter requests at
+  the head of the waiting queue (priority order), so they prefill in the same
+  step instead of waiting for the whole long prompt (37 to 51 s for 870K to
+  885K tokens on 4x B200). The chunk keeps at least
+  `SGLANG_HRRN_CHUNK_MIN_SHARE` (0.25) of the budget, so a long prompt still
+  progresses under a steady stream of short ones; 1 turns the reservation off.
+  `shortest-prefill-first` is unchanged.
+- Tests: `test_schedule_policy.py`
+  `test_hrrn_reserves_for_short_requests_and_keeps_a_floor`.
+- 2026-11-25, second half: the penalizers themselves never saw DSpark's
+  tokens. `prepare_for_decode` returns early for speculative decoding before
+  `cumulate_penalty_output_tokens`, and EAGLE feeds them in its own prep but
+  DFlash/DSpark (`dflash_info_v2.py` `prepare_for_decode`) did not, so the
+  counts stayed at zero (and `min_tokens` would never have released EOS once
+  verify applied it). Each request now tracks `penalty_fed_output_len`
+  (reset when an orchestrator starts its penalty state) and DSpark's decode
+  prep feeds every committed token not yet seen, as one padded block
+  (`cumulate_output_token_block` on the four penalizers). Measured on 4x B200
+  before: greedy "banana" x299 with presence 2, frequency 2 or repetition 1.5,
+  identical to no penalty. Tests: `test_penaltylib.py`
+  `TestSpeculativeTokenBlock`.

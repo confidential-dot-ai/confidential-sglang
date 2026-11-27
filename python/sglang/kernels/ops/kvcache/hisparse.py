@@ -319,6 +319,12 @@ def _jit_dsv4_transfer_module(block_size: int) -> Module:
     )
 
 
+def prepare_transfer_cache_dsv4_mla(block_size: int = 1024) -> None:
+    """Build the module now: its first call is otherwise the first token-granular
+    HiCache backup or load, after the server is ready."""
+    _jit_dsv4_transfer_module(block_size)
+
+
 def transfer_cache_dsv4_mla(
     src_ptrs: torch.Tensor,
     dst_ptrs: torch.Tensor,

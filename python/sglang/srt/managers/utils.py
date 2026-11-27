@@ -201,6 +201,24 @@ class GenerationBatchResult:
     def get_num_generated_tokens(self, batch_size: int) -> int:
         return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
 
+    def own_device_outputs(self, stream: torch.cuda.Stream) -> None:
+        """Clone the decision outputs on ``stream`` before an async readback.
+
+        DSpark's in-graph accept returns views of verify-graph buffers that the
+        next replay rewrites, and the confidential-compute readback worker copies
+        only after a CPU wakeup; each TP rank reading another step's tokens
+        diverges the ranks.
+        """
+        with torch.cuda.stream(stream):
+            if isinstance(self.next_token_ids, torch.Tensor):
+                self.next_token_ids = self.next_token_ids.clone()
+            if self.accept_lens is not None:
+                self.accept_lens = self.accept_lens.clone()
+            if self.block_accept_lens is not None:
+                self.block_accept_lens = self.block_accept_lens.clone()
+            if self.cap_lens is not None:
+                self.cap_lens = self.cap_lens.clone()
+
     @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.

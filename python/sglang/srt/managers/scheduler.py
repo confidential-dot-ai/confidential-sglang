@@ -1887,6 +1887,12 @@ class Scheduler(
         ``SchedulerBatchResultProcessor._wait_result_copy``).
         """
         if self.enable_cc_async_copy:
+            # Snapshot before src_ready: the copies are ordered behind the producing
+            # forward and ahead of the next one, whatever the worker's latency.
+            if isinstance(result, GenerationBatchResult):
+                result.own_device_outputs(
+                    producer_stream or self.device_module.current_stream()
+                )
             src_ready = self.device_module.Event()
             src_ready.record(stream=producer_stream)
             result.copy_ready_cpu = self.d2h_worker.submit(src_ready, copy_fn)
@@ -3549,6 +3555,8 @@ class Scheduler(
         if (
             isinstance(self.spec_algorithm, SpeculativeAlgorithm)
             and self.spec_algorithm.is_some()
+            # DSpark's sampled verify applies min-p to the target distribution.
+            and not self.spec_algorithm.is_dspark()
             and req.sampling_params.min_p > 0
         ):
             error_msg = (
@@ -3559,6 +3567,24 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
+            return
+
+        if (
+            self.disaggregation_mode != DisaggregationMode.NULL
+            and req.return_logprob
+            and req.logprob.top_logprobs_num
+            > self.disagg_metadata_buffers.max_top_logprobs_num
+        ):
+            # Prefill sends the first token's top logprobs in a fixed-width
+            # metadata row; a wider request would raise in set_buf and take
+            # the prefill scheduler down (upstream #49686 rejects it the same way).
+            self._reject_sampling_mask_request(
+                req,
+                f"top_logprobs_num {req.logprob.top_logprobs_num} exceeds the "
+                "disaggregation metadata capacity "
+                f"{self.disagg_metadata_buffers.max_top_logprobs_num}. Lower "
+                "top_logprobs.",
+            )
             return
 
         if req.return_sampling_mask:
@@ -3919,7 +3945,8 @@ class Scheduler(
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
     def _reject_sampling_mask_request(self, req: Req, error_msg: str) -> None:
-        """Return a sampling-mask validation error without running the model."""
+        """Return a validation error (sampling mask, PD top_logprobs width) as a
+        400 without running the model."""
         logger.error(f"{error_msg}, {req.rid=}")
         prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
         self.request_retirer.retire_unadmitted(req)

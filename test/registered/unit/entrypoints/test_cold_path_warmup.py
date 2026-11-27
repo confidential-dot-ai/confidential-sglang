@@ -22,13 +22,16 @@ class TestColdPathPlan(unittest.TestCase):
         self.assertEqual(sampling, COLD_PATH_SAMPLING)
         self.assertTrue(logprobs)
 
-    def test_dspark_drops_min_p_and_logprobs_keeps_the_rest(self):
-        # The scheduler aborts min_p under any speculative algorithm and
-        # return_logprob under DSpark; DSpark masks grammars in verify.
+    def test_dspark_keeps_min_p_logprobs_and_the_rest(self):
+        # DSpark serves min_p (its sampled verify filters the target) and
+        # logprobs (compute_spec_logprobs), so the warmup runs both paths and a
+        # first such request does not compile them; DSpark masks grammars in verify.
         sampling, logprobs = cold_path_plan(SpeculativeAlgorithm.DSPARK)
-        self.assertFalse(logprobs)
-        self.assertFalse(any("min_p" in s for s in sampling))
-        self.assertIn({"temperature": 0.7, "top_p": 0.9}, sampling)
+        self.assertTrue(logprobs)
+        self.assertIn({"temperature": 0.7, "top_p": 0.9, "min_p": 0.05}, sampling)
+        # Joint top-k/top-p runs a torch.compile'd top-p rescale in DSpark verify.
+        self.assertIn({"temperature": 0.7, "top_k": 40, "top_p": 0.9}, sampling)
+        self.assertIn({"temperature": 0.7, "top_k": 1, "top_p": 0.9}, sampling)
         self.assertTrue(any("json_schema" in s for s in sampling))
         self.assertTrue(any("repetition_penalty" in s for s in sampling))
         self.assertIn({}, sampling)
@@ -36,7 +39,7 @@ class TestColdPathPlan(unittest.TestCase):
 
     def test_dflash_also_drops_grammar(self):
         sampling, logprobs = cold_path_plan(SpeculativeAlgorithm.DFLASH)
-        self.assertFalse(logprobs)
+        self.assertTrue(logprobs)
         self.assertFalse(any(k in s for s in sampling for k in GRAMMAR + ("min_p",)))
 
     def test_eagle_keeps_logprobs_without_min_p(self):
@@ -56,13 +59,57 @@ class TestColdPathPlan(unittest.TestCase):
         # A decode warmup request's first token comes from the fake bootstrap,
         # not from a grammar-constrained prefill.
         sampling, logprobs = cold_path_plan(SpeculativeAlgorithm.DSPARK, "decode")
-        self.assertFalse(any(k in s for s in sampling for k in GRAMMAR + ("min_p",)))
-        self.assertFalse(logprobs)
+        self.assertFalse(any(k in s for s in sampling for k in GRAMMAR))
+        self.assertTrue(logprobs)
         prefill, _ = cold_path_plan(SpeculativeAlgorithm.DSPARK, "prefill")
         self.assertTrue(any("json_schema" in s for s in prefill))
         plain, logprobs = cold_path_plan(SpeculativeAlgorithm.NONE, "decode")
         self.assertTrue(logprobs)
         self.assertFalse(any("json_schema" in s for s in plain))
+
+
+class TestLongPrompts(unittest.TestCase):
+    def test_lengths_follow_what_the_worker_admits(self):
+        # 1M context: ~80K and nearly the longest admitted prompt, with room for
+        # the follow-up and its new tokens.
+        lengths = warmup.long_prompt_lengths(1048576 - 6)
+        self.assertEqual(lengths[0], warmup.LONG_PROMPT_TOKENS)
+        self.assertLessEqual(lengths[-1] + warmup.LONG_PROMPT_FOLLOW_UP + 16, 1048576 - 6)
+        self.assertGreater(lengths[-1], 1048576 - 1024 - 8192)
+        # Both end in an eager 8K-chunk tail past the 65536 prefill graph cap:
+        # 128..255 tokens (an MXFP8 GEMM tactic bucket) and 1024..8191 tokens,
+        # neither a multiple of 16.
+        short_tail, long_tail = (n % 8192 for n in lengths)
+        self.assertTrue(128 <= short_tail < 256 and short_tail % 16)
+        self.assertTrue(1024 <= long_tail < 8192 and long_tail % 16)
+        self.assertGreater(lengths[0] - short_tail, 65536)
+        # A pool smaller than the context bounds it, not the context.
+        self.assertLess(warmup.long_prompt_lengths(700_000)[-1], 700_000)
+        # Short-context servers skip the step.
+        self.assertEqual(warmup.long_prompt_lengths(32768), ())
+        self.assertEqual(warmup.long_prompt_lengths(None), ())
+
+    def test_the_follow_up_extends_the_long_prompt(self):
+        seen = []
+
+        class Manager:
+            max_req_input_len = 262144 - 6
+            context_len = 262144
+
+            async def generate_request(self, req, _):
+                seen.append(req)
+                yield {}
+
+        spec = mock.Mock(speculative_algorithm="DSPARK")
+        with mock.patch("sglang.srt.runtime_context.get_spec", return_value=spec):
+            asyncio.run(warmup.confidential_cold_path("prefill", Manager()))
+        long = [r for r in seen if len(r.input_ids) > 32768]
+        self.assertEqual([len(r.input_ids) for r in long],
+                         [82120, 82120 + 64, 258955, 258955 + 64])
+        for first, follow_up in (long[0:2], long[2:4]):
+            self.assertEqual(follow_up.input_ids[:len(first.input_ids)], first.input_ids)
+            self.assertNotIn("min_p", follow_up.sampling_params)
+            self.assertIsNotNone(first.bootstrap_room)
 
 
 def _tokenizer_process(server_key, log, ready):

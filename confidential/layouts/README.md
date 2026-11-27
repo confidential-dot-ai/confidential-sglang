@@ -26,6 +26,7 @@ The revision is `--revision`, else `$SOURCE_REVISION`, else
 | --- | --- | --- | --- |
 | `dsv41` | `recipes/deepseek-v41/container/dsv41.env` | 4x B200 | 1 pair: TP2 prefill + TP2 decode, 128K context |
 | `dsv41-262k` | `dsv41-262k.env` | 4x B200 | 1 pair, 262144-token context |
+| `dsv41-1m` | `dsv41-1m.env` | 4x B200, ~880 GiB host RAM | 1 pair, 1M context, MXFP4 Engram, B200 memory estimate in the plan (unqualified) |
 | `dsv41-b200-1m` | `dsv41-b200-1m.env` | 8x B200 | 2x TP2 prefill + 2x TP2 decode, 1M context |
 | `dsv41-b300-1m` | `dsv41-b300-1m.env` | 8x B300 | 2x TP2 prefill + 2x TP2 decode, 1M context, B300 memory profile |
 | `dsv41-b300-1m-ced` | `dsv41-b300-1m-ced.env` | 8x B300 | 2x PP2xTP1 CED prefill + 2x TP2 decode, 1M context |
@@ -79,7 +80,7 @@ JSON object, keys sorted, two-space indent, trailing newline.
 | `target.gpu_count` | int | GPUs the layout uses (prefill workers x TP + decode workers x TP) |
 | `target.gpu_models` | list of string | GPU name substrings the launcher's preflight accepts (`--gpu-models`) |
 | `target.memory_profile` | string or null | `--memory-profile` (`B200`/`B300`) used for `auto` pool sizes, or null |
-| `target.host_available_gib` | number or null | Host RAM assumed for `--prefill-hicache-ratio auto` (null when not auto). B200 layouts: 768 GiB (an 8x B200 host with 1 TiB, less the ~198 GiB Engram copy the holder pins) |
+| `target.host_available_gib` | number or null | Host RAM assumed for `--prefill-hicache-ratio auto` (null when not auto). B200 layouts: 768 GiB (an 8x B200 host with 1 TiB, less the ~198 GiB Engram copy the holder pins; for `dsv41-1m`, a 4x B200 with ~880 GiB less the ~98 GiB MXFP4 Engram copy and the guest) |
 | `target.host_gpus` | list of int or null | The profile's host GPU indices (docker recipe only; not used in the plan) |
 | `paths.*` | string | `install_root`, `python`, `launcher`, `engram_holder`, `model`, `kernel_cache_dir`, `output_dir` (table above) |
 | `launch_argv` | list of string | `launch.py` arguments (without `--dry-run`) that produce `plan` |

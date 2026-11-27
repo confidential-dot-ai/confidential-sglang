@@ -142,6 +142,61 @@ class TestSWAEvictionInterval(unittest.TestCase):
         self.assertEqual(req.kv.get_evicted_seqlen("swa"), 64)
 
 
+class TestTreeBarredChunkedPrefillRetiresItsWindow(unittest.TestCase):
+    """A chunked prefill whose chunks never enter the prefix tree (warmup and
+    other fake-bootstrap requests) must retire its own out-of-window rows: the
+    tree can never evict them, so holding them fills the window pool at one
+    pool's worth of prompt and the scheduler stalls."""
+
+    def _extend_batch(self, cache, *, barred: bool):
+        req = SimpleNamespace(
+            seqlen=520,
+            extend_batch_idx=3,
+            skip_radix_cache_insert=barred,
+            kv=ReqKvInfo(req_pool_idx=0),
+        )
+        batch = ScheduleBatch(
+            reqs=[req],
+            tree_cache=cache,
+            req_to_token_pool=cache.req_to_token_pool,
+            token_to_kv_pool_allocator=cache.token_to_kv_pool_allocator,
+            forward_mode=ForwardMode.EXTEND,
+        )
+        batch.prefix_lens = [512]
+        batch.enable_overlap = False
+        return req, batch
+
+    def test_barred_request_frees_rows_behind_the_window(self):
+        with envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False):
+            cache = _SwaCache()
+            req, batch = self._extend_batch(cache, barred=True)
+            batch.maybe_evict_swa()
+        free = cache.token_to_kv_pool_allocator.free_swa_segment
+        free.assert_called_once()
+        # 512 computed, 128-token window: rows [0, 384) are dead.
+        self.assertTrue(torch.equal(free.call_args.args[0], torch.arange(384)))
+        self.assertEqual(req.kv.get_evicted_seqlen("swa"), 384)
+
+    def test_tree_published_request_leaves_rows_to_the_tree(self):
+        with envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False):
+            cache = _SwaCache()
+            req, batch = self._extend_batch(cache, barred=False)
+            batch.maybe_evict_swa()
+        cache.token_to_kv_pool_allocator.free_swa_segment.assert_not_called()
+        self.assertEqual(req.kv.get_evicted_seqlen("swa"), 0)
+
+    def test_barred_request_never_frees_the_tree_owned_prefix(self):
+        with envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False):
+            cache = _SwaCache()
+            req, batch = self._extend_batch(cache, barred=True)
+            req.kv = ReqKvInfo(req_pool_idx=0, cache_protected_len=256)
+            batch.maybe_evict_swa()
+        free = cache.token_to_kv_pool_allocator.free_swa_segment
+        free.assert_called_once()
+        self.assertTrue(torch.equal(free.call_args.args[0], torch.arange(256, 384)))
+        self.assertEqual(free.call_args.kwargs, {"start_pos": 256})
+
+
 class TestForwardCadenceRetirementIsPriced(unittest.TestCase):
     def test_the_demand_keeps_every_commit_between_retirements(self):
         """With window rows retired every interval forwards (Aiter MegaMoE on

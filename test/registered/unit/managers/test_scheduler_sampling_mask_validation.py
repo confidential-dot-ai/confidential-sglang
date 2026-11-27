@@ -76,6 +76,64 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 )
                 scheduler._add_request_to_queue.assert_not_called()
 
+    def test_pd_top_logprobs_wider_than_the_metadata_row_get_bad_request(self):
+        """Prefill writes the first token's top logprobs into a fixed-width
+        metadata row and raises past it, so wider requests must be refused first."""
+        for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
+            with self.subTest(mode=mode):
+                scheduler = Scheduler.__new__(Scheduler)
+                scheduler.enable_session_radix_cache = False
+                scheduler.model_config = SimpleNamespace(
+                    hf_eos_token_id={1}, vocab_size=128
+                )
+                scheduler.disaggregation_mode = mode
+                scheduler.disagg_metadata_buffers = SimpleNamespace(
+                    enable_sampling_mask=False, max_top_logprobs_num=128
+                )
+                scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+                scheduler.tokenizer = None
+                scheduler.dllm_config = None
+                scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
+                scheduler._record_kv_event_lora_name = MagicMock()
+                scheduler.spec_algorithm = SimpleNamespace(
+                    is_dflash_family=lambda: False,
+                    is_uno=lambda: False,
+                )
+                scheduler._add_request_to_queue = MagicMock()
+                scheduler.output_streamer = MagicMock()
+                scheduler.tree_cache = MagicMock()
+                scheduler.beam_coordinator = MagicMock()
+                scheduler.hisparse_coordinator = None
+                scheduler.uocr_runtime = None
+                scheduler.send_abort_output = MagicMock()
+                scheduler.init_request_retirer()
+                recv_req = MagicMock(
+                    session_params=None,
+                    session_id=None,
+                    input_embeds=None,
+                    bootstrap_port=1,
+                    bootstrap_room=9,
+                )
+                req = MagicMock(return_sampling_mask=False, return_logprob=True)
+                req.logprob.top_logprobs_num = 129
+                req.exit_via = req.send_via = req.kv.retraction_backup = None
+                req.kv.holds_kv = req.kv.holds_mamba = False
+                with (
+                    patch(
+                        "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
+                        return_value=1,
+                    ),
+                    patch("sglang.srt.managers.scheduler.Req", return_value=req),
+                    patch("sglang.srt.managers.scheduler.prepare_abort") as abort,
+                ):
+                    scheduler.handle_generate_request(recv_req)
+                abort.assert_called_once()
+                self.assertIn("top_logprobs_num 129", abort.call_args.args[1])
+                self.assertEqual(
+                    abort.call_args.kwargs["status_code"], HTTPStatus.BAD_REQUEST
+                )
+                scheduler._add_request_to_queue.assert_not_called()
+
     def test_rejected_streaming_turn_leaves_session_idle(self):
         """A turn rejected after `create_req` must not wedge its streaming session."""
         for name in ("sampling_mask", "dllm"):

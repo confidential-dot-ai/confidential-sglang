@@ -66,6 +66,11 @@ def mark_serving_started() -> None:
     _serving_started = True
 
 
+def serving_started() -> bool:
+    """Whether mark_serving_started() ran in this process."""
+    return _serving_started
+
+
 def _on_compilation(*, src, metadata, metadata_group, times, cache_hit) -> None:
     if _prev_compile_listener is not None:
         _prev_compile_listener(

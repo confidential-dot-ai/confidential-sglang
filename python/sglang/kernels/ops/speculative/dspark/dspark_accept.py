@@ -119,8 +119,11 @@ def _accept_sampling_core(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
+    # min-p needs the whole filtered distribution, like top-k/top-p.
     plain = (
-        not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling
+        not sampling_info.need_top_k_sampling
+        and not sampling_info.need_top_p_sampling
+        and not sampling_info.need_min_p_sampling
     )
     if (
         _SPLIT_ACCEPT

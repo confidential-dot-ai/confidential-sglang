@@ -45,7 +45,8 @@ def built(tmp_path_factory):
 
 def test_every_env_profile_has_a_layout():
     assert LAYOUTS == [
-        "dsv41", "dsv41-262k", "dsv41-b200-1m", "dsv41-b300-1m", "dsv41-b300-1m-ced",
+        "dsv41", "dsv41-1m", "dsv41-262k", "dsv41-b200-1m", "dsv41-b300-1m",
+        "dsv41-b300-1m-ced",
     ]
 
 
@@ -82,6 +83,11 @@ def test_schema_and_container_paths(built, name):
         assert command[command.index("--model-path") + 1] == doc["paths"]["model"]
         assert worker["env"]["SGLANG_CACHE_DIR"] == doc["paths"]["kernel_cache_dir"]
         assert worker["env"]["TRITON_CACHE_DIR"].startswith("/tmp/")
+        # A kernel-cache seed is the kernel_cache_dir tree: every compiler cache
+        # whose default is outside SGLANG_CACHE_DIR must be inside it.
+        for key in ("TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR", "FLASHINFER_WORKSPACE_BASE",
+                    "CUDA_CACHE_PATH", "SGLANG_JIT_CACHE_DIR", "TORCH_EXTENSIONS_DIR", "CUTE_DSL_CACHE_DIR"):
+            assert worker["env"][key].startswith(doc["paths"]["kernel_cache_dir"] + "/"), key
     # The baked argv reproduces the plan with the image's launcher.
     assert "--dry-run" not in doc["launch_argv"]
 
@@ -90,6 +96,12 @@ def test_hicache_auto_is_planned_from_the_recorded_host_ram(built):
     doc = json.loads((built[0] / "dsv41-b200-1m.json").read_text())
     assert doc["target"]["host_available_gib"] == 768
     assert doc["plan"]["hicache_auto"]["host_available_gib"] == 768.0
+    one_m = json.loads((built[0] / "dsv41-1m.json").read_text())
+    assert one_m["target"]["host_available_gib"] == 768
+    assert one_m["target"]["gpu_count"] == 4
+    assert one_m["plan"]["hicache_auto"]["ratio"] == 8.0
+    assert one_m["plan"]["memory"]["per_rank"]["prefill"]["pool_tokens"] == 1572864
+    assert one_m["plan"]["memory"]["per_rank"]["decode"]["contexts_resident"] == 6
     b300 = json.loads((built[0] / "dsv41-b300-1m-ced.json").read_text())
     assert b300["target"]["host_available_gib"] is None
     assert b300["target"]["memory_profile"] == "B300"

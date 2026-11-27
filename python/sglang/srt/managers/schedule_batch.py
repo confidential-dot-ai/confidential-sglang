@@ -526,6 +526,9 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
+        # How many of output_ids the penalizers have seen; speculative decode
+        # feeds the rest. Reset when a new orchestrator starts the penalty state.
+        self.penalty_fed_output_len = 0
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by refresh_fill_ids; admission only updates
         # extend_end, never mutates this array's length.
@@ -3321,6 +3324,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             latest_output_ids
         )
 
+    def cumulate_penalty_new_output_tokens(self):
+        """Speculative steps commit several tokens per request: feed the
+        penalizers every output token they have not seen, once."""
+        new_tokens = [req.output_ids[req.penalty_fed_output_len :] for req in self.reqs]
+        width = max((len(t) for t in new_tokens), default=0)
+        if width == 0:
+            return
+        block = torch.full((len(new_tokens), width), -1, dtype=torch.int64)
+        for row, (req, tokens) in enumerate(zip(self.reqs, new_tokens)):
+            if tokens:
+                block[row, : len(tokens)] = torch.tensor(list(tokens), dtype=torch.int64)
+            req.penalty_fed_output_len = len(req.output_ids)
+        if is_pin_memory_available(self.device):
+            block = block.pin_memory()
+        self.sampling_info.penalizer_orchestrator.cumulate_output_token_block(
+            block.to(self.device, non_blocking=True)
+        )
+
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         self.mamba_track_seqlens_cpu = None
@@ -3700,9 +3721,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         several_windows or req.decode_batch_idx >= retain_window
                     ):
                         self.tree_cache.release_swa_prefix_lock(req)
-                elif (
-                    self.forward_mode.is_extend()
-                    and not self.tree_cache.supports_prefix_sharing()
+                elif self.forward_mode.is_extend() and (
+                    not self.tree_cache.supports_prefix_sharing()
+                    # Its chunks never enter the tree (warmup and other fake-
+                    # bootstrap requests, embed overrides), so the tree can never
+                    # evict their window rows: retire them here, per chunk.
+                    or getattr(req, "skip_radix_cache_insert", False)
                 ):
                     pre_len = self.prefix_lens[idx]
                     if self.enable_overlap:

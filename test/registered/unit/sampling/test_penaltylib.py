@@ -22,6 +22,9 @@ from sglang.srt.sampling.penaltylib.orchestrator import (
 from sglang.srt.sampling.penaltylib.presence_penalty import (
     BatchedPresencePenalizer,
 )
+from sglang.srt.sampling.penaltylib.repetition_penalty import (
+    BatchedRepetitionPenalizer,
+)
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
@@ -541,6 +544,66 @@ class TestOrchestratorMultiplePenalizers(CustomTestCase):
         self.assertTrue(orch_a.is_required)
         pen = orch_a.penalizers[BatchedFrequencyPenalizer]
         self.assertEqual(pen.frequency_penalties.shape[0], 2)
+
+
+ALL_PENALIZERS = {
+    BatchedFrequencyPenalizer,
+    BatchedPresencePenalizer,
+    BatchedRepetitionPenalizer,
+    BatchedMinNewTokensPenalizer,
+}
+
+
+def _penalized_req(output_ids=()):
+    req = _make_req(freq=0.5, presence=0.25, min_tokens=8)
+    req.sampling_params.repetition_penalty = 1.5
+    req.output_ids = list(output_ids)
+    return req
+
+
+class TestSpeculativeTokenBlock(CustomTestCase):
+    """DSpark commits several tokens per step; the penalizers must count each
+    exactly once (before, speculative decode never fed them at all)."""
+
+    def test_block_counts_each_token_once_per_row(self):
+        reqs = [_penalized_req() for _ in range(3)]
+        orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, _make_batch(reqs), ALL_PENALIZERS)
+        block = torch.tensor([[5, 5, 7], [9, -1, -1], [-1, -1, -1]])
+        orch.cumulate_output_token_block(block)
+        pen = orch.penalizers
+        freq = pen[BatchedFrequencyPenalizer].cumulated_frequency_penalties
+        self.assertEqual(freq[0, 5].item(), 1.0)
+        self.assertEqual(freq[0, 7].item(), 0.5)
+        self.assertEqual(freq[1, 9].item(), 0.5)
+        self.assertEqual(freq.sum().item(), 2.0)
+        presence = pen[BatchedPresencePenalizer].cumulated_presence_penalties
+        self.assertEqual(presence.nonzero().tolist(), [[0, 5], [0, 7], [1, 9]])
+        self.assertEqual(presence[0, 5].item(), 0.25)
+        rep = pen[BatchedRepetitionPenalizer].cumulated_repetition_penalties
+        self.assertEqual((rep != 1.0).nonzero().tolist(), [[0, 5], [0, 7], [1, 9]])
+        # Padding is not a token: token 0 stays unpenalized.
+        self.assertEqual(freq[:, 0].abs().sum().item(), 0.0)
+        lens = pen[BatchedMinNewTokensPenalizer].len_output_tokens
+        self.assertEqual(lens.view(-1).tolist(), [3, 1, 0])
+
+    def test_decode_steps_feed_only_new_tokens(self):
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+        reqs = [_penalized_req([5, 5]), _penalized_req([])]
+        batch = _make_batch(reqs)
+        orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, ALL_PENALIZERS)
+        batch.sampling_info.penalizer_orchestrator = orch
+        ScheduleBatch.cumulate_penalty_new_output_tokens(batch)
+        reqs[0].output_ids += [7, 5]
+        reqs[1].output_ids += [9]
+        ScheduleBatch.cumulate_penalty_new_output_tokens(batch)
+        ScheduleBatch.cumulate_penalty_new_output_tokens(batch)  # nothing new
+        freq = orch.penalizers[BatchedFrequencyPenalizer].cumulated_frequency_penalties
+        self.assertEqual(freq[0, 5].item(), 1.5)
+        self.assertEqual(freq[0, 7].item(), 0.5)
+        self.assertEqual(freq[1, 9].item(), 0.5)
+        lens = orch.penalizers[BatchedMinNewTokensPenalizer].len_output_tokens
+        self.assertEqual(lens.view(-1).tolist(), [4, 1])
 
 
 if __name__ == "__main__":

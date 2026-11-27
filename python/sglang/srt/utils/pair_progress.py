@@ -131,7 +131,9 @@ _KERNEL_NAME = None
 
 
 def compile_event(kernel, duration_ms):
-    """Report one Triton compile (not a cache hit) to the pair supervisor.
+    """Report one Triton compile (not a cache hit) or one SGLang JIT module
+    build (kernels/jit/utils/compile/loader.py, kernel "sgl_jit_<family>") to
+    the pair supervisor.
 
     Only the kernel's function name in code and the compile time leave the
     process. The supervisor forwards it once this worker is ready (after its

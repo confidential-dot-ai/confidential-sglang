@@ -1,5 +1,17 @@
 """Assemble a DeepSeek-V4.1 checkpoint from pinned Hub sources; idempotent.
 
+Each spec takes every file from a base repo except the Engram shards, which
+come from a second repo. config.json is the base's, with the Engram
+quantization fields of the Engram repo (absent means FP8 tables).
+
+Spec `1017-mxfp4-engram`: DeepSeek's own V4.1-Flash-1017 (MXFP4 experts, as
+deepseek-ai publishes it) with the MXFP4 Engram tables of
+nvidia/DeepSeek-V4.1-Flash-1017-NVFP4, which NVIDIA converted from the same
+1017 revision. Only the lookup tables differ from DeepSeek's shards (FP8
+[rows, 256] -> packed E2M1 [rows, 128], same e8m0 scales): about 97 GiB of
+Engram per instance instead of 189 GiB. SGLang reads them packed since
+sgl-project/sglang#47935.
+
 Spec `1017-nvfp4-fp8-engram`: LibertAI's NVFP4 conversion of V4.1-Flash-1017
 with DeepSeek's own FP8 Engram tables in place of its MXFP4 ones. That is the
 layout of nvidia/DeepSeek-V4.1-Flash-NVFP4 at 3431dde, the revision NVIDIA
@@ -11,7 +23,10 @@ complete, a rerun only checks file sizes and mtimes. --seed-dir reuses files
 that already exist elsewhere after hashing them: hard-linked when they share a
 mount with the checkpoint, copied otherwise.
 
-    prepare_checkpoint.py --spec 1017-nvfp4-fp8-engram --local-dir DIR [--seed-dir DIR]
+    prepare_checkpoint.py --spec 1017-mxfp4-engram --local-dir DIR [--seed-dir DIR]
+
+A --seed-dir holding deepseek-ai/DeepSeek-V4.1-Flash-1017 at 1bae0e10 leaves
+only the two Engram shards (about 98 GB) to download for 1017-mxfp4-engram.
 """
 
 import argparse
@@ -33,13 +48,32 @@ class Source(NamedTuple):
 class Spec(NamedTuple):
     # Everything but the Engram shards, config.json and the index.
     base: Source
-    # The Engram shards only.
+    # The Engram shards, and the Engram fields of quantization_config.
     engram: Source
-    # Config fields the derived checkpoint drops.
-    drop_quant_fields: tuple
 
+
+# quantization_config fields that describe the Engram tables. They select MXFP4
+# tables in sglang/srt/layers/engram.py; without them the loader reads FP8.
+ENGRAM_QUANT_FIELDS = (
+    "engram_embed_quant",
+    "engram_embed_block_size",
+    "engram_embed_scale_dtype",
+    "engram_embed_layers",
+)
+# safetensors dtype of each layer's `engram.embed.weight` per engram_embed_quant.
+ENGRAM_TABLE_DTYPES = {"fp8": "F8_E4M3", "mxfp4": "U8"}
 
 SPECS = {
+    "1017-mxfp4-engram": Spec(
+        base=Source(
+            "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            "1bae0e1088993b9b82de08f59de5be5a34e42170",
+        ),
+        engram=Source(
+            "nvidia/DeepSeek-V4.1-Flash-1017-NVFP4",
+            "3ae9c0d3fbbea5370bd06e679d22044db15883f1",
+        ),
+    ),
     "1017-nvfp4-fp8-engram": Spec(
         base=Source(
             "LibertAIDAI/DeepSeek-V4.1-Flash-1017-NVFP4",
@@ -48,14 +82,6 @@ SPECS = {
         engram=Source(
             "deepseek-ai/DeepSeek-V4.1-Flash-1017",
             "1bae0e1088993b9b82de08f59de5be5a34e42170",
-        ),
-        # They select MXFP4 tables in sglang/srt/layers/engram.py; without them
-        # the loader reads FP8, as the 1017 tables are.
-        drop_quant_fields=(
-            "engram_embed_quant",
-            "engram_embed_block_size",
-            "engram_embed_scale_dtype",
-            "engram_embed_layers",
         ),
     ),
 }
@@ -115,13 +141,36 @@ def plan_files(
     return files
 
 
-def derived_config(config: dict, drop_quant_fields: tuple) -> dict:
+def derived_config(base_config: dict, engram_config: dict) -> dict:
+    """The base config with the Engram source's Engram quantization fields."""
     quant = {
         k: v
-        for k, v in config["quantization_config"].items()
-        if k not in drop_quant_fields
+        for k, v in base_config["quantization_config"].items()
+        if k not in ENGRAM_QUANT_FIELDS
     }
-    return {**config, "quantization_config": quant}
+    engram_quant = engram_config.get("quantization_config") or {}
+    quant.update({k: engram_quant[k] for k in ENGRAM_QUANT_FIELDS if k in engram_quant})
+    return {**base_config, "quantization_config": quant}
+
+
+def check_engram_tables(config: dict, headers: Dict[str, dict]) -> None:
+    """Every `engram.embed.weight` has the dtype config.json declares for it."""
+    declared = (config.get("quantization_config") or {}).get("engram_embed_quant", "fp8")
+    if declared not in ENGRAM_TABLE_DTYPES:
+        raise ValueError(f"unsupported engram_embed_quant {declared!r}")
+    tables = {
+        name: tensor["dtype"]
+        for header in headers.values()
+        for name, tensor in header.items()
+        if name.endswith(".engram.embed.weight")
+    }
+    if not tables:
+        raise ValueError("no engram.embed.weight tensors in the Engram shards")
+    wrong = {n: d for n, d in tables.items() if d != ENGRAM_TABLE_DTYPES[declared]}
+    if wrong:
+        raise ValueError(
+            f"config.json declares {declared} Engram tables, but the shards hold {wrong}"
+        )
 
 
 def safetensors_header(path: Path) -> dict:
@@ -251,13 +300,22 @@ def prepare(
         engram_index=fetch_json(spec.engram, INDEX),
     )
     local_dir.mkdir(parents=True, exist_ok=True)
-    # Conservative: a seeded file is a copy unless it can be hard-linked.
-    missing = sum(
-        f.size
-        for f in files.values()
-        if not (local_dir / f.path).is_file()
-        or (local_dir / f.path).stat().st_size != f.size
-    )
+    # Conservative: a seeded file is a copy unless it can be hard-linked
+    # (same filesystem as the checkpoint), which takes no space.
+    local_dev = local_dir.stat().st_dev
+
+    def needs_space(f) -> bool:
+        target = local_dir / f.path
+        if target.is_file() and target.stat().st_size == f.size:
+            return False
+        seed = seed_dir / f.path if seed_dir is not None else None
+        if seed is not None and seed.is_file():
+            st = seed.stat()
+            if st.st_size == f.size and st.st_dev == local_dev:
+                return False
+        return True
+
+    missing = sum(f.size for f in files.values() if needs_space(f))
     free = shutil.disk_usage(local_dir).free
     print(
         f"{spec_name}: {len(files)} files, up to {missing / 2**30:.1f} GiB to "
@@ -281,16 +339,15 @@ def prepare(
                 ),
             )
         )
-    for shard in engram_shards(base_index["weight_map"]):
-        dtypes = {t["dtype"] for t in safetensors_header(local_dir / shard).values()}
-        print(f"{shard}: dtypes {sorted(dtypes)}")
-    (local_dir / CONFIG).write_text(
-        json.dumps(
-            derived_config(fetch_json(spec.base, CONFIG), spec.drop_quant_fields),
-            indent=2,
-        )
-        + "\n"
-    )
+    headers = {
+        shard: safetensors_header(local_dir / shard)
+        for shard in engram_shards(base_index["weight_map"])
+    }
+    for shard, header in headers.items():
+        print(f"{shard}: dtypes {sorted({t['dtype'] for t in header.values()})}")
+    config = derived_config(fetch_json(spec.base, CONFIG), fetch_json(spec.engram, CONFIG))
+    check_engram_tables(config, headers)
+    (local_dir / CONFIG).write_text(json.dumps(config, indent=2) + "\n")
     (local_dir / INDEX).write_text(
         json.dumps(derived_index(base_index, local_dir), indent=2) + "\n"
     )

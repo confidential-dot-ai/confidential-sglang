@@ -1051,6 +1051,24 @@ class TestLaunch(unittest.TestCase):
                     self.assertEqual(plan["hicache_auto"]["ratio"], 8.0)
                     prefill = [w for w in plan["workers"] if "--hicache-ratio" in w["command"]]
                     self.assertEqual(len(prefill), 2)
+                if env.name == "dsv41-1m.env":
+                    # One pair on a 4x B200: a full 1M prompt fits the prefill
+                    # pool with room left, decode holds six 1M contexts, and
+                    # both roles wait 20 min for a KV handoff.
+                    self.assertEqual(args.context_length, 1048576)
+                    self.assertEqual(plan["physical_gpus"], [0, 1, 2, 3])
+                    self.assertEqual(plan["hicache_auto"]["ratio"], 8.0)
+                    memory = plan["memory"]["per_rank"]
+                    self.assertGreater(memory["prefill"]["pool_tokens"], 1048576)
+                    self.assertEqual(memory["decode"]["contexts_resident"], 6)
+                    for role in ("prefill", "decode"):
+                        self.assertGreaterEqual(
+                            memory[role]["free_gib"], memory[role]["transient_reserve_gib"]
+                        )
+                    for worker in plan["workers"]:
+                        self.assertEqual(
+                            worker["env"]["SGLANG_DISAGGREGATION_WAITING_TIMEOUT"], "1200"
+                        )
 
     def test_hicache_auto_ratio_fits_host_ram(self):
         resident = ("--cpu-engram-staging", "--resident-engram-pid", "1")

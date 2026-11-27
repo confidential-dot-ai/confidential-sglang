@@ -43,6 +43,13 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
             src=self.frequency_penalties,
         )
 
+    def _cumulate_output_token_block(self, output_ids: torch.Tensor, valid: torch.Tensor):
+        self.cumulated_frequency_penalties.scatter_add_(
+            dim=1,
+            index=output_ids.clamp(min=0),
+            src=self.frequency_penalties.expand_as(output_ids) * valid,
+        )
+
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
         logits.sub_(self.cumulated_frequency_penalties)
 

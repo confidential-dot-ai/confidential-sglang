@@ -1042,6 +1042,12 @@ def build_plan(args):
             FLASHINFER_WORKSPACE_BASE=str(cache / "flashinfer"),
             CUDA_CACHE_PATH=str(cache / "nv"),
             SGLANG_CACHE_DIR=str(cache),
+            # These three default under HOME, not SGLANG_CACHE_DIR: without them a
+            # kernel-cache seed of this tree misses SGLang JIT modules, torch
+            # extensions (HiCache's hash) and CuTe DSL kernels.
+            SGLANG_JIT_CACHE_DIR=str(cache / "jit"),
+            TORCH_EXTENSIONS_DIR=str(cache / "torch_extensions"),
+            CUTE_DSL_CACHE_DIR=str(cache / "cute_dsl"),
         )
         if args.prefill_bounded_replay:
             env["SGLANG_OPT_DSV41_PREFILL_TAIL"] = "1"

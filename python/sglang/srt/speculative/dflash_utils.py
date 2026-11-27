@@ -22,6 +22,7 @@ from sglang.srt.layers.sampling_renorm import top_k_renorm_prob, top_p_renorm_pr
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_npu
 
@@ -118,6 +119,14 @@ def _dflash_top_p_renorm_prob(
     if npu_probs is not None:
         return npu_probs
     return top_p_normalize_probs_torch(probs, top_ps)
+
+
+def min_p_renorm_prob(probs: torch.Tensor, min_ps: torch.Tensor) -> torch.Tensor:
+    # The sampler's min-p rule, applied after top-k/top-p renormalization;
+    # renormalizing keeps ratios, so the kept set is the same.
+    thresholds = probs.amax(dim=-1, keepdim=True) * min_ps.to(probs.dtype).unsqueeze(-1)
+    kept = probs.masked_fill(probs < thresholds, 0.0)
+    return kept / kept.sum(dim=-1, keepdim=True)
 
 
 def dflash_draft_cell_size_per_token(
@@ -221,7 +230,8 @@ def apply_dflash_verify_logits_adjustments(
     """Apply sampling-time logit adjustments for DFlash verify in place.
 
     This keeps v1 and v2 verify semantics aligned while letting overlap scheduling
-    use the cheaper precomputed `acc_linear_penalties` path instead of allocating a
+    use the cheaper precomputed `acc_additive_penalties` / `acc_scaling_penalties`
+    path instead of allocating a
     repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
     """
     if sampling_info is None:
@@ -247,7 +257,10 @@ def apply_dflash_verify_logits_adjustments(
             num_tokens_in_batch=draft_token_num,
         )
 
-    acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
+    # Overlap scheduling folds the penalizers into these (copy_for_forward) and
+    # drops the orchestrator; frequency/presence add, repetition scales.
+    additive = sampling_info.acc_additive_penalties
+    scaling = sampling_info.acc_scaling_penalties
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
@@ -260,33 +273,37 @@ def apply_dflash_verify_logits_adjustments(
             logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
         return logits_3d
 
+    def per_request(t: torch.Tensor) -> torch.Tensor:
+        return t.to(device=next_token_logits.device, dtype=next_token_logits.dtype)[
+            :, None, :
+        ]
+
     # Dense fallback only when we need live penalizer application or a vocab mask.
-    # In overlap scheduling the common path is `acc_linear_penalties`, which can be
-    # broadcast over the verify block without materializing a repeated buffer.
     if (
-        penalizer is not None and penalizer.is_required and acc_linear_penalties is None
+        penalizer is not None
+        and penalizer.is_required
+        and additive is None
+        and scaling is None
     ) or grammar_mask is not None:
         linear_penalty = torch.zeros(
             (bs, next_token_logits.shape[1]),
             dtype=torch.float32,
             device=next_token_logits.device,
         )
+        # Folds the additive penalties, the grammar mask and logit_bias; a scaling
+        # penalty on this zero buffer is a no-op, so it goes on the logits first.
         sampling_info.apply_logits_bias(linear_penalty)
+        if scaling is not None:
+            apply_scaling_penalties(get_logits_3d(), per_request(scaling))
         get_logits_3d().add_(
             linear_penalty[:, None, :].to(dtype=next_token_logits.dtype)
         )
         return
 
-    if acc_linear_penalties is not None:
-        if (
-            acc_linear_penalties.device != next_token_logits.device
-            or acc_linear_penalties.dtype != next_token_logits.dtype
-        ):
-            acc_linear_penalties = acc_linear_penalties.to(
-                device=next_token_logits.device,
-                dtype=next_token_logits.dtype,
-            )
-        get_logits_3d().add_(acc_linear_penalties[:, None, :])
+    if additive is not None:
+        get_logits_3d().add_(per_request(additive))
+    if scaling is not None:
+        apply_scaling_penalties(get_logits_3d(), per_request(scaling))
 
     if logit_bias is not None:
         if (
@@ -1156,6 +1173,7 @@ def build_speculative_verify_target_probs(
     device = next_token_logits.device
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
+    need_min_p = bool(getattr(sampling_info, "need_min_p_sampling", False))
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, draft_token_num, dim=0
     )
@@ -1221,6 +1239,11 @@ def build_speculative_verify_target_probs(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
             )
+    if need_min_p:
+        target_probs = min_p_renorm_prob(
+            target_probs,
+            torch.repeat_interleave(sampling_info.min_ps, draft_token_num, dim=0),
+        )
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
@@ -1230,9 +1253,8 @@ def validate_dflash_request(
     grammar_backend: Optional[str] = None,
     masks_grammar_in_verify: bool = False,
 ) -> Optional[str]:
-    if req.return_logprob:
-        return "DFLASH speculative decoding does not support return_logprob yet."
-
+    # Logprobs are served: the verify step computes them for every committed
+    # token (compute_spec_logprobs), as upstream since #33459.
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 

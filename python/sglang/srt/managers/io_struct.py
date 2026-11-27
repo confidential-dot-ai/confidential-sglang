@@ -926,6 +926,32 @@ class GenerateReqInput:
         else:
             raise ValueError("kv_hints should be a list or a dict.")
 
+    def _expand_bootstrap_rooms(self, num):
+        """Expand a bootstrap_room list to one room per expanded request.
+
+        Expanded request j is sample j // batch_size of prompt j % batch_size
+        (inputs are expanded as `inputs * parallel_sample_num`). Under PD every
+        sample is its own prefill->decode handoff and needs its own room, and
+        prefill and decode get the same body, so the mapping is deterministic:
+        - one room per sample (len == num, what the PD router sends for chat
+          n > 1): used as given;
+        - one room per prompt (len == batch_size): sample k of prompt i gets
+          room[i] + k (mod 2**63), like a scalar room's room + j;
+        - anything else: the legacy repetition (the PD batch path rejects the
+          duplicate rooms it produces).
+        """
+        rooms = self.bootstrap_room
+        n = self.parallel_sample_num
+        if n == 1 or len(rooms) == num:
+            return list(rooms)
+        if len(rooms) == self.batch_size:
+            return [
+                None if rooms[i] is None else (rooms[i] + k) % (1 << 63)
+                for k in range(n)
+                for i in range(self.batch_size)
+            ]
+        return rooms * n
+
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
         # Normalize bootstrap_host
@@ -950,7 +976,7 @@ class GenerateReqInput:
         elif not isinstance(self.bootstrap_room, list):
             self.bootstrap_room = [self.bootstrap_room + i for i in range(num)]
         elif isinstance(self.bootstrap_room, list):
-            self.bootstrap_room = self.bootstrap_room * self.parallel_sample_num
+            self.bootstrap_room = self._expand_bootstrap_rooms(num)
 
         # Normalize bootstrap_pair_key
         if self.bootstrap_pair_key is None:

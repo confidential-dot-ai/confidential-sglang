@@ -40,7 +40,10 @@ if _is_xpu:
             "transfer_cache_dsv4_mla", _dsv4_mla_unavailable_reason
         )
 else:
-    from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
+    from sglang.kernels.ops.kvcache.hisparse import (
+        prepare_transfer_cache_dsv4_mla,
+        transfer_cache_dsv4_mla,
+    )
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
@@ -270,6 +273,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         # whose page row is a flat run of tokens, has that layout, so those may
         # only move whole pages.
         self.page_aligned_only = page_aligned_only
+        if not page_aligned_only and (_is_cuda or _is_hip):
+            prepare_transfer_cache_dsv4_mla()
         self.num_host_pages = num_host_pages
         self.slot_page_size = slot_page_size
         self.dtype = torch.uint8

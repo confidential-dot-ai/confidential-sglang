@@ -93,7 +93,10 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
         return True
     if sampling_info.has_custom_logit_processor:
         return False
-    if getattr(sampling_info, "acc_linear_penalties", None) is not None:
+    if (
+        sampling_info.acc_additive_penalties is not None
+        or sampling_info.acc_scaling_penalties is not None
+    ):
         return False
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     if penalizer is not None and penalizer.is_required:
@@ -1226,8 +1229,12 @@ def sample_simulated_bonus(
     seed: int,
 ) -> torch.Tensor:
     """The bonus token at the (simulated) correct_len row, drawn from the target
-    distribution the sampling accept uses: temperature, then top-k / top-p."""
-    if sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
+    distribution the sampling accept uses: temperature, then top-k / top-p / min-p."""
+    if (
+        sampling_info.need_top_k_sampling
+        or sampling_info.need_top_p_sampling
+        or sampling_info.need_min_p_sampling
+    ):
         probs = build_speculative_verify_target_probs(
             next_token_logits=target_logits.index_select(
                 0, _simulated_rows(correct_len, verify_num_draft_tokens)
@@ -1261,7 +1268,7 @@ def _accepts_on_shards(
     draft_block: DraftBlockResult, sampling_info, block_verification: bool
 ) -> bool:
     # The sharded accept is a Triton chain rule on temperature-only target
-    # probabilities; block verification and top-k/top-p need the whole vocab.
+    # probabilities; block verification and top-k/top-p/min-p need the whole vocab.
     # A SimpleNamespace stand-in (unit tests) has no vocab_shard.
     shard = getattr(draft_block, "vocab_shard", None)
     return (
@@ -1270,6 +1277,7 @@ def _accepts_on_shards(
         and not block_verification
         and not sampling_info.need_top_k_sampling
         and not sampling_info.need_top_p_sampling
+        and not sampling_info.need_min_p_sampling
     )
 
 
@@ -1305,6 +1313,7 @@ def _blockwise_rejection_applies(
         and not block_verification
         and not sampling_info.need_top_k_sampling
         and not sampling_info.need_top_p_sampling
+        and not sampling_info.need_min_p_sampling
     )
 
 
